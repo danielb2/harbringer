@@ -1,17 +1,19 @@
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Form, Path, Query, RawForm, State},
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{any, get, post},
     Json, Router,
 };
 use clap::Parser;
-use serde::Deserialize;
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use std::{
     net::SocketAddr,
     path::{Component, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     fs::File,
@@ -26,15 +28,44 @@ const USER_ID: &str = "mplex-user";
 #[derive(Parser, Debug)]
 struct Args {
     #[arg(long, value_name = "DIRECTORY")]
-    dir: PathBuf,
-    #[arg(long, default_value = "development-token")]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    token: Option<String>,
+    #[arg(long)]
+    bind: Option<SocketAddr>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct Config {
+    #[serde(default = "default_bind")]
+    bind: String,
+    #[serde(default = "default_token")]
     token: String,
-    #[arg(long, default_value = "0.0.0.0:8096")]
-    bind: SocketAddr,
+    #[serde(default)]
+    libraries: Vec<ConfigLibrary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ConfigLibrary {
+    name: String,
+    kind: String,
+    #[serde(default)]
+    folders: Vec<PathBuf>,
+}
+
+fn default_bind() -> String {
+    "0.0.0.0:8096".to_owned()
+}
+fn default_token() -> String {
+    "development-token".to_owned()
 }
 
 #[derive(Clone)]
 struct AppState {
+    config: Arc<Mutex<Config>>,
+    config_path: Arc<PathBuf>,
+    db: Arc<Mutex<Connection>>,
+    machine_identifier: Arc<str>,
     root: Arc<PathBuf>,
     media: Arc<Vec<Media>>,
     token: Arc<str>,
@@ -53,25 +84,83 @@ struct Media {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
-    let metadata = tokio::fs::metadata(&args.dir).await?;
-    if !metadata.is_dir() {
-        return Err(format!("--dir is not a directory: {}", args.dir.display()).into());
+    let config_arg = args.config.unwrap_or_else(|| PathBuf::from("config"));
+    let config_path = if config_arg
+        .extension()
+        .is_some_and(|extension| extension == "toml")
+    {
+        if config_arg.is_absolute() {
+            config_arg
+        } else {
+            std::env::current_dir()?.join(config_arg)
+        }
+    } else {
+        let config_dir = if config_arg.is_absolute() {
+            config_arg
+        } else {
+            std::env::current_dir()?.join(config_arg)
+        };
+        config_dir.join("mplex.toml")
+    };
+    let mut config = load_config(&config_path)?;
+    if let Some(bind) = args.bind {
+        config.bind = bind.to_string();
     }
-
-    let root = tokio::fs::canonicalize(&args.dir).await?;
-    let media = scan_media(&root).await?;
+    if let Some(token) = args.token {
+        config.token = token;
+    }
+    save_config(&config_path, &config)?;
+    let (db, machine_identifier) = open_database(&config_path)?;
+    migrate_library_model(&db)?;
+    sync_config_libraries(&db, &config)?;
+    let root = config
+        .libraries
+        .iter()
+        .flat_map(|library| library.folders.iter())
+        .find_map(|path| std::fs::canonicalize(path).ok())
+        .unwrap_or_else(|| {
+            config_path
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf()
+        });
+    let mut media = Vec::new();
+    for (library_index, library) in config.libraries.iter().enumerate() {
+        for folder in &library.folders {
+            let Ok(folder) = tokio::fs::canonicalize(folder).await else {
+                continue;
+            };
+            let mut library_media = scan_media(&folder).await?;
+            for item in &mut library_media {
+                item.id = format!("{}-{}", library_index + 1, item.id);
+            }
+            persist_media_records(&db, &folder, &library_media)?;
+            media.extend(library_media);
+        }
+    }
     for item in &media {
         info!(id = %item.id, file = %item.path.display(), size = item.size, "serving media");
     }
 
     let state = AppState {
+        config: Arc::new(Mutex::new(config.clone())),
+        config_path: Arc::new(config_path),
+        db: Arc::new(Mutex::new(db)),
+        machine_identifier: Arc::from(machine_identifier),
         root: Arc::new(root),
         media: Arc::new(media),
-        token: Arc::from(args.token),
+        token: Arc::from(config.token),
     };
     let app = Router::new()
-        .route("/", get(web_client))
+        .route("/", get(root_handler))
+        .route("/library", get(web_client))
+        .route("/web", get(web_client))
         .route("/web/stream", any(web_stream))
+        .route("/web/progress", get(web_progress).post(update_web_progress))
+        .route("/settings", get(settings_page))
+        .route("/settings/libraries", post(create_library))
+        .route("/settings/folders", post(add_library_folder))
+        .route("/settings/browse", get(settings_browse))
         .route("/identity", get(plex_identity))
         .route("/library/sections", get(plex_sections))
         .route("/library/sections/1/all", get(plex_all))
@@ -91,7 +180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fallback(log_not_found)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind(args.bind).await?;
+    let listener = tokio::net::TcpListener::bind(config.bind.parse::<SocketAddr>()?).await?;
     let address = listener.local_addr()?;
     let host = if address.ip().is_unspecified() {
         "127.0.0.1".to_owned()
@@ -170,9 +259,588 @@ fn find_media<'a>(state: &'a AppState, id: &str) -> Option<&'a Media> {
     state.media.iter().find(|item| item.id == id)
 }
 
+fn persist_media_records(
+    connection: &Connection,
+    root: &std::path::Path,
+    media: &[Media],
+) -> Result<(), rusqlite::Error> {
+    let transaction = connection.unchecked_transaction()?;
+    for item in media {
+        let path = item
+            .path
+            .strip_prefix(root)
+            .unwrap_or(&item.path)
+            .to_string_lossy();
+        transaction.execute(
+            "INSERT INTO media (media_key, path, title) VALUES (?1, ?2, ?3)
+             ON CONFLICT(media_key) DO UPDATE SET path = excluded.path, title = excluded.title",
+            (&item.id, path.as_ref(), &item.title),
+        )?;
+    }
+    transaction.commit()
+}
+
+fn load_config(path: &std::path::Path) -> Result<Config, Box<dyn std::error::Error>> {
+    if !path.exists() {
+        return Ok(Config {
+            bind: default_bind(),
+            token: default_token(),
+            libraries: Vec::new(),
+        });
+    }
+    Ok(toml::from_str(&std::fs::read_to_string(path)?)?)
+}
+
+fn save_config(path: &std::path::Path, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let serialized = toml::to_string_pretty(config)?;
+    if std::fs::read_to_string(path).ok().as_deref() == Some(serialized.as_str()) {
+        return Ok(());
+    }
+    std::fs::write(path, serialized)?;
+    Ok(())
+}
+
+fn sync_config_libraries(connection: &Connection, config: &Config) -> Result<(), rusqlite::Error> {
+    for library in &config.libraries {
+        connection.execute(
+            "INSERT OR IGNORE INTO library_groups (name, kind, added_at) VALUES (?1, ?2, strftime('%s', 'now'))",
+            (&library.name, &library.kind),
+        )?;
+        let id: i64 = connection.query_row(
+            "SELECT id FROM library_groups WHERE name = ?1",
+            [&library.name],
+            |row| row.get(0),
+        )?;
+        connection.execute(
+            "UPDATE library_groups SET kind = ?1 WHERE id = ?2",
+            (&library.kind, id),
+        )?;
+        for folder in &library.folders {
+            connection.execute(
+                "INSERT OR IGNORE INTO library_folders (library_id, path, added_at) VALUES (?1, ?2, strftime('%s', 'now'))",
+                (id, folder.to_string_lossy().as_ref()),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn open_database(
+    config_path: &std::path::Path,
+) -> Result<(Connection, String), Box<dyn std::error::Error>> {
+    let state_dir = config_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join(".mplex");
+    std::fs::create_dir_all(&state_dir)?;
+    let connection = Connection::open(state_dir.join("state.sqlite"))?;
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS server_identity (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             machine_identifier TEXT NOT NULL UNIQUE,
+             server_name TEXT NOT NULL,
+             plex_account_token TEXT,
+             claimed INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE TABLE IF NOT EXISTS users (
+             id TEXT PRIMARY KEY,
+             plex_user_id TEXT UNIQUE,
+             name TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS media (
+             media_key TEXT PRIMARY KEY,
+             path TEXT NOT NULL,
+             title TEXT NOT NULL,
+             metadata_json TEXT,
+             matched_at INTEGER
+         );
+         CREATE TABLE IF NOT EXISTS watch_progress (
+             user_id TEXT NOT NULL,
+             media_key TEXT NOT NULL,
+             position_ms INTEGER NOT NULL DEFAULT 0,
+             duration_ms INTEGER,
+             watched INTEGER NOT NULL DEFAULT 0,
+             updated_at INTEGER NOT NULL,
+             PRIMARY KEY (user_id, media_key)
+         );
+         CREATE TABLE IF NOT EXISTS artwork (
+             media_key TEXT NOT NULL,
+             kind TEXT NOT NULL,
+             source_url TEXT,
+             local_path TEXT,
+             downloaded_at INTEGER,
+             PRIMARY KEY (media_key, kind)
+         );
+         CREATE TABLE IF NOT EXISTS libraries (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             path TEXT NOT NULL UNIQUE,
+             kind TEXT NOT NULL DEFAULT 'other',
+             added_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS library_groups (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             name TEXT NOT NULL UNIQUE,
+             kind TEXT NOT NULL DEFAULT 'other',
+             added_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS library_folders (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             library_id INTEGER NOT NULL REFERENCES library_groups(id) ON DELETE CASCADE,
+             path TEXT NOT NULL UNIQUE,
+             added_at INTEGER NOT NULL
+         );",
+    )?;
+    let _ = connection.execute(
+        "ALTER TABLE libraries ADD COLUMN kind TEXT NOT NULL DEFAULT 'other'",
+        [],
+    );
+    let machine_identifier = connection
+        .query_row(
+            "SELECT machine_identifier FROM server_identity WHERE id = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .or_else(|error| {
+            if !matches!(error, rusqlite::Error::QueryReturnedNoRows) {
+                return Err(error);
+            }
+            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+            })?;
+            let generated = format!("mplex-{:x}", timestamp.as_nanos());
+            connection.execute(
+                "INSERT INTO server_identity (id, machine_identifier, server_name) VALUES (1, ?1, 'mPlex')",
+                [&generated],
+            )?;
+            Ok(generated)
+        })?;
+    Ok((connection, machine_identifier))
+}
+
+fn migrate_library_model(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute(
+        "INSERT OR IGNORE INTO library_groups (name, kind, added_at) VALUES ('Default Library', 'other', strftime('%s', 'now'))",
+        [],
+    )?;
+    let default_id: i64 = connection.query_row(
+        "SELECT id FROM library_groups WHERE name = 'Default Library'",
+        [],
+        |row| row.get(0),
+    )?;
+    connection.execute(
+        "INSERT OR IGNORE INTO library_folders (library_id, path, added_at) SELECT ?1, path, added_at FROM libraries",
+        [default_id],
+    )?;
+    Ok(())
+}
+
+fn library_kind_label(kind: &str) -> &str {
+    match kind {
+        "movie" => "Movies",
+        "tv" => "TV Shows",
+        _ => "Other",
+    }
+}
+
+#[derive(Deserialize)]
+struct LibraryFolderForm {
+    library_id: i64,
+    path: String,
+}
+
+#[derive(Deserialize, Default)]
+struct SettingsQuery {
+    folder: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct BrowseQuery {
+    path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProgressQuery {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct ProgressUpdate {
+    path: String,
+    position_ms: i64,
+    duration_ms: Option<i64>,
+    watched: bool,
+}
+
+async fn web_progress(
+    State(state): State<AppState>,
+    Query(query): Query<ProgressQuery>,
+) -> Response {
+    let Some(path) = clean_relative_path(&query.path) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let progress = connection.query_row(
+        "SELECT position_ms, duration_ms, watched FROM watch_progress WHERE user_id = ?1 AND media_key = ?2",
+        (USER_ID, path.to_string_lossy().as_ref()),
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, bool>(2)?)),
+    );
+    match progress {
+        Ok((position_ms, duration_ms, watched)) => Json(serde_json::json!({
+            "positionMs": position_ms,
+            "durationMs": duration_ms,
+            "watched": watched
+        }))
+        .into_response(),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            Json(serde_json::json!({"positionMs": 0, "durationMs": null, "watched": false}))
+                .into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn update_web_progress(
+    State(state): State<AppState>,
+    Json(update): Json<ProgressUpdate>,
+) -> Response {
+    let Some(path) = clean_relative_path(&update.path) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    if connection
+        .execute(
+            "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(user_id, media_key) DO UPDATE SET position_ms = excluded.position_ms, duration_ms = excluded.duration_ms, watched = excluded.watched, updated_at = excluded.updated_at",
+            (USER_ID, path.to_string_lossy().as_ref(), update.position_ms.max(0), update.duration_ms, update.watched, updated_at),
+        )
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn settings_page(
+    State(state): State<AppState>,
+    Query(query): Query<SettingsQuery>,
+) -> Response {
+    let libraries = {
+        let Ok(config) = state.config.lock() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        config
+            .libraries
+            .iter()
+            .enumerate()
+            .map(|(id, library)| {
+                (
+                    id as i64,
+                    library.name.clone(),
+                    library.kind.clone(),
+                    library
+                        .folders
+                        .iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let list = libraries
+        .iter()
+        .map(|(id, name, kind, folders)| {
+            format!(
+                "<li><strong>{}</strong> <span class=\"note\">({})</span><ul>{}</ul><details><summary>＋ Add folder</summary><form method=\"post\" action=\"/settings/folders\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><input name=\"path\" type=\"text\" placeholder=\"/another/folder\" required><button type=\"submit\">Add folder</button></form></details></li>",
+                html(name), html(library_kind_label(kind)), folders.iter().map(|path| format!("<li>{}</li>", html(path))).collect::<String>(), id
+            )
+        })
+        .collect::<String>();
+    Html(format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mPlex settings</title><style>
+body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }}
+.app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; transition: grid-template-columns .2s ease; }} .app-shell.sidebar-collapsed {{ grid-template-columns: 68px minmax(0, 1fr); }}
+.sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }}
+.sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }}
+.sidebar-top {{ display: flex; align-items: center; justify-content: space-between; padding-bottom: 1rem; }}
+.sidebar-top .sidebar-brand {{ padding-bottom: 0; }} .sidebar-toggle {{ width: 2rem; height: 2rem; border: 0; border-radius: .4rem; color: #cbd5e1; background: transparent; cursor: pointer; font-size: 1.15rem; }} .sidebar-collapsed .sidebar-top {{ justify-content: center; }} .sidebar-collapsed .sidebar-brand, .sidebar-collapsed .sidebar-label, .sidebar-collapsed .sidebar-link {{ font-size: 0; }} .sidebar-collapsed .sidebar-link {{ justify-content: center; }} .sidebar-collapsed .sidebar-icon {{ font-size: 1.1rem; }}
+.sidebar-label {{ padding: 0 .7rem .45rem; color: #6b7280; font-size: .7rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }}
+.sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; align-items: center; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }}
+.sidebar-link:hover {{ background: #17243a; color: #fff; }} .sidebar-link.active {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; font-size: 1.1rem; }}
+main {{ min-width: 0; max-width: 760px; width: 100%; box-sizing: border-box; margin: 0 auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; }}
+form {{ display: flex; gap: .6rem; margin: 1.5rem 0; }} input, select {{ flex: 1; padding: .7rem; border: 1px solid #4b5563; border-radius: .4rem; color: #fff; background: #1f2937; }} .path-list {{ display: grid; gap: .55rem; flex: 2; }} .path-row {{ display: flex; gap: .5rem; }} .path-row input {{ min-width: 0; }}
+button {{ padding: .7rem 1rem; border: 0; border-radius: .4rem; color: #fff; background: #2563eb; cursor: pointer; }} li {{ margin: .65rem 0; overflow-wrap: anywhere; }} .note {{ color: #9ca3af; }}
+details {{ margin-top: .7rem; }} summary {{ display: inline-block; padding: .45rem .7rem; border: 1px solid #3b82f6; border-radius: .4rem; color: #bfdbfe; cursor: pointer; list-style: none; }} summary::-webkit-details-marker {{ display: none; }} details form {{ margin: .7rem 0 0; }}
+@media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; padding: .7rem; border-right: 0; border-bottom: 1px solid #263244; }} .sidebar-top {{ padding-bottom: .35rem; }} .sidebar-brand {{ padding: .35rem .55rem; }} .sidebar-toggle {{ display: none; }} .sidebar-label {{ display: none; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} }}
+</style></head><body><div class="app-shell">{}
+<main><h1>Settings</h1>
+<p class="note">A library is a named collection with one type and one or more monitored folders. Create it with its first folder, then add more folders to that same library below.</p>
+<details open><summary>＋ Add library</summary><form method="post" action="/settings/libraries"><input name="name" type="text" placeholder="Library name" required><select name="kind"><option value="movie">Movies</option><option value="tv">TV Shows</option><option value="other">Other</option></select><div class="path-list" id="new-library-paths"><div class="path-row"><input name="path[]" type="text" placeholder="/path/to/folder" value="{}" required><a href="/settings/browse">Browse</a><button type="button" class="remove-path" disabled>−</button></div></div><button type="button" id="add-path">＋</button><button type="submit">Create library</button></form></details>
+<h2>Libraries</h2><ul>{}</ul>
+ </main></div><script>
+const shell = document.querySelector('.app-shell'); const toggle = document.querySelector('.sidebar-toggle');
+if (localStorage.getItem('mplex-sidebar-collapsed') === 'true') shell.classList.add('sidebar-collapsed');
+toggle?.addEventListener('click', () => {{ const collapsed = shell.classList.toggle('sidebar-collapsed'); localStorage.setItem('mplex-sidebar-collapsed', collapsed ? 'true' : 'false'); }});
+const pathList = document.querySelector('#new-library-paths'); document.querySelector('#add-path')?.addEventListener('click', () => {{ const row = document.createElement('div'); row.className = 'path-row'; row.innerHTML = '<input name="path[]" type="text" placeholder="/path/to/folder" required><a href="/settings/browse">Browse</a><button type="button" class="remove-path">−</button>'; row.querySelector('.remove-path').addEventListener('click', () => {{ row.remove(); }}); pathList.appendChild(row); }});
+</script></body></html>"#,
+        sidebar_nav_with_settings(false, true),
+        html(query.folder.as_deref().unwrap_or("")),
+        list
+    ))
+    .into_response()
+}
+
+async fn settings_browse(Query(query): Query<BrowseQuery>) -> Response {
+    let at_root = query.path.is_none();
+    let directory = query
+        .path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+    let Ok(metadata) = tokio::fs::metadata(&directory).await else {
+        return (StatusCode::NOT_FOUND, "Directory does not exist").into_response();
+    };
+    if !metadata.is_dir() {
+        return (StatusCode::BAD_REQUEST, "Path is not a directory").into_response();
+    }
+    let mut entries = match tokio::fs::read_dir(&directory).await {
+        Ok(entries) => entries,
+        Err(_) => return StatusCode::FORBIDDEN.into_response(),
+    };
+    let mut folders = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type().await.is_ok_and(|kind| kind.is_dir()) {
+            folders.push((name, path));
+        }
+    }
+    folders.sort_by_key(|(name, _)| name.to_ascii_lowercase());
+    let parent = directory.parent().unwrap_or(&directory);
+    let items = folders
+        .iter()
+        .map(|(name, path)| {
+            let encoded = url_encode(&path.to_string_lossy());
+            format!(
+                "<li class=\"folder\"><span class=\"folder-name\">📁 {}</span><span><a class=\"open\" href=\"/settings/browse?path={}\">Open</a><a class=\"choose\" href=\"/settings?folder={}\">Choose</a></span></li>",
+                html(name), encoded, encoded
+            )
+        })
+        .collect::<String>();
+    let shortcuts = if at_root {
+        let candidates = [
+            std::env::current_dir().ok(),
+            Some(PathBuf::from("/Users")),
+            Some(PathBuf::from("/Volumes")),
+            Some(PathBuf::from("/home")),
+            Some(PathBuf::from("/mnt")),
+            Some(PathBuf::from("/media")),
+        ];
+        candidates
+            .into_iter()
+            .flatten()
+            .filter(|path| path.is_dir())
+            .map(|path| {
+                format!(
+                    "<a class=\"shortcut\" href=\"/settings/browse?path={}\">📂 {}</a>",
+                    url_encode(&path.to_string_lossy()),
+                    html(&path.to_string_lossy())
+                )
+            })
+            .collect::<String>()
+    } else {
+        String::new()
+    };
+    Html(format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Choose folder · mPlex</title><style>body {{ margin: 0; padding: 2rem; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} main {{ max-width: 820px; margin: auto; }} a {{ color: #93c5fd; }} .toolbar {{ display: flex; flex-wrap: wrap; gap: .6rem; margin: 1.2rem 0; }} .shortcut, .action {{ display: inline-block; padding: .6rem .8rem; border: 1px solid #374151; border-radius: .5rem; text-decoration: none; background: #1f2937; }} .folder-list {{ padding: 0; list-style: none; border: 1px solid #374151; border-radius: .6rem; overflow: hidden; }} .folder {{ display: flex; justify-content: space-between; gap: 1rem; padding: .8rem 1rem; border-bottom: 1px solid #374151; }} .folder:last-child {{ border-bottom: 0; }} .open {{ margin-right: 1rem; }} code, .note {{ color: #9ca3af; overflow-wrap: anywhere; }} </style></head><body><main><p><a href="/settings">← Back to Settings</a></p><h1>Choose a media folder</h1><p class="note">Pick a folder on the mPlex server. You can add more folders to the same library after this.</p><p><strong>Current folder:</strong> <code>{}</code></p><div class="toolbar"><a class="action" href="/settings/browse?path={}">⬆ Parent</a><a class="action" href="/settings?folder={}">Choose this folder</a></div>{}<ul class="folder-list">{}</ul></main></body></html>"#,
+        html(&directory.to_string_lossy()),
+        url_encode(&parent.to_string_lossy()),
+        url_encode(&directory.to_string_lossy()),
+        shortcuts,
+        items
+    )).into_response()
+}
+
+async fn create_library(State(state): State<AppState>, RawForm(raw): RawForm) -> Response {
+    let fields = match serde_urlencoded::from_bytes::<Vec<(String, String)>>(&raw) {
+        Ok(fields) => fields,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid library form").into_response(),
+    };
+    let mut name = String::new();
+    let mut kind = String::new();
+    let mut paths = Vec::new();
+    for (key, value) in fields {
+        match key.as_str() {
+            "name" => name = value,
+            "kind" => kind = value,
+            "path" | "path[]" => paths.push(value),
+            _ => {}
+        }
+    }
+    let kind = match kind.as_str() {
+        "movie" | "tv" | "other" => kind,
+        _ => return (StatusCode::BAD_REQUEST, "Invalid library type").into_response(),
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Library name is required").into_response();
+    }
+    if paths.is_empty() {
+        return (StatusCode::BAD_REQUEST, "At least one folder is required").into_response();
+    }
+    let mut canonical_paths = Vec::with_capacity(paths.len());
+    for value in paths
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        let Ok(path_metadata) = tokio::fs::metadata(value).await else {
+            return (StatusCode::BAD_REQUEST, "Directory does not exist").into_response();
+        };
+        if !path_metadata.is_dir() {
+            return (StatusCode::BAD_REQUEST, "Path is not a directory").into_response();
+        }
+        let Ok(path) = tokio::fs::canonicalize(value).await else {
+            return (StatusCode::BAD_REQUEST, "Directory could not be resolved").into_response();
+        };
+        if !canonical_paths.contains(&path) {
+            canonical_paths.push(path);
+        }
+    }
+    if canonical_paths.is_empty() {
+        return (StatusCode::BAD_REQUEST, "At least one folder is required").into_response();
+    }
+    let Ok(mut config) = state.config.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if config.libraries.iter().any(|library| library.name == name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "A library with that name already exists",
+        )
+            .into_response();
+    }
+    config.libraries.push(ConfigLibrary {
+        name: name.to_owned(),
+        kind,
+        folders: canonical_paths,
+    });
+    if save_config(&state.config_path, &config).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    Redirect::to("/settings").into_response()
+}
+
+async fn add_library_folder(
+    State(state): State<AppState>,
+    Form(form): Form<LibraryFolderForm>,
+) -> Response {
+    let requested = PathBuf::from(form.path.trim());
+    let Ok(metadata) = tokio::fs::metadata(&requested).await else {
+        return (StatusCode::BAD_REQUEST, "Directory does not exist").into_response();
+    };
+    if !metadata.is_dir() {
+        return (StatusCode::BAD_REQUEST, "Path is not a directory").into_response();
+    }
+    let Ok(path) = tokio::fs::canonicalize(requested).await else {
+        return (StatusCode::BAD_REQUEST, "Directory could not be resolved").into_response();
+    };
+    let Ok(mut config) = state.config.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Some(library) = config.libraries.get_mut(form.library_id as usize) else {
+        return (StatusCode::BAD_REQUEST, "Library does not exist").into_response();
+    };
+    if library.folders.iter().any(|folder| folder == &path) {
+        return Redirect::to("/settings").into_response();
+    }
+    library.folders.push(path);
+    if save_config(&state.config_path, &config).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    Redirect::to("/settings").into_response()
+}
+
 #[derive(Deserialize, Default)]
 struct WebPath {
     path: Option<String>,
+    library: Option<usize>,
+}
+
+fn selected_library_root(state: &AppState, library: Option<usize>) -> PathBuf {
+    let Ok(config) = state.config.lock() else {
+        return state.root.as_ref().clone();
+    };
+    library
+        .and_then(|index| config.libraries.get(index))
+        .and_then(|library| library.folders.first())
+        .cloned()
+        .unwrap_or_else(|| state.root.as_ref().clone())
+}
+
+async fn home_client(State(state): State<AppState>) -> Response {
+    let Ok(config) = state.config.lock().map(|config| config.clone()) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let libraries = config
+        .libraries
+        .iter()
+        .enumerate()
+        .map(|(index, library)| {
+            format!(
+                "<a class=\"library-card\" href=\"/library?library={}\"><span class=\"library-icon\">{}</span><strong>{}</strong><span class=\"note\">{}</span></a>",
+                index,
+                if library.kind == "tv" { "📺" } else { "🎬" },
+                html(&library.name),
+                format!("{} · {} folders", library_kind_label(&library.kind), library.folders.len())
+            )
+        })
+        .collect::<String>();
+    let continue_watching = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|connection| {
+            let mut statement = connection.prepare("SELECT media_key, position_ms FROM watch_progress WHERE user_id = ?1 AND watched = 0 AND position_ms > 0 ORDER BY updated_at DESC LIMIT 12").ok()?;
+            let rows = statement.query_map([USER_ID], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))).ok()?;
+            Some(rows.filter_map(Result::ok).collect::<Vec<_>>())
+        })
+        .unwrap_or_default()
+        .iter()
+        .map(|(path, position)| {
+            let path_buf = PathBuf::from(path);
+            let title = path_buf.file_stem().and_then(|value| value.to_str()).unwrap_or(path);
+            format!("<a class=\"recent-item\" href=\"/library?path={}\"><strong>{}</strong><span class=\"note\">Resume at {} seconds</span></a>", url_encode(path), html(title), position / 1000)
+        })
+        .collect::<String>();
+    let recent = state
+        .media
+        .iter()
+        .take(12)
+        .map(|media| {
+            format!(
+                "<a class=\"recent-item\" href=\"/library\"><strong>{}</strong><span class=\"note\">Recently added</span></a>",
+                html(&media.title)
+            )
+        })
+        .collect::<String>();
+    Html(format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>mPlex</title><style>body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }} .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }} .sidebar-top {{ display: flex; justify-content: space-between; align-items: center; }} .sidebar-toggle {{ background: none; border: 0; color: #cbd5e1; font-size: 1.3rem; cursor: pointer; }} .sidebar-label {{ padding: 1rem .7rem .4rem; color: #6b7280; font-size: .7rem; text-transform: uppercase; }} .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }} .sidebar-link.active, .sidebar-link:hover {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; }} main {{ max-width: 1100px; width: 100%; box-sizing: border-box; margin: auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; text-decoration: none; }} h1 {{ margin-top: 0; }} .section {{ margin: 2rem 0; }} .library-grid, .recent-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1rem; }} .library-card, .recent-item {{ display: flex; flex-direction: column; gap: .4rem; padding: 1rem; border: 1px solid #374151; border-radius: .7rem; background: #1f2937; }} .library-card:hover, .recent-item:hover {{ border-color: #60a5fa; }} .library-icon {{ font-size: 2rem; }} .note {{ color: #9ca3af; }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; width: 100%; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} .sidebar-label {{ display: none; }} .sidebar-toggle {{ display: none; }} }}</style></head><body><div class="app-shell">{}<main><h1>Home</h1><p class="note">Choose a library to browse, or continue where you left off.</p><section class="section"><h2>Your libraries</h2><div class="library-grid">{}</div></section><section class="section"><h2>Continue watching</h2><div class="recent-grid">{}</div></section><section class="section"><h2>Recently added</h2><div class="recent-grid">{}</div></section></main></div><script>const shell=document.querySelector('.app-shell'), toggle=document.querySelector('.sidebar-toggle'); if(localStorage.getItem('mplex-sidebar-collapsed')==='true') shell.classList.add('sidebar-collapsed'); toggle?.addEventListener('click',()=>{{shell.classList.toggle('sidebar-collapsed');localStorage.setItem('mplex-sidebar-collapsed',shell.classList.contains('sidebar-collapsed')?'true':'false')}});</script></body></html>"#,
+        sidebar_nav_for(&state, std::path::Path::new(""), None), libraries, continue_watching, recent
+    )).into_response()
 }
 
 async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> Response {
@@ -183,7 +851,8 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     if contains_hidden_component(&relative) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let directory = match web_path(&s, &relative).await {
+    let library_root = selected_library_root(&s, query.library);
+    let directory = match web_path(&s, &library_root, &relative).await {
         Ok(path) if path.is_dir() => path,
         Ok(_) => return StatusCode::NOT_FOUND.into_response(),
         Err(status) => return status.into_response(),
@@ -213,7 +882,9 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     directories.sort_by_key(|(name, _)| name.to_ascii_lowercase());
     files.sort_by_key(|(name, _, _)| name.to_ascii_lowercase());
 
-    let mut items = breadcrumb_nav(&relative);
+    let mut items = String::new();
+    items.push_str(&breadcrumb_nav(&relative));
+    let sidebar = sidebar_nav_for(&s, &relative, query.library);
     let mut folder_cards = String::new();
     let mut empty_folders = String::new();
     let mut has_content = false;
@@ -260,7 +931,29 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
   <style>
     :root {{ color-scheme: dark; font-family: system-ui, sans-serif; }}
     body {{ margin: 0; background: #111827; color: #f9fafb; }}
-    main {{ max-width: 1100px; margin: 0 auto; padding: 2rem 1rem; }}
+    .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; transition: grid-template-columns .2s ease; }}
+    .app-shell.sidebar-collapsed {{ grid-template-columns: 68px minmax(0, 1fr); }}
+    .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }}
+    .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; letter-spacing: .02em; }}
+    .sidebar-top {{ display: flex; align-items: center; justify-content: space-between; gap: .4rem; padding-bottom: 1rem; }}
+    .sidebar-top .sidebar-brand {{ padding-bottom: 0; }}
+    .sidebar-toggle {{ display: grid; place-items: center; width: 2rem; height: 2rem; border: 0; border-radius: .4rem; color: #cbd5e1; background: transparent; cursor: pointer; font-size: 1.15rem; }}
+    .sidebar-toggle:hover {{ background: #17243a; color: #fff; }}
+    .sidebar-label {{ padding: 0 .7rem .45rem; color: #6b7280; font-size: .7rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }}
+    .sidebar-nav {{ display: grid; gap: .25rem; }}
+    .sidebar-link {{ display: flex; align-items: center; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }}
+    .sidebar-link:hover {{ background: #17243a; color: #fff; }}
+    .sidebar-link.active {{ background: #1d4ed8; color: #fff; }}
+    .sidebar-icon {{ width: 1.3rem; text-align: center; font-size: 1.1rem; }}
+    .sidebar-libraries {{ display: grid; gap: .15rem; margin: .2rem 0 .45rem 2rem; }}
+    .sidebar-library {{ padding: .35rem .55rem; border-radius: .35rem; color: #94a3b8; font-size: .9rem; text-decoration: none; overflow-wrap: anywhere; }}
+    .sidebar-library:hover, .sidebar-library.active {{ color: #fff; background: #17243a; }}
+    .sidebar-collapsed .sidebar-top {{ justify-content: center; }}
+    .sidebar-collapsed .sidebar-brand, .sidebar-collapsed .sidebar-label, .sidebar-collapsed .sidebar-link {{ font-size: 0; }}
+    .sidebar-collapsed .sidebar-toggle {{ transform: rotate(180deg); }}
+    .sidebar-collapsed .sidebar-link {{ justify-content: center; padding-left: 0; padding-right: 0; }}
+    .sidebar-collapsed .sidebar-icon {{ font-size: 1.1rem; }}
+    main {{ min-width: 0; max-width: 1100px; width: 100%; box-sizing: border-box; margin: 0 auto; padding: 2rem 1rem; }}
     h1 {{ margin-top: 0; }}
     .brand {{ color: inherit; text-decoration: none; }}
     .library {{ display: flex; flex-direction: column; align-items: center; gap: 1.25rem; }}
@@ -283,18 +976,61 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     .empty-folder {{ padding: .35rem 0; }}
     a {{ color: #93c5fd; }}
     .note {{ color: #9ca3af; }}
+    @media (max-width: 700px) {{
+      .app-shell {{ display: block; }}
+      .sidebar {{ position: static; height: auto; padding: .7rem; border-right: 0; border-bottom: 1px solid #263244; }}
+      .sidebar-top {{ padding-bottom: .35rem; }}
+      .sidebar-brand {{ display: inline-block; padding: .35rem .55rem; }}
+      .sidebar-toggle {{ display: none; }}
+      .sidebar-label {{ display: none; }}
+      .sidebar-nav {{ display: flex; overflow-x: auto; }}
+      .sidebar-link {{ white-space: nowrap; }}
+      main {{ padding-top: 1.25rem; }}
+    }}
   </style>
 </head>
 <body>
-  <main>
-    <h1><a class="brand" href="/">mPlex</a></h1>
+  <div class="app-shell">
+    {}
+    <main>
+    <h1>Library</h1>
     <p class="note">Browse the configured directory. Use ←/→ to seek 5 seconds, Space to play/pause, and F for fullscreen.</p>
     <section class="library">{}</section>
-  </main>
+    </main>
+  </div>
   <script>
+    const shell = window.document.querySelector(".app-shell");
+    const sidebarToggle = window.document.querySelector(".sidebar-toggle");
+    if (window.localStorage.getItem("mplex-sidebar-collapsed") === "true") shell.classList.add("sidebar-collapsed");
+    sidebarToggle?.addEventListener("click", () => {{
+      const collapsed = shell.classList.toggle("sidebar-collapsed");
+      window.localStorage.setItem("mplex-sidebar-collapsed", collapsed ? "true" : "false");
+      sidebarToggle.setAttribute("aria-expanded", String(!collapsed));
+    }});
     document.querySelectorAll("video").forEach(video => {{
       video.volume = 1;
       video.muted = false;
+      const path = video.dataset.progressPath;
+      if (!path) return;
+      fetch(`/web/progress?path=${{encodeURIComponent(path)}}`, {{ cache: "no-store" }})
+        .then(response => response.ok ? response.json() : null)
+        .then(progress => {{
+          if (!progress || progress.watched || !Number.isFinite(progress.positionMs) || progress.positionMs <= 2) return;
+          const resume = () => {{ if (progress.positionMs / 1000 < video.duration - 5) video.currentTime = progress.positionMs / 1000; }};
+          if (video.readyState >= 1) resume();
+          else video.addEventListener("loadedmetadata", resume, {{ once: true }});
+        }}).catch(() => {{}});
+      let saveTimer;
+      const save = watched => {{
+        clearTimeout(saveTimer);
+        saveTimer = setTimeout(() => fetch("/web/progress", {{
+          method: "POST", headers: {{ "content-type": "application/json" }},
+          body: JSON.stringify({{ path, position_ms: Math.round(video.currentTime * 1000), duration_ms: Number.isFinite(video.duration) ? Math.round(video.duration * 1000) : null, watched }})
+        }}).catch(() => {{}}), 500);
+      }};
+      video.addEventListener("timeupdate", () => {{ if (!video.paused) save(false); }});
+      video.addEventListener("pause", () => save(false));
+      video.addEventListener("ended", () => save(true));
     }});
     let selectedVideo = null;
     document.addEventListener("pointerover", event => {{
@@ -347,6 +1083,7 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
   </script>
 </body>
 </html>"#,
+        sidebar,
         items
         )),
     )
@@ -357,7 +1094,7 @@ fn web_client_item(name: &str, relative: &str, mime: &str) -> String {
     let stream_path = url_encode(relative);
     format!(
         r#"<article>
-  <video controls preload="metadata" src="/web/stream?path={}" type="{}">
+  <video controls preload="metadata" data-progress-path="{}" src="/web/stream?path={}" type="{}">
     Your browser does not support HTML video. <a href="/web/stream?path={}">Open the stream</a>.
   </video>
   <div class="details">
@@ -365,6 +1102,7 @@ fn web_client_item(name: &str, relative: &str, mime: &str) -> String {
     <a href="/web/stream?path={}">Open stream</a>
   </div>
 </article>"#,
+        html(relative),
         stream_path,
         mime,
         url_encode(relative),
@@ -373,9 +1111,81 @@ fn web_client_item(name: &str, relative: &str, mime: &str) -> String {
     )
 }
 
+fn sidebar_nav(relative: &std::path::Path) -> String {
+    sidebar_nav_with_settings(relative.as_os_str().is_empty() == false, false)
+}
+
+fn sidebar_nav_for(
+    state: &AppState,
+    relative: &std::path::Path,
+    selected_library: Option<usize>,
+) -> String {
+    let library_links = state
+        .config
+        .lock()
+        .ok()
+        .map(|config| {
+            config
+                .libraries
+                .iter()
+                .enumerate()
+                .map(|(index, library)| {
+                    format!(
+                        "<a class=\"sidebar-library {}\" href=\"/library?library={}\">{}</a>",
+                        if selected_library == Some(index) {
+                            "active"
+                        } else {
+                            ""
+                        },
+                        index,
+                        html(&library.name)
+                    )
+                })
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    sidebar_nav_with_library_links(
+        relative.as_os_str().is_empty() == false,
+        false,
+        &library_links,
+    )
+}
+
+fn sidebar_nav_with_settings(relative_is_nested: bool, settings_active: bool) -> String {
+    sidebar_nav_with_library_links(relative_is_nested, settings_active, "")
+}
+
+fn sidebar_nav_with_library_links(
+    relative_is_nested: bool,
+    settings_active: bool,
+    library_links: &str,
+) -> String {
+    let library_active = relative_is_nested && !settings_active;
+    let home_active = !relative_is_nested && !settings_active;
+    format!(
+        r#"<aside class="sidebar">
+  <div class="sidebar-top">
+    <a class="sidebar-brand" href="/">mPlex</a>
+    <button class="sidebar-toggle" type="button" aria-label="Collapse sidebar" aria-expanded="true" title="Collapse sidebar">‹</button>
+  </div>
+  <div class="sidebar-label">Browse</div>
+  <nav class="sidebar-nav" aria-label="Main navigation">
+    <a class="sidebar-link {}" href="/"><span class="sidebar-icon">⌂</span>Home</a>
+    <a class="sidebar-link {}" href="/library"><span class="sidebar-icon">▦</span>Library</a>
+    <div class="sidebar-libraries">{}</div>
+    <a class="sidebar-link {}" href="/settings"><span class="sidebar-icon">⚙</span>Settings</a>
+  </nav>
+</aside>"#,
+        if home_active { "active" } else { "" },
+        if library_active { "active" } else { "" },
+        library_links,
+        if settings_active { "active" } else { "" },
+    )
+}
+
 fn breadcrumb_nav(relative: &std::path::Path) -> String {
     let mut nav = String::from(r#"<nav class="breadcrumb" aria-label="Breadcrumb">"#);
-    nav.push_str(r#"<a href="/">mPlex</a>"#);
+    nav.push_str(r#"<a href="/library">mPlex</a>"#);
     let mut current = PathBuf::new();
     for component in relative.components() {
         let Component::Normal(name) = component else {
@@ -456,7 +1266,8 @@ async fn web_stream(
     if contains_hidden_component(&relative) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let path = match web_path(&s, &relative).await {
+    let library_root = selected_library_root(&s, query.library);
+    let path = match web_path(&s, &library_root, &relative).await {
         Ok(path) => path,
         Err(status) => return status.into_response(),
     };
@@ -484,11 +1295,15 @@ async fn web_stream(
     stream_file(&media, method, headers).await
 }
 
-async fn web_path(state: &AppState, relative: &std::path::Path) -> Result<PathBuf, StatusCode> {
-    let path = tokio::fs::canonicalize(state.root.join(relative))
+async fn web_path(
+    _state: &AppState,
+    root: &std::path::Path,
+    relative: &std::path::Path,
+) -> Result<PathBuf, StatusCode> {
+    let path = tokio::fs::canonicalize(root.join(relative))
         .await
         .map_err(|_| StatusCode::NOT_FOUND)?;
-    if path.starts_with(state.root.as_ref()) {
+    if path.starts_with(root) {
         Ok(path)
     } else {
         Err(StatusCode::FORBIDDEN)
@@ -532,9 +1347,36 @@ fn url_encode(value: &str) -> String {
         .collect()
 }
 
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 async fn log_not_found(req: Request<Body>) -> StatusCode {
     warn!(method = %req.method(), path = %req.uri().path(), "unsupported route");
     StatusCode::NOT_FOUND
+}
+
+async fn root_handler(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    let is_plex_client = headers.contains_key("X-Plex-Product")
+        || headers.contains_key("X-Plex-Client-Identifier")
+        || headers.contains_key("X-Plex-Token");
+    if is_plex_client {
+        plex_root(&s).await
+    } else {
+        home_client(State(s)).await
+    }
+}
+
+async fn plex_root(state: &AppState) -> Response {
+    plex_xml(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="1" machineIdentifier="{}" title1="Home" friendlyName="mPlex"><Directory key="/library/sections/1" type="movie" title="Movies" agent="com.plexapp.agents.none" scanner="Plex Movie" /></MediaContainer>"#,
+        xml_escape(&state.machine_identifier)
+    ))
 }
 
 fn plex_xml(body: String) -> Response {
@@ -545,8 +1387,11 @@ fn plex_xml(body: String) -> Response {
         .into_response()
 }
 
-async fn plex_identity() -> Response {
-    plex_xml(r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="0" claimed="1" machineIdentifier="mplex" version="1.0"/>"#.into())
+async fn plex_identity(State(state): State<AppState>) -> Response {
+    plex_xml(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="0" claimed="1" machineIdentifier="{}" version="1.0"/>"#,
+        xml_escape(&state.machine_identifier)
+    ))
 }
 
 async fn plex_sections() -> Response {
@@ -799,7 +1644,10 @@ fn html(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_relative_path, contains_hidden_component, html, parse_range};
+    use super::{
+        clean_relative_path, contains_hidden_component, html, parse_range, sidebar_nav,
+        sidebar_nav_with_settings,
+    };
     #[test]
     fn full_file() {
         assert_eq!(parse_range(None, 10), Ok((0, 9)));
@@ -840,5 +1688,16 @@ mod tests {
         assert!(!contains_hidden_component(std::path::Path::new(
             "folder/video.mp4"
         )));
+    }
+    #[test]
+    fn sidebar_links_to_home_and_library() {
+        let sidebar = sidebar_nav(std::path::Path::new("shows"));
+        assert!(sidebar.contains("href=\"/\""));
+        assert!(sidebar.contains("href=\"/library\""));
+        assert!(sidebar.contains("class=\"sidebar-link active\""));
+        assert!(sidebar.contains("sidebar-toggle"));
+        let settings = sidebar_nav_with_settings(false, true);
+        assert!(settings.contains("href=\"/settings\""));
+        assert!(!settings.contains("<a class=\"sidebar-link active\" href=\"/\""));
     }
 }

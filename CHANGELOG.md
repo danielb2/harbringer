@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+- Simplified `just dev` to use the application’s default `./config/mplex.toml` without supplying `--config`; explicit config overrides remain available on direct `cargo run` commands.
+- Split Home from Library: Home now provides the dashboard, Continue Watching, Recently Added, and library cards; Library is the browsing view, with configured libraries listed as a sidebar submenu instead of an in-content dropdown.
+- Reflection: navigation now distinguishes dashboard content from library browsing and makes each configured library directly selectable; `cargo test`, `cargo fmt`, `just --fmt --check`, and `git diff --check` were run.
+- Added persistent web-player progress: playback resumes from the saved position, saves periodically and on pause, and marks a file watched when it ends.
+- Reflection: watch state uses the existing SQLite cache without making streaming depend on successful progress writes; `cargo test`, `cargo fmt`, `just --fmt --check`, and `git diff --check` were run.
+- Fixed repeated-folder form parsing by reading raw URL-encoded fields, so creating a library with one or multiple paths no longer fails deserialization.
+- Fixed multi-folder library form deserialization by encoding folder fields as `path[]`, matching the Rust vector form model.
+- Reworked the folder picker into a friendlier server-directory browser with sensible starting locations, shortcut roots, folder cards, breadcrumbs via parent navigation, and prominent Choose this folder actions.
+- Reflection: selecting a library path no longer begins at a raw filesystem root or requires shell copy/paste; `cargo test`, `cargo fmt`, `just --fmt --check`, and `git diff --check` were run.
+- Added a server-side folder browser to library creation, with a visible Add Library action and Browse/Choose controls so users can select media directories without copying shell paths.
+- Reflection: library setup is now discoverable from the UI and still supports multiple separate folder entries; `cargo test`, `cargo fmt`, `just --fmt --check`, and `git diff --check` were run.
+- Changed new-library creation to use a separate folder list with a `＋` add-row control and server-side enforcement of at least one folder.
+- Reflection: multiple paths are now represented as distinct editable values during creation instead of being compressed into one line; `cargo test`, `cargo fmt -- --check`, `just --fmt --check`, and `git diff --check` were run.
+- Changed each library’s folder management to a visible `＋ Add folder` action that expands its own path form, matching Plex’s library-editing workflow for adding multiple folders.
+- Reflection: additional paths are now visually attached to the selected library instead of appearing as another library-level form; `cargo test`, `cargo fmt -- --check`, `just --fmt --check`, and `git diff --check` were run.
+- Improved library creation so a new library requires its first validated folder, then exposes an explicit Add folder action for attaching additional paths to that same library.
+- Reflection: the settings flow now matches the intended library model instead of creating empty or ambiguous entries; `cargo test`, `cargo fmt -- --check`, `just --fmt --check`, and `git diff --check` were run.
+- Made `--config` a true optional override. Running `cargo run` or the built executable now creates and uses `./config/mplex.toml` automatically.
+- Fixed `just dev` restart loops by making unchanged TOML configuration writes idempotent while the config file is watched.
+- Reflection: startup no longer touches `config/mplex.toml` unless its contents change; `cargo test`, `cargo fmt -- --check`, `just --fmt --check`, and `git diff --check` were run.
+- Replaced the required `--dir` startup model with a portable TOML configuration file. Named libraries, types, folders, bind address, and token are loaded from `mplex.toml`; SQLite is now treated as a cache/state database beside it.
+- Defaulted configuration to `./config/mplex.toml`; `--config` now overrides the configuration directory, with direct `.toml` paths also accepted.
+- Updated `just dev` to use the config directory and watch its TOML file.
+- Reflection: the user-editable setup can now be backed up independently from rebuildable discovered state; `cargo test`, `cargo fmt -- --check`, `just --fmt --check`, and `git diff --check` were run.
+- Reworked library settings so a named library owns one type (Movies, TV Shows, or Other) and can contain multiple monitored folders. Existing directory entries migrate into a Default Library automatically.
+- Reflection: the database now models the user-facing library concept instead of treating every folder as a separate library; `cargo test`, `cargo fmt`, `just --fmt --check`, and `git diff --check` were run.
+- Fixed Settings navigation so Home is not shown as active there, and added Movies, TV Shows, and Other library types with SQLite persistence and migration for existing databases.
+- Reflection: library categories now capture the intended presentation type while leaving scanning and playback shared; `cargo test`, `cargo fmt`, `just --fmt --check`, and `git diff --check` were run.
+- Made the explorer/sidebar persistent across the Settings page as well as the media browser, including the same collapse preference and active Settings state.
+- Reflection: all web-client screens now share one navigation model instead of making Settings a separate dead-end page; `cargo test`, `cargo fmt`, `just --fmt --check`, and `git diff --check` were run.
+- Added a Settings page for adding validated library directories. Library paths are persisted in SQLite and all saved libraries are scanned on startup.
+- Reflection: the initial configured directory remains the web browser root while Plex inventory includes every saved library; live rescan and per-library browser navigation remain follow-up work. `cargo test`, `cargo fmt`, `just --fmt --check`, and `git diff --check` were run.
+- Made the web-client sidebar collapsible on desktop, with the preference saved in local storage and a compact responsive navigation bar on mobile.
+- Reflection: collapsing preserves icon navigation and leaves the media workspace more room; `cargo test`, `cargo fmt -- --check`, `just --fmt --check`, and `git diff --check` were run.
+- Added a left-hand web-client navigation rail with Home and Library links, active-location styling, and a compact horizontal layout on small screens.
+- Reflection: the sidebar makes the browser feel like an application shell while preserving breadcrumbs for folder-level navigation; `cargo test`, `cargo fmt -- --check`, `just --fmt --check`, and `git diff --check` were run.
+- Added a SQLite state database under the configured media root. It persists the server identity and records the current scanned media inventory, with tables reserved for users, watch progress, and artwork.
+- Updated Plex root and identity responses to use the persisted machine identifier.
+- Reflection: this establishes the storage required for a real Plex replacement without making playback depend on database availability beyond startup; metadata matching, watch-state APIs, and Plex.tv registration remain incomplete. `cargo fmt`, `cargo test`, and `git diff --check` were run.
+- Documented the broader mPlex direction: a small shared media engine with Plex/Jellyfin adapters, standalone and embeddable forms, and future Weaver/Scryer seekable-source integration.
+- Recorded the persistence requirement for per-user watch progress, Plex/account identity, and artwork/presentation state.
+- Recorded the requirement to match local files to movies and series and scrape metadata/artwork without blocking direct playback.
+- Added `ROADMAP.md` with the drop-in Plex replacement checklist and dated gap log.
+- Reflection: the documentation now distinguishes the current directory-serving MVP from the longer-term architecture; no implementation behavior changed and no new validation was required.
 - Added an ASCII startup banner showing the bound port and an easy local web-client URL.
 - Reflection: the URL is derived from the listener's actual address, including ephemeral ports, and invalid ports remain rejected by normal socket parsing; `cargo fmt -- --check`, `cargo test`, and `just --fmt --check` were run.
 - Added a small built-in web client at `/` with browser video players and a `just dev` convenience target.
