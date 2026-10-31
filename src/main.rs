@@ -454,6 +454,7 @@ struct LibraryFolderForm {
 #[derive(Deserialize, Default)]
 struct SettingsQuery {
     folder: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -565,6 +566,16 @@ async fn settings_page(
             )
         })
         .collect::<String>();
+    let error = query
+        .error
+        .as_deref()
+        .map(|message| {
+            format!(
+                "<div class=\"flash-error\" role=\"alert\">{}</div>",
+                html(message)
+            )
+        })
+        .unwrap_or_default();
     Html(format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -581,10 +592,11 @@ body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, 
 main {{ min-width: 0; max-width: 760px; width: 100%; box-sizing: border-box; margin: 0 auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; }}
 form {{ display: flex; gap: .6rem; margin: 1.5rem 0; }} input, select {{ flex: 1; padding: .7rem; border: 1px solid #4b5563; border-radius: .4rem; color: #fff; background: #1f2937; }} .path-list {{ display: grid; gap: .55rem; flex: 2; }} .path-row {{ display: flex; gap: .5rem; }} .path-row input {{ min-width: 0; }}
 button {{ padding: .7rem 1rem; border: 0; border-radius: .4rem; color: #fff; background: #2563eb; cursor: pointer; }} li {{ margin: .65rem 0; overflow-wrap: anywhere; }} .note {{ color: #9ca3af; }}
+ .flash-error {{ margin: 1rem 0; padding: .8rem 1rem; border: 1px solid #ef4444; border-radius: .5rem; color: #fecaca; background: #451a1a; }}
 details {{ margin-top: .7rem; }} summary {{ display: inline-block; padding: .45rem .7rem; border: 1px solid #3b82f6; border-radius: .4rem; color: #bfdbfe; cursor: pointer; list-style: none; }} summary::-webkit-details-marker {{ display: none; }} details form {{ margin: .7rem 0 0; }}
 @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; padding: .7rem; border-right: 0; border-bottom: 1px solid #263244; }} .sidebar-top {{ padding-bottom: .35rem; }} .sidebar-brand {{ padding: .35rem .55rem; }} .sidebar-toggle {{ display: none; }} .sidebar-label {{ display: none; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} }}
 </style></head><body><div class="app-shell">{}
-<main><h1>Settings</h1>
+<main><h1>Settings</h1>{}
 <p class="note">A library is a named collection with one type and one or more monitored folders. Create it with its first folder, then add more folders to that same library below.</p>
 <details open><summary>＋ Add library</summary><form method="post" action="/settings/libraries"><input name="name" type="text" placeholder="Library name" required><select name="kind"><option value="movie">Movies</option><option value="tv">TV Shows</option><option value="other">Other</option></select><div class="path-list" id="new-library-paths"><div class="path-row"><input name="path[]" type="text" placeholder="/path/to/folder" value="{}" required><a href="/settings/browse">Browse</a><button type="button" class="remove-path" disabled>−</button></div></div><button type="button" id="add-path">＋</button><button type="submit">Create library</button></form></details>
 <h2>Libraries</h2><ul>{}</ul>
@@ -595,10 +607,16 @@ toggle?.addEventListener('click', () => {{ const collapsed = shell.classList.tog
 const pathList = document.querySelector('#new-library-paths'); document.querySelector('#add-path')?.addEventListener('click', () => {{ const row = document.createElement('div'); row.className = 'path-row'; row.innerHTML = '<input name="path[]" type="text" placeholder="/path/to/folder" required><a href="/settings/browse">Browse</a><button type="button" class="remove-path">−</button>'; row.querySelector('.remove-path').addEventListener('click', () => {{ row.remove(); }}); pathList.appendChild(row); }});
 </script></body></html>"#,
         sidebar_nav_with_settings(false, true),
+        error,
         html(query.folder.as_deref().unwrap_or("")),
         list
     ))
     .into_response()
+}
+
+fn settings_error(message: &str) -> Response {
+    let location = format!("/settings?error={}", url_encode(message));
+    Redirect::to(&location).into_response()
 }
 
 async fn settings_browse(Query(query): Query<BrowseQuery>) -> Response {
@@ -677,7 +695,7 @@ async fn settings_browse(Query(query): Query<BrowseQuery>) -> Response {
 async fn create_library(State(state): State<AppState>, RawForm(raw): RawForm) -> Response {
     let fields = match serde_urlencoded::from_bytes::<Vec<(String, String)>>(&raw) {
         Ok(fields) => fields,
-        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid library form").into_response(),
+        Err(_) => return settings_error("Invalid library form"),
     };
     let mut name = String::new();
     let mut kind = String::new();
@@ -692,14 +710,14 @@ async fn create_library(State(state): State<AppState>, RawForm(raw): RawForm) ->
     }
     let kind = match kind.as_str() {
         "movie" | "tv" | "other" => kind,
-        _ => return (StatusCode::BAD_REQUEST, "Invalid library type").into_response(),
+        _ => return settings_error("Invalid library type"),
     };
     let name = name.trim();
     if name.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Library name is required").into_response();
+        return settings_error("Library name is required");
     }
     if paths.is_empty() {
-        return (StatusCode::BAD_REQUEST, "At least one folder is required").into_response();
+        return settings_error("At least one folder is required");
     }
     let mut canonical_paths = Vec::with_capacity(paths.len());
     for value in paths
@@ -708,30 +726,26 @@ async fn create_library(State(state): State<AppState>, RawForm(raw): RawForm) ->
         .filter(|value| !value.is_empty())
     {
         let Ok(path_metadata) = tokio::fs::metadata(value).await else {
-            return (StatusCode::BAD_REQUEST, "Directory does not exist").into_response();
+            return settings_error(&format!("Directory does not exist: {}", value));
         };
         if !path_metadata.is_dir() {
-            return (StatusCode::BAD_REQUEST, "Path is not a directory").into_response();
+            return settings_error(&format!("Not a directory: {}", value));
         }
         let Ok(path) = tokio::fs::canonicalize(value).await else {
-            return (StatusCode::BAD_REQUEST, "Directory could not be resolved").into_response();
+            return settings_error(&format!("Directory could not be resolved: {}", value));
         };
         if !canonical_paths.contains(&path) {
             canonical_paths.push(path);
         }
     }
     if canonical_paths.is_empty() {
-        return (StatusCode::BAD_REQUEST, "At least one folder is required").into_response();
+        return settings_error("At least one folder is required");
     }
     let Ok(mut config) = state.config.lock() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     if config.libraries.iter().any(|library| library.name == name) {
-        return (
-            StatusCode::BAD_REQUEST,
-            "A library with that name already exists",
-        )
-            .into_response();
+        return settings_error("A library with that name already exists");
     }
     config.libraries.push(ConfigLibrary {
         name: name.to_owned(),
@@ -750,19 +764,19 @@ async fn add_library_folder(
 ) -> Response {
     let requested = PathBuf::from(form.path.trim());
     let Ok(metadata) = tokio::fs::metadata(&requested).await else {
-        return (StatusCode::BAD_REQUEST, "Directory does not exist").into_response();
+        return settings_error("Directory does not exist");
     };
     if !metadata.is_dir() {
-        return (StatusCode::BAD_REQUEST, "Path is not a directory").into_response();
+        return settings_error("Path is not a directory");
     }
     let Ok(path) = tokio::fs::canonicalize(requested).await else {
-        return (StatusCode::BAD_REQUEST, "Directory could not be resolved").into_response();
+        return settings_error("Directory could not be resolved");
     };
     let Ok(mut config) = state.config.lock() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let Some(library) = config.libraries.get_mut(form.library_id as usize) else {
-        return (StatusCode::BAD_REQUEST, "Library does not exist").into_response();
+        return settings_error("Library does not exist");
     };
     if library.folders.iter().any(|folder| folder == &path) {
         return Redirect::to("/settings").into_response();
@@ -823,9 +837,15 @@ async fn home_client(State(state): State<AppState>) -> Response {
         .map(|(path, position)| {
             let path_buf = PathBuf::from(path);
             let title = path_buf.file_stem().and_then(|value| value.to_str()).unwrap_or(path);
-            format!("<a class=\"recent-item\" href=\"/library?path={}\"><strong>{}</strong><span class=\"note\">Resume at {} seconds</span></a>", url_encode(path), html(title), position / 1000)
+            let folder = path_buf.parent().unwrap_or(std::path::Path::new(""));
+            format!("<a class=\"continue-item\" href=\"/library?path={}\"><strong>{}</strong><span class=\"note\">Resume at {} seconds</span></a>", url_encode(&folder.to_string_lossy()), html(title), position / 1000)
         })
         .collect::<String>();
+    let continue_watching = if continue_watching.is_empty() {
+        "<p class=\"note empty-state\">Nothing to resume yet. Start watching something and it will appear here.</p>".to_owned()
+    } else {
+        continue_watching
+    };
     let recent = state
         .media
         .iter()
@@ -838,8 +858,8 @@ async fn home_client(State(state): State<AppState>) -> Response {
         })
         .collect::<String>();
     Html(format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>mPlex</title><style>body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }} .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }} .sidebar-top {{ display: flex; justify-content: space-between; align-items: center; }} .sidebar-toggle {{ background: none; border: 0; color: #cbd5e1; font-size: 1.3rem; cursor: pointer; }} .sidebar-label {{ padding: 1rem .7rem .4rem; color: #6b7280; font-size: .7rem; text-transform: uppercase; }} .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }} .sidebar-link.active, .sidebar-link:hover {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; }} main {{ max-width: 1100px; width: 100%; box-sizing: border-box; margin: auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; text-decoration: none; }} h1 {{ margin-top: 0; }} .section {{ margin: 2rem 0; }} .library-grid, .recent-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1rem; }} .library-card, .recent-item {{ display: flex; flex-direction: column; gap: .4rem; padding: 1rem; border: 1px solid #374151; border-radius: .7rem; background: #1f2937; }} .library-card:hover, .recent-item:hover {{ border-color: #60a5fa; }} .library-icon {{ font-size: 2rem; }} .note {{ color: #9ca3af; }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; width: 100%; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} .sidebar-label {{ display: none; }} .sidebar-toggle {{ display: none; }} }}</style></head><body><div class="app-shell">{}<main><h1>Home</h1><p class="note">Choose a library to browse, or continue where you left off.</p><section class="section"><h2>Your libraries</h2><div class="library-grid">{}</div></section><section class="section"><h2>Continue watching</h2><div class="recent-grid">{}</div></section><section class="section"><h2>Recently added</h2><div class="recent-grid">{}</div></section></main></div><script>const shell=document.querySelector('.app-shell'), toggle=document.querySelector('.sidebar-toggle'); if(localStorage.getItem('mplex-sidebar-collapsed')==='true') shell.classList.add('sidebar-collapsed'); toggle?.addEventListener('click',()=>{{shell.classList.toggle('sidebar-collapsed');localStorage.setItem('mplex-sidebar-collapsed',shell.classList.contains('sidebar-collapsed')?'true':'false')}});</script></body></html>"#,
-        sidebar_nav_for(&state, std::path::Path::new(""), None), libraries, continue_watching, recent
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>mPlex</title><style>body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }} .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }} .sidebar-top {{ display: flex; justify-content: space-between; align-items: center; }} .sidebar-toggle {{ background: none; border: 0; color: #cbd5e1; font-size: 1.3rem; cursor: pointer; }} .sidebar-label {{ padding: 1rem .7rem .4rem; color: #6b7280; font-size: .7rem; text-transform: uppercase; }} .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }} .sidebar-link.active, .sidebar-link:hover {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; }} main {{ max-width: 1100px; width: 100%; box-sizing: border-box; margin: auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; text-decoration: none; }} h1 {{ margin-top: 0; }} .section {{ margin: 2rem 0; }} .library-grid, .recent-grid, .continue-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1rem; }} .library-card, .recent-item, .continue-item {{ display: flex; flex-direction: column; gap: .4rem; padding: 1rem; border: 1px solid #374151; border-radius: .7rem; background: #1f2937; }} .continue-item {{ min-height: 130px; justify-content: flex-end; border-color: #2563eb; background: linear-gradient(135deg, #1e3a8a, #1f2937); font-size: 1.05rem; }} .library-card:hover, .recent-item:hover, .continue-item:hover {{ border-color: #60a5fa; }} .library-icon {{ font-size: 2rem; }} .note {{ color: #9ca3af; }} .empty-state {{ padding: 1.5rem; border: 1px dashed #4b5563; border-radius: .7rem; }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; width: 100%; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} .sidebar-label {{ display: none; }} .sidebar-toggle {{ display: none; }} }}</style></head><body><div class="app-shell">{}<main><h1>Home</h1><section class="section"><h2>Continue watching</h2><div class="continue-grid">{}</div></section><section class="section"><h2>Recently added</h2><div class="recent-grid">{}</div></section><section class="section"><h2>Your libraries</h2><div class="library-grid">{}</div></section></main></div><script>const shell=document.querySelector('.app-shell'), toggle=document.querySelector('.sidebar-toggle'); if(localStorage.getItem('mplex-sidebar-collapsed')==='true') shell.classList.add('sidebar-collapsed'); toggle?.addEventListener('click',()=>{{shell.classList.toggle('sidebar-collapsed');localStorage.setItem('mplex-sidebar-collapsed',shell.classList.contains('sidebar-collapsed')?'true':'false')}});</script></body></html>"#,
+        sidebar_nav_for(&state, std::path::Path::new(""), None), continue_watching, recent, libraries
     )).into_response()
 }
 
@@ -883,7 +903,7 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     files.sort_by_key(|(name, _, _)| name.to_ascii_lowercase());
 
     let mut items = String::new();
-    items.push_str(&breadcrumb_nav(&relative));
+    items.push_str(&breadcrumb_nav(&relative, query.library));
     let sidebar = sidebar_nav_for(&s, &relative, query.library);
     let mut folder_cards = String::new();
     let mut empty_folders = String::new();
@@ -893,9 +913,14 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
         let directory = directory.join(&name);
         let media_count = media_file_count(&directory).await;
         if media_count == 0 {
-            empty_folders.push_str(&empty_folder_item(&name, &child_relative));
+            empty_folders.push_str(&empty_folder_item(&name, &child_relative, query.library));
         } else {
-            folder_cards.push_str(&folder_card(&name, &child_relative, media_count));
+            folder_cards.push_str(&folder_card(
+                &name,
+                &child_relative,
+                media_count,
+                query.library,
+            ));
         }
     }
     for (name, child_relative, path) in files {
@@ -907,6 +932,7 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
             &name,
             &child_relative.to_string_lossy(),
             mime,
+            query.library,
         ));
     }
     items.push_str(&folder_cards);
@@ -1090,23 +1116,33 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
         .into_response()
 }
 
-fn web_client_item(name: &str, relative: &str, mime: &str) -> String {
+fn web_client_item(name: &str, relative: &str, mime: &str, library: Option<usize>) -> String {
     let stream_path = url_encode(relative);
+    let library_query = library
+        .map(|index| format!("library={index}&"))
+        .unwrap_or_default();
     format!(
         r#"<article>
-  <video controls preload="metadata" data-progress-path="{}" src="/web/stream?path={}" type="{}">
-    Your browser does not support HTML video. <a href="/web/stream?path={}">Open the stream</a>.
+  <video controls preload="metadata" data-progress-path="{}" src="/web/stream?{}path={}" type="{}">
+    Your browser does not support HTML video. <a href="/web/stream?{}path={}">Open the stream</a>.
   </video>
   <div class="details">
     <h2>{}</h2>
-    <a href="/web/stream?path={}">Open stream</a>
+    <a href="/web/stream?{}path={}">Open stream</a>
   </div>
 </article>"#,
         html(relative),
+        library_query,
         stream_path,
         mime,
+        library
+            .map(|index| format!("library={index}&"))
+            .unwrap_or_default(),
         url_encode(relative),
         html(name),
+        library
+            .map(|index| format!("library={index}&"))
+            .unwrap_or_default(),
         url_encode(relative)
     )
 }
@@ -1183,9 +1219,12 @@ fn sidebar_nav_with_library_links(
     )
 }
 
-fn breadcrumb_nav(relative: &std::path::Path) -> String {
+fn breadcrumb_nav(relative: &std::path::Path, library: Option<usize>) -> String {
     let mut nav = String::from(r#"<nav class="breadcrumb" aria-label="Breadcrumb">"#);
-    nav.push_str(r#"<a href="/library">mPlex</a>"#);
+    let prefix = library
+        .map(|index| format!("library={index}&"))
+        .unwrap_or_default();
+    nav.push_str(&format!(r#"<a href="/library?{}">mPlex</a>"#, prefix));
     let mut current = PathBuf::new();
     for component in relative.components() {
         let Component::Normal(name) = component else {
@@ -1194,7 +1233,8 @@ fn breadcrumb_nav(relative: &std::path::Path) -> String {
         current.push(name);
         let label = name.to_string_lossy();
         nav.push_str(&format!(
-            r#"<span class="breadcrumb-separator">/</span><a href="/?path={}">{}</a>"#,
+            r#"<span class="breadcrumb-separator">/</span><a href="/library?{}path={}">{}</a>"#,
+            prefix,
             url_encode(&current.to_string_lossy()),
             html(&label)
         ));
@@ -1203,17 +1243,25 @@ fn breadcrumb_nav(relative: &std::path::Path) -> String {
     nav
 }
 
-fn folder_card(name: &str, relative: &std::path::Path, media_count: usize) -> String {
+fn folder_card(
+    name: &str,
+    relative: &std::path::Path,
+    media_count: usize,
+    library: Option<usize>,
+) -> String {
     let label = if media_count == 1 {
         "1 media file"
     } else {
         "media files"
     };
     format!(
-        r#"<a class="folder-card" href="/?path={}">
+        r#"<a class="folder-card" href="/library?{}path={}">
   <div class="folder-preview" aria-hidden="true">📁</div>
   <div class="folder-info"><h2>{}</h2><span class="note">{} {}</span></div>
 </a>"#,
+        library
+            .map(|index| format!("library={index}&"))
+            .unwrap_or_default(),
         url_encode(&relative.to_string_lossy()),
         html(name),
         media_count,
@@ -1221,9 +1269,12 @@ fn folder_card(name: &str, relative: &std::path::Path, media_count: usize) -> St
     )
 }
 
-fn empty_folder_item(name: &str, relative: &std::path::Path) -> String {
+fn empty_folder_item(name: &str, relative: &std::path::Path, library: Option<usize>) -> String {
     format!(
-        r#"<div class="empty-folder"><a href="/?path={}">📂 {}</a></div>"#,
+        r#"<div class="empty-folder"><a href="/library?{}path={}">📂 {}</a></div>"#,
+        library
+            .map(|index| format!("library={index}&"))
+            .unwrap_or_default(),
         url_encode(&relative.to_string_lossy()),
         html(name)
     )

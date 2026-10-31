@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Preserved the selected library index in folder cards, breadcrumbs, media stream links, and stream requests so paths from secondary libraries no longer fall back to the first library and 404.
+- Fixed Continue Watching links to open the containing library folder instead of treating a media filename as a directory.
+- Promoted Continue Watching to the first and most prominent Home section, with larger cards and a useful empty state.
+- Fixed library folder and breadcrumb links after the Home/Library split so selecting library content stays in `/library` instead of bouncing to Home.
+- Kept invalid library-folder submissions inside Settings with an inline error notification instead of replacing the page with a plain form-deserialization or validation response.
 - Simplified `just dev` to use the application’s default `./config/mplex.toml` without supplying `--config`; explicit config overrides remain available on direct `cargo run` commands.
 - Split Home from Library: Home now provides the dashboard, Continue Watching, Recently Added, and library cards; Library is the browsing view, with configured libraries listed as a sidebar submenu instead of an in-content dropdown.
 - Reflection: navigation now distinguishes dashboard content from library browsing and makes each configured library directly selectable; `cargo test`, `cargo fmt`, `just --fmt --check`, and `git diff --check` were run.
