@@ -1341,6 +1341,7 @@ struct WebPath {
     library: Option<usize>,
     view: Option<String>,
     kind: Option<String>,
+    stream: Option<usize>,
 }
 
 fn selected_library_root(state: &AppState, library: Option<usize>) -> PathBuf {
@@ -1679,7 +1680,7 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
                 &child_relative.to_string_lossy(),
                 mime,
                 query.library,
-                &subtitle_tracks(&path, &child_relative).await,
+                &subtitle_tracks(&path, &child_relative, query.library).await,
                 artwork,
             ));
         } else {
@@ -2023,10 +2024,14 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
 
 struct SubtitleTrack {
     label: String,
-    path: PathBuf,
+    url: String,
 }
 
-async fn subtitle_tracks(video: &PathBuf, relative: &std::path::Path) -> Vec<SubtitleTrack> {
+async fn subtitle_tracks(
+    video: &PathBuf,
+    relative: &std::path::Path,
+    library: Option<usize>,
+) -> Vec<SubtitleTrack> {
     let Some(stem) = video.file_stem().and_then(|value| value.to_str()) else {
         return Vec::new();
     };
@@ -2064,15 +2069,69 @@ async fn subtitle_tracks(video: &PathBuf, relative: &std::path::Path) -> Vec<Sub
             .replace('_', " ");
         tracks.push(SubtitleTrack {
             label: if label.is_empty() {
-                extension.to_uppercase()
+                format!("External: {}", extension.to_uppercase())
             } else {
-                label
+                format!("External: {label}")
             },
-            path: relative
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
-                .join(path.file_name().unwrap_or_default()),
+            url: format!(
+                "/web/subtitle?{}path={}",
+                library
+                    .map(|index| format!("library={index}&"))
+                    .unwrap_or_default(),
+                url_encode(
+                    &relative
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .join(path.file_name().unwrap_or_default())
+                        .to_string_lossy()
+                )
+            ),
         });
+    }
+    if let Ok(contents) = tokio::fs::read_to_string(
+        video
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join(".mplex/info.toml"),
+    )
+    .await
+    {
+        if let Ok(info) = contents.parse::<toml::Value>() {
+            if let Some(streams) = info
+                .get("technical")
+                .and_then(|value| value.get("streams"))
+                .and_then(toml::Value::as_array)
+            {
+                for stream in streams {
+                    if stream.get("codec_type").and_then(toml::Value::as_str) != Some("subtitle") {
+                        continue;
+                    }
+                    let Some(index) = stream.get("index").and_then(toml::Value::as_integer) else {
+                        continue;
+                    };
+                    let language = stream
+                        .get("tags")
+                        .and_then(|tags| tags.get("language"))
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or("unknown");
+                    let title = stream
+                        .get("tags")
+                        .and_then(|tags| tags.get("title"))
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or(language);
+                    tracks.push(SubtitleTrack {
+                        label: format!("Embedded: {title}"),
+                        url: format!(
+                            "/web/subtitle?{}path={}&stream={index}",
+                            library
+                                .map(|library| format!("library={library}&"))
+                                .unwrap_or_default(),
+                            url_encode(&relative.to_string_lossy())
+                        ),
+                    });
+                }
+            }
+        }
     }
     tracks.sort_by_key(|track| track.label.to_ascii_lowercase());
     tracks
@@ -2090,6 +2149,25 @@ async fn web_subtitle(State(s): State<AppState>, Query(query): Query<WebPath>) -
         Ok(path) => path,
         Err(status) => return status.into_response(),
     };
+    if let Some(stream) = query.stream {
+        let Ok(output) = tokio::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&path)
+            .args(["-map", &format!("0:{stream}"), "-f", "webvtt", "-"])
+            .output()
+            .await
+        else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        if !output.status.success() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        return (
+            [(header::CONTENT_TYPE, "text/vtt; charset=utf-8")],
+            output.stdout,
+        )
+            .into_response();
+    }
     let Ok(contents) = tokio::fs::read_to_string(&path).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -2139,7 +2217,11 @@ async fn media_info_panel(directory: &std::path::Path) -> String {
 fn render_toml_details(table: &toml::map::Map<String, toml::Value>) -> String {
     table
         .iter()
-        .filter(|(key, _)| key.as_str() != "metadata_json" && key.as_str() != "description")
+        .filter(|(key, _)| {
+            key.as_str() != "metadata_json"
+                && key.as_str() != "description"
+                && key.as_str() != "technical"
+        })
         .map(|(key, value)| {
             let rendered = match value {
                 toml::Value::Table(table) => render_toml_details(table),
@@ -2330,10 +2412,9 @@ fn web_client_item(
         .iter()
         .map(|track| {
             format!(
-                "<track kind=\"subtitles\" label=\"{}\" src=\"/web/subtitle?{}path={}\" />",
+                "<track kind=\"subtitles\" label=\"{}\" src=\"{}\" />",
                 html(&track.label),
-                library_query,
-                url_encode(&track.path.to_string_lossy())
+                html(&track.url)
             )
         })
         .collect::<String>();
@@ -2342,17 +2423,18 @@ fn web_client_item(
         .enumerate()
         .map(|(index, track)| {
             format!(
-                r#"<option value="{}">External: {}</option>"#,
+                r#"<option value="{}">{}</option>"#,
                 index,
                 html(&track.label)
             )
         })
         .collect::<String>();
     let subtitle_selector = if subtitles.is_empty() {
-        r#"<span class="subtitle-note">No external subtitles detected; embedded subtitle streams are not currently inspected.</span>"#.to_owned()
+        r#"<span class="subtitle-note">No external or embedded subtitles detected.</span>"#
+            .to_owned()
     } else {
         format!(
-            r#"<label class="subtitle-picker">Subtitles <select class="subtitle-select"><option value="-1">Off</option>{}</select></label><span class="subtitle-note">External sidecar subtitles</span>"#,
+            r#"<label class="subtitle-picker">Subtitles <select class="subtitle-select"><option value="-1">Off</option>{}</select></label><span class="subtitle-note">External and embedded subtitles</span>"#,
             subtitle_options
         )
     };

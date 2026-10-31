@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added embedded subtitle tracks from cached ffprobe stream data. Embedded streams are labeled separately and extracted to WebVTT through `ffmpeg`; external sidecar subtitles remain supported.
 - Fixed Library navbar disappearance caused by a shared CSS format argument being inserted before the sidebar placeholder; Home, Library, and Settings continue to use the shared sidebar renderer.
 - Replaced Continue Watching's unique text card detail with the shared folder-card progress bar, so its visual treatment stays aligned with Library and Recently Added.
 - Added per-library Home-section controls for Recently Added and Continue Watching, persisted in `mplex.toml`.
