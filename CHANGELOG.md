@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Added Home library-card artwork using cached cover/banner files and added a Theatre mode that expands one player across the right-hand content pane without browser fullscreen.
+- Wired cached `.mplex/cover.jpg` and `.mplex/banner.jpg` into web library cards and video posters through a safe artwork route.
+- Corrected content-folder cards to use the cover as the primary image instead of rendering the 10% video frame over it; the frame remains only as a fallback when no cover exists.
+- Metadata scanning now matches one entity per movie folder or TV-show folder instead of querying once per episode/file. Matched metadata is applied to the contained media records, with one sidecar set per entity.
+- Settings now has a prominent Metadata storage section with explicit SQLite-only and `.mplex` sidecar choices.
+- Persisted the storage choice explicitly as `metadata_storage = "database"` or `metadata_storage = "sidecar"` in `mplex.toml`, while migrating the older boolean setting.
+- Changing storage settings no longer revalidates TMDB unless a new token is entered; a blank token field keeps the existing token.
+- Clarified subtitle provenance in the web player: sidecar tracks are labeled `External`, and the UI states that embedded subtitle streams are not currently inspected.
+- Fixed subtitle initialization after the provenance UI change and persist each video's selected external subtitle in browser local storage.
+- Added icon-led Resume and Play from beginning actions to each playable media card.
 - Clarified metadata storage in Settings with an explicit choice between the SQLite cache alone and SQLite plus `.mplex` sidecars in each media folder.
 - Reflection: SQLite remains the runtime cache in both modes; the sidecar option adds portable metadata/artwork files for media folders that may be moved or backed up independently.
 - Changed metadata sidecars to the portable layout `.mplex/cover.jpg`, `.mplex/banner.jpg`, and `.mplex/info.toml`. The TOML includes title, path, description, movie/TV dates, season and episode counts when supplied, plus the complete matched metadata JSON.

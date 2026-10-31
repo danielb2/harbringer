@@ -10,6 +10,7 @@ use clap::Parser;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     net::SocketAddr,
     path::{Component, PathBuf},
     sync::{Arc, Mutex},
@@ -45,6 +46,8 @@ struct Config {
     libraries: Vec<ConfigLibrary>,
     #[serde(default)]
     metadata_in_media_folder: bool,
+    #[serde(default = "default_metadata_storage")]
+    metadata_storage: String,
     #[serde(default)]
     tmdb_bearer_token: Option<String>,
 }
@@ -62,6 +65,9 @@ fn default_bind() -> String {
 }
 fn default_token() -> String {
     "development-token".to_owned()
+}
+fn default_metadata_storage() -> String {
+    "database".to_owned()
 }
 
 #[derive(Clone)]
@@ -162,6 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/web/stream", any(web_stream))
         .route("/web/progress", get(web_progress).post(update_web_progress))
         .route("/web/subtitle", get(web_subtitle))
+        .route("/web/artwork", get(web_artwork))
         .route("/settings", get(settings_page))
         .route("/settings/libraries", post(create_library))
         .route("/settings/folders", post(add_library_folder))
@@ -300,10 +307,17 @@ fn load_config(path: &std::path::Path) -> Result<Config, Box<dyn std::error::Err
             token: default_token(),
             libraries: Vec::new(),
             metadata_in_media_folder: false,
+            metadata_storage: default_metadata_storage(),
             tmdb_bearer_token: None,
         });
     }
-    Ok(toml::from_str(&std::fs::read_to_string(path)?)?)
+    let mut config: Config = toml::from_str(&std::fs::read_to_string(path)?)?;
+    if config.metadata_in_media_folder {
+        config.metadata_storage = "sidecar".to_owned();
+    } else if config.metadata_storage == "sidecar" {
+        config.metadata_in_media_folder = true;
+    }
+    Ok(config)
 }
 
 fn save_config(path: &std::path::Path, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -637,7 +651,7 @@ body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, 
 .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; align-items: center; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }}
 .sidebar-link:hover {{ background: #17243a; color: #fff; }} .sidebar-link.active {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; font-size: 1.1rem; }}
 main {{ min-width: 0; max-width: 760px; width: 100%; box-sizing: border-box; margin: 0 auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; }}
-form {{ display: flex; gap: .6rem; margin: 1.5rem 0; }} input, select {{ flex: 1; padding: .7rem; border: 1px solid #4b5563; border-radius: .4rem; color: #fff; background: #1f2937; }} .path-list {{ display: grid; gap: .55rem; flex: 2; }} .path-row {{ display: flex; gap: .5rem; }} .path-row input {{ min-width: 0; }}
+form {{ display: flex; gap: .6rem; margin: 1.5rem 0; }} input, select {{ flex: 1; padding: .7rem; border: 1px solid #4b5563; border-radius: .4rem; color: #fff; background: #1f2937; }} .path-list {{ display: grid; gap: .55rem; flex: 2; }} .path-row {{ display: flex; gap: .5rem; }} .path-row input {{ min-width: 0; }} .metadata-options {{ display: grid; gap: .6rem; margin: .7rem 0 1rem; }} .metadata-option {{ display: flex; align-items: flex-start; gap: .6rem; padding: .8rem; border: 1px solid #374151; border-radius: .5rem; background: #172033; }} .metadata-option input {{ flex: 0; margin-top: .2rem; }}
 button {{ padding: .7rem 1rem; border: 0; border-radius: .4rem; color: #fff; background: #2563eb; cursor: pointer; }} li {{ margin: .65rem 0; overflow-wrap: anywhere; }} .note {{ color: #9ca3af; }}
  .flash-error {{ margin: 1rem 0; padding: .8rem 1rem; border: 1px solid #ef4444; border-radius: .5rem; color: #fecaca; background: #451a1a; }} .flash-notice {{ margin: 1rem 0; padding: .8rem 1rem; border: 1px solid #22c55e; border-radius: .5rem; color: #bbf7d0; background: #14532d; }}
 details {{ margin-top: .7rem; }} summary {{ display: inline-block; padding: .45rem .7rem; border: 1px solid #3b82f6; border-radius: .4rem; color: #bfdbfe; cursor: pointer; list-style: none; }} summary::-webkit-details-marker {{ display: none; }} details form {{ margin: .7rem 0 0; }}
@@ -645,7 +659,7 @@ details {{ margin-top: .7rem; }} summary {{ display: inline-block; padding: .45r
 </style></head><body><div class="app-shell">{}
 <main><h1>Settings</h1>{}{}
 <p class="note">A library is a named collection with one type and one or more monitored folders. Create it with its first folder, then add more folders to that same library below.</p>
-<form method="post" action="/settings/preferences"><label>Metadata storage <select name="metadata_storage"><option value="database" {}>SQLite database only</option><option value="sidecar" {}>SQLite database + <code>.mplex</code> sidecars in media folders</option></select></label><input name="tmdb_bearer_token" type="password" placeholder="TMDB bearer token (optional)" value="{}"><button type="submit">Save preferences</button></form>
+<h2>Metadata storage</h2><p class="note">Choose where matched movie and TV metadata is stored. SQLite is the runtime database; sidecar mode also writes portable files beside the media.</p><form method="post" action="/settings/preferences"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="database" {}><span><strong>SQLite database {}</strong><br><span class="note">Store metadata in mPlex’s database only.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="sidecar" {}><span><strong>.mplex files in media folders {}</strong><br><span class="note">Also write <code>.mplex/cover.jpg</code>, <code>banner.jpg</code>, and <code>info.toml</code>.</span></span></label></div><input name="tmdb_bearer_token" type="password" placeholder="TMDB bearer token (leave blank to keep current)" value=""><button type="submit">Save preferences</button></form>
 <details open><summary>＋ Add library</summary><form method="post" action="/settings/libraries"><input name="name" type="text" placeholder="Library name" required><select name="kind"><option value="movie">Movies</option><option value="tv">TV Shows</option><option value="other">Other</option></select><div class="path-list" id="new-library-paths"><div class="path-row"><input name="path[]" type="text" placeholder="/path/to/folder" value="{}" required><a href="/settings/browse">Browse</a><button type="button" class="remove-path" disabled>−</button></div></div><button type="button" id="add-path">＋</button><button type="submit">Create library</button></form></details>
 <h2>Libraries</h2><ul>{}</ul>
  </main></div><script>
@@ -657,9 +671,10 @@ const pathList = document.querySelector('#new-library-paths'); document.querySel
         sidebar_nav_with_settings(false, true),
         error,
         notice,
-        if metadata_enabled { "" } else { "selected" },
-        if metadata_enabled { "selected" } else { "" },
-        html(&state.config.lock().ok().and_then(|config| config.tmdb_bearer_token.clone()).unwrap_or_default()),
+        if metadata_enabled { "" } else { "checked" },
+        if metadata_enabled { "" } else { "(current)" },
+        if metadata_enabled { "checked" } else { "" },
+        if metadata_enabled { "(current)" } else { "" },
         html(query.folder.as_deref().unwrap_or("")),
         list
     ))
@@ -670,13 +685,13 @@ async fn update_preferences(
     State(state): State<AppState>,
     Form(form): Form<PreferencesForm>,
 ) -> Response {
-    let token = form
+    let requested_token = form
         .tmdb_bearer_token
         .as_deref()
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .map(str::to_owned);
-    if let Some(token) = token.as_deref() {
+    if let Some(token) = requested_token.as_deref() {
         let Ok(response) = reqwest::Client::new()
             .get("https://api.themoviedb.org/3/configuration")
             .bearer_auth(token)
@@ -692,8 +707,16 @@ async fn update_preferences(
     let Ok(mut config) = state.config.lock() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    config.metadata_in_media_folder = form.metadata_storage.as_deref() == Some("sidecar")
-        || form.metadata_in_media_folder.is_some();
+    let token = requested_token.or_else(|| config.tmdb_bearer_token.clone());
+    if form.metadata_storage.as_deref() == Some("sidecar")
+        || form.metadata_in_media_folder.is_some()
+    {
+        config.metadata_storage = "sidecar".to_owned();
+        config.metadata_in_media_folder = true;
+    } else if form.metadata_storage.as_deref() == Some("database") {
+        config.metadata_storage = "database".to_owned();
+        config.metadata_in_media_folder = false;
+    }
     config.tmdb_bearer_token = token;
     if save_config(&state.config_path, &config).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -731,8 +754,14 @@ async fn scan_library_metadata(
         let Ok(files) = scan_media(folder).await else {
             continue;
         };
-        for (index, media) in files.into_iter().enumerate() {
-            let title = metadata_search_title(&media.title);
+        let mut groups = BTreeMap::<PathBuf, Vec<Media>>::new();
+        for media in files {
+            let group_path = metadata_group_path(folder, &media.path, kind);
+            groups.entry(group_path).or_default().push(media);
+        }
+        for (group_path, group) in groups {
+            let group_title = metadata_group_title(&group_path, folder);
+            let title = metadata_search_title(&group_title);
             let response = client
                 .get(format!("https://api.themoviedb.org/3/search/{}", kind))
                 .bearer_auth(token)
@@ -754,32 +783,84 @@ async fn scan_library_metadata(
             else {
                 continue;
             };
-            let media_key = format!("{}-{}", library_id + 1, index + 1);
             let metadata_json = serde_json::to_string(result).unwrap_or_else(|_| "{}".to_owned());
-            let database_ok = state
-                .db
-                .lock()
-                .ok()
-                .and_then(|connection| {
-                    connection
-                        .execute(
-                            "UPDATE media SET metadata_json = ?1, matched_at = strftime('%s', 'now') WHERE media_key = ?2",
-                            (&metadata_json, &media_key),
-                        )
-                        .ok()
-                })
-                .is_some();
-            if !database_ok {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            for media in &group {
+                let media_key = format!("{}-{}", library_id + 1, media.id);
+                let database_ok = state
+                    .db
+                    .lock()
+                    .ok()
+                    .and_then(|connection| {
+                        connection
+                            .execute(
+                                "UPDATE media SET metadata_json = ?1, matched_at = strftime('%s', 'now') WHERE media_key = ?2",
+                                (&metadata_json, &media_key),
+                            )
+                            .ok()
+                    })
+                    .is_some();
+                if !database_ok {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
             }
             if config.metadata_in_media_folder {
-                let _ = store_metadata_sidecar(folder, &media, result).await;
-                let _ = download_tmdb_artwork(&client, token, folder, &media, result, &state).await;
+                let representative = &group[0];
+                let _ = store_metadata_sidecar(
+                    folder,
+                    &group_path,
+                    &group_title,
+                    representative,
+                    result,
+                )
+                .await;
+                let media_key = format!("{}-{}", library_id + 1, representative.id);
+                let _ = download_tmdb_artwork(
+                    &client,
+                    token,
+                    folder,
+                    &group_path,
+                    &media_key,
+                    result,
+                    &state,
+                )
+                .await;
             }
             matched += 1;
         }
     }
     Redirect::to(&format!("/settings?metadata_matched={matched}")).into_response()
+}
+
+fn metadata_group_path(root: &PathBuf, media: &std::path::Path, kind: &str) -> PathBuf {
+    if kind == "tv" {
+        if let Ok(relative) = media.strip_prefix(root) {
+            if let Some(Component::Normal(show)) = relative.components().next() {
+                return root.join(show);
+            }
+        }
+    }
+    let parent = media.parent().unwrap_or(root);
+    if parent == root {
+        media.to_path_buf()
+    } else {
+        parent.to_path_buf()
+    }
+}
+
+fn metadata_group_title(group: &std::path::Path, root: &PathBuf) -> String {
+    if group.is_file() {
+        return group
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("Video")
+            .to_owned();
+    }
+    group
+        .file_name()
+        .and_then(|value| value.to_str())
+        .or_else(|| root.file_name().and_then(|value| value.to_str()))
+        .unwrap_or("Media")
+        .to_owned()
 }
 
 fn metadata_search_title(title: &str) -> String {
@@ -794,10 +875,17 @@ fn metadata_search_title(title: &str) -> String {
 
 async fn store_metadata_sidecar(
     folder: &PathBuf,
+    group_path: &std::path::Path,
+    title: &str,
     media: &Media,
     metadata: &serde_json::Value,
 ) -> Result<(), std::io::Error> {
-    let directory = media.path.parent().unwrap_or(folder).join(".mplex");
+    let media_directory = if group_path.is_file() {
+        group_path.parent().unwrap_or(folder)
+    } else {
+        group_path
+    };
+    let directory = media_directory.join(".mplex");
     tokio::fs::create_dir_all(&directory).await?;
     let path = media
         .path
@@ -805,7 +893,7 @@ async fn store_metadata_sidecar(
         .unwrap_or(&media.path)
         .to_string_lossy();
     let info = MediaInfo {
-        title: media.title.clone(),
+        title: title.to_owned(),
         media_path: path.into_owned(),
         description: json_string(metadata, "overview"),
         release_date: json_string(metadata, "release_date"),
@@ -846,11 +934,17 @@ async fn download_tmdb_artwork(
     client: &reqwest::Client,
     token: &str,
     folder: &PathBuf,
-    media: &Media,
+    group_path: &std::path::Path,
+    media_key: &str,
     metadata: &serde_json::Value,
     state: &AppState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let artwork = media.path.parent().unwrap_or(folder).join(".mplex");
+    let media_directory = if group_path.is_file() {
+        group_path.parent().unwrap_or(folder)
+    } else {
+        group_path
+    };
+    let artwork = media_directory.join(".mplex");
     tokio::fs::create_dir_all(&artwork).await?;
     for (kind, field) in [("cover", "poster_path"), ("banner", "backdrop_path")] {
         let Some(path) = metadata.get(field).and_then(|value| value.as_str()) else {
@@ -867,7 +961,7 @@ async fn download_tmdb_artwork(
         let bytes = response.bytes().await?;
         let local = artwork.join(format!("{kind}.jpg"));
         tokio::fs::write(&local, &bytes).await?;
-        record_artwork(&state.db, &media.id, kind, &local);
+        record_artwork(&state.db, media_key, kind, &local);
     }
     Ok(())
 }
@@ -1065,6 +1159,7 @@ struct WebPath {
     path: Option<String>,
     library: Option<usize>,
     view: Option<String>,
+    kind: Option<String>,
 }
 
 fn selected_library_root(state: &AppState, library: Option<usize>) -> PathBuf {
@@ -1082,20 +1177,35 @@ async fn home_client(State(state): State<AppState>) -> Response {
     let Ok(config) = state.config.lock().map(|config| config.clone()) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let libraries = config
-        .libraries
-        .iter()
-        .enumerate()
-        .map(|(index, library)| {
+    let mut libraries = String::new();
+    for (index, library) in config.libraries.iter().enumerate() {
+        let artwork = library_artwork(library, index).await;
+        let artwork_markup = artwork
+            .map(|(cover, banner)| {
+                format!(
+                    r#"<span class="library-art" style="display:grid;place-items:center;min-height:120px;background-size:cover;background-position:center;background-image:linear-gradient(90deg,rgba(17,24,39,.2),rgba(17,24,39,.8)),url('{}')"><img style="width:30%;max-height:110px;object-fit:cover;border-radius:.25rem;box-shadow:0 3px 12px #0008" src="{}" alt=""></span>"#,
+                    banner,
+                    cover
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    r#"<span class="library-art library-art-fallback" style="display:grid;place-items:center;min-height:120px;font-size:2.5rem;background:linear-gradient(135deg,#1e3a8a,#312e81)">{}</span>"#,
+                    if library.kind == "tv" { "📺" } else { "🎬" }
+                )
+            });
+        libraries.push_str(&format!(
+            "<a class=\"library-card\" style=\"overflow:hidden;padding:0\" href=\"/library?library={}\">{}<span class=\"library-card-info\" style=\"display:flex;flex-direction:column;gap:.25rem;padding:.85rem 1rem 1rem\"><strong>{}</strong><span class=\"note\">{}</span></span></a>",
+            index,
+            artwork_markup,
+            html(&library.name),
             format!(
-                "<a class=\"library-card\" href=\"/library?library={}\"><span class=\"library-icon\">{}</span><strong>{}</strong><span class=\"note\">{}</span></a>",
-                index,
-                if library.kind == "tv" { "📺" } else { "🎬" },
-                html(&library.name),
-                format!("{} · {} folders", library_kind_label(&library.kind), library.folders.len())
+                "{} · {} folders",
+                library_kind_label(&library.kind),
+                library.folders.len()
             )
-        })
-        .collect::<String>();
+        ));
+    }
     let continue_watching = state
         .db
         .lock()
@@ -1134,6 +1244,32 @@ async fn home_client(State(state): State<AppState>) -> Response {
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>mPlex</title><style>body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }} .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }} .sidebar-top {{ display: flex; justify-content: space-between; align-items: center; }} .sidebar-toggle {{ background: none; border: 0; color: #cbd5e1; font-size: 1.3rem; cursor: pointer; }} .sidebar-label {{ padding: 1rem .7rem .4rem; color: #6b7280; font-size: .7rem; text-transform: uppercase; }} .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }} .sidebar-link.active, .sidebar-link:hover {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; }} main {{ max-width: 1100px; width: 100%; box-sizing: border-box; margin: auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; text-decoration: none; }} h1 {{ margin-top: 0; }} .section {{ margin: 2rem 0; }} .library-grid, .recent-grid, .continue-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1rem; }} .library-card, .recent-item, .continue-item {{ display: flex; flex-direction: column; gap: .4rem; padding: 1rem; border: 1px solid #374151; border-radius: .7rem; background: #1f2937; }} .continue-item {{ min-height: 130px; justify-content: flex-end; border-color: #2563eb; background: linear-gradient(135deg, #1e3a8a, #1f2937); font-size: 1.05rem; }} .library-card:hover, .recent-item:hover, .continue-item:hover {{ border-color: #60a5fa; }} .library-icon {{ font-size: 2rem; }} .note {{ color: #9ca3af; }} .empty-state {{ padding: 1.5rem; border: 1px dashed #4b5563; border-radius: .7rem; }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; width: 100%; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} .sidebar-label {{ display: none; }} .sidebar-toggle {{ display: none; }} }}</style></head><body><div class="app-shell">{}<main><h1>Home</h1><section class="section"><h2>Continue watching</h2><div class="continue-grid">{}</div></section><section class="section"><h2>Recently added</h2><div class="recent-grid">{}</div></section><section class="section"><h2>Your libraries</h2><div class="library-grid">{}</div></section></main></div><script>const shell=document.querySelector('.app-shell'), toggle=document.querySelector('.sidebar-toggle'); if(localStorage.getItem('mplex-sidebar-collapsed')==='true') shell.classList.add('sidebar-collapsed'); toggle?.addEventListener('click',()=>{{shell.classList.toggle('sidebar-collapsed');localStorage.setItem('mplex-sidebar-collapsed',shell.classList.contains('sidebar-collapsed')?'true':'false')}});</script></body></html>"#,
         sidebar_nav_for(&state, std::path::Path::new(""), None), continue_watching, recent, libraries
     )).into_response()
+}
+
+async fn library_artwork(library: &ConfigLibrary, index: usize) -> Option<(String, String)> {
+    let root = library.folders.first()?;
+    let media = scan_media(root).await.ok()?;
+    for item in media {
+        let parent = item.path.parent()?;
+        if tokio::fs::metadata(parent.join(".mplex/cover.jpg"))
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        let relative = parent.strip_prefix(root).ok()?;
+        let cover = artwork_url(relative, Some(index), "cover");
+        let banner = if tokio::fs::metadata(parent.join(".mplex/banner.jpg"))
+            .await
+            .is_ok()
+        {
+            artwork_url(relative, Some(index), "banner")
+        } else {
+            cover.clone()
+        };
+        return Some((cover, banner));
+    }
+    None
 }
 
 async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> Response {
@@ -1192,24 +1328,47 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
             let preview = first_media_file(&directory)
                 .await
                 .and_then(|path| path.strip_prefix(&library_root).ok().map(PathBuf::from));
+            let cover = tokio::fs::metadata(directory.join(".mplex/cover.jpg"))
+                .await
+                .is_ok();
+            let banner = tokio::fs::metadata(directory.join(".mplex/banner.jpg"))
+                .await
+                .is_ok();
             folder_cards.push_str(&folder_card(
                 &name,
                 &child_relative,
                 media_count,
                 query.library,
                 preview.as_deref(),
+                cover,
+                banner,
             ));
         }
     }
     for (name, child_relative, path) in files {
         has_content = true;
         if let Some((_, mime)) = media_type(&path) {
+            let artwork = if tokio::fs::metadata(
+                path.parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join(".mplex/cover.jpg"),
+            )
+            .await
+            .is_ok()
+            {
+                path.parent()
+                    .and_then(|parent| parent.strip_prefix(&library_root).ok())
+                    .map(|parent| artwork_url(parent, query.library, "cover"))
+            } else {
+                None
+            };
             items.push_str(&web_client_item(
                 &name,
                 &child_relative.to_string_lossy(),
                 mime,
                 query.library,
                 &subtitle_tracks(&path, &child_relative).await,
+                artwork,
             ));
         } else {
             items.push_str(&file_item(&name));
@@ -1271,8 +1430,15 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     h2 {{ font-size: 1rem; margin: 0 0 .4rem; overflow-wrap: anywhere; }}
     .play-actions {{ display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .7rem 0; }}
     .play-actions button, .subtitle-picker select {{ padding: .45rem .65rem; }}
+    .theatre-button {{ background: #4b5563; }}
+    body.theatre-mode main {{ max-width: none; padding: 0; }}
+    body.theatre-mode .library {{ display: block; }}
+    body.theatre-mode article:not(.theatre-card), body.theatre-mode .breadcrumb, body.theatre-mode .folder-card, body.theatre-mode .empty-folders {{ display: none; }}
+    body.theatre-mode .theatre-card {{ width: 100%; min-height: 100vh; border: 0; border-radius: 0; }}
+    body.theatre-mode .theatre-card video {{ width: 100%; max-height: calc(100vh - 8rem); aspect-ratio: 16 / 9; object-fit: contain; }}
     .subtitle-picker {{ display: inline-flex; align-items: center; gap: .35rem; color: #cbd5e1; font-size: .9rem; }}
     .subtitle-picker select {{ border: 1px solid #4b5563; border-radius: .35rem; color: #fff; background: #111827; }}
+    .subtitle-note {{ color: #9ca3af; font-size: .8rem; }}
     .breadcrumb {{ display: flex; flex-wrap: wrap; align-items: center; gap: .35rem; box-sizing: border-box; color: #9ca3af; }}
     .breadcrumb a {{ padding: .35rem .55rem; border-radius: .35rem; text-decoration: none; }}
     .breadcrumb a:hover {{ background: #24344d; }}
@@ -1285,6 +1451,7 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     .folder-preview {{ position: relative; display: grid; place-items: center; overflow: hidden; aspect-ratio: 16 / 6; color: #bfdbfe; font-size: 3rem; background: linear-gradient(135deg, #1e3a8a, #312e81 55%, #111827); }}
     .folder-preview-video {{ width: 100%; height: 100%; object-fit: cover; opacity: .85; }}
     .folder-preview-icon {{ position: absolute; inset: 0; display: grid; place-items: center; text-shadow: 0 2px 8px #000; pointer-events: none; }}
+    .folder-cover {{ position: relative; z-index: 1; width: 28%; max-height: 88%; object-fit: cover; border: 2px solid rgba(255,255,255,.7); border-radius: .3rem; box-shadow: 0 4px 14px #0008; }}
     .folder-info {{ padding: .9rem 1rem 1rem; }}
     .folder-info h2 {{ margin: 0 0 .25rem; }}
     .empty-folders {{ padding: 1rem; border: 1px solid #374151; border-radius: .75rem; background: #172033; }}
@@ -1347,18 +1514,33 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
           }}
         }}, {{ once: true }});
       }}
+      const path = video.dataset.progressPath;
       const subtitleSelect = video.closest("article")?.querySelector(".subtitle-select");
-      subtitleSelect?.addEventListener("change", event => {{
-        const selected = Number(event.target.value);
+      const subtitleKey = `mplex-subtitle:${{path || video.dataset.progressPath || video.currentSrc}}`;
+      const applySubtitle = selected => {{
         [...video.textTracks].forEach((track, index) => {{
           track.mode = index === selected ? "showing" : "disabled";
         }});
+        if (subtitleSelect) subtitleSelect.value = String(selected);
+      }};
+      const savedSubtitle = Number.parseInt(window.localStorage.getItem(subtitleKey) || "-1", 10);
+      if (Number.isInteger(savedSubtitle) && savedSubtitle >= 0) applySubtitle(savedSubtitle);
+      subtitleSelect?.addEventListener("change", event => {{
+        const selected = Number(event.target.value);
+        applySubtitle(selected);
+        window.localStorage.setItem(subtitleKey, String(selected));
       }});
-      const path = video.dataset.progressPath;
       if (!path) return;
       const article = video.closest("article");
       const resumeButton = article?.querySelector(".resume-button");
       const startButton = article?.querySelector(".start-button");
+      const theatreButton = article?.querySelector(".theatre-button");
+      theatreButton?.addEventListener("click", () => {{
+        const active = document.body.classList.toggle("theatre-mode");
+        article.classList.toggle("theatre-card", active);
+        theatreButton.textContent = active ? "▣ Exit theatre" : "▣ Theatre";
+        theatreButton.setAttribute("aria-label", active ? "Exit theatre mode" : "Theatre mode");
+      }});
       const playAt = position => {{
         const start = () => {{
           video.currentTime = position;
@@ -1558,6 +1740,40 @@ async fn web_subtitle(State(s): State<AppState>, Query(query): Query<WebPath>) -
     ([(header::CONTENT_TYPE, "text/vtt; charset=utf-8")], vtt).into_response()
 }
 
+async fn web_artwork(State(s): State<AppState>, Query(query): Query<WebPath>) -> Response {
+    let Some(relative) = query.path.as_deref().and_then(clean_relative_path) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if contains_hidden_component(&relative)
+        || !matches!(query.kind.as_deref(), Some("cover" | "banner"))
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let root = selected_library_root(&s, query.library);
+    let directory = match web_path(&s, &root, &relative).await {
+        Ok(path) if path.is_dir() => path,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let path = directory
+        .join(".mplex")
+        .join(format!("{}.jpg", query.kind.unwrap()));
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response()
+}
+
+fn artwork_url(relative: &std::path::Path, library: Option<usize>, kind: &str) -> String {
+    format!(
+        "/web/artwork?{}path={}&kind={}",
+        library
+            .map(|index| format!("library={index}&"))
+            .unwrap_or_default(),
+        url_encode(&relative.to_string_lossy()),
+        kind
+    )
+}
+
 fn srt_to_vtt(contents: &str) -> String {
     let mut output = String::from("WEBVTT\n\n");
     for block in contents.replace("\r\n", "\n").split("\n\n") {
@@ -1640,6 +1856,7 @@ fn web_client_item(
     mime: &str,
     library: Option<usize>,
     subtitles: &[SubtitleTrack],
+    artwork: Option<String>,
 ) -> String {
     let stream_path = url_encode(relative);
     let library_query = library
@@ -1661,33 +1878,37 @@ fn web_client_item(
         .enumerate()
         .map(|(index, track)| {
             format!(
-                r#"<option value="{}">{}</option>"#,
+                r#"<option value="{}">External: {}</option>"#,
                 index,
                 html(&track.label)
             )
         })
         .collect::<String>();
     let subtitle_selector = if subtitles.is_empty() {
-        String::new()
+        r#"<span class="subtitle-note">No external subtitles detected; embedded subtitle streams are not currently inspected.</span>"#.to_owned()
     } else {
         format!(
-            r#"<label class="subtitle-picker">Subtitles <select class="subtitle-select"><option value="-1">Off</option>{}</select></label>"#,
+            r#"<label class="subtitle-picker">Subtitles <select class="subtitle-select"><option value="-1">Off</option>{}</select></label><span class="subtitle-note">External sidecar subtitles</span>"#,
             subtitle_options
         )
     };
+    let poster = artwork
+        .map(|url| format!(r#" poster="{}""#, html(&url)))
+        .unwrap_or_default();
     format!(
         r#"<article>
-  <video controls preload="auto" data-progress-path="{}" src="/web/stream?{}path={}" type="{}">
+  <video controls preload="auto" data-progress-path="{}"{} src="/web/stream?{}path={}" type="{}">
     {}
     Your browser does not support HTML video. <a href="/web/stream?{}path={}">Open the stream</a>.
   </video>
   <div class="details">
     <h2>{}</h2>
-    <div class="play-actions"><button type="button" class="resume-button" hidden>Resume</button><button type="button" class="start-button">Play from beginning</button>{}</div>
+    <div class="play-actions"><button type="button" class="resume-button" title="Resume from saved position" aria-label="Resume from saved position" hidden>↪ Resume</button><button type="button" class="start-button" title="Play from beginning" aria-label="Play from beginning">▶ Play from beginning</button><button type="button" class="theatre-button" title="Theatre mode" aria-label="Theatre mode">▣ Theatre</button>{}</div>
     <a href="/web/stream?{}path={}">Open stream</a>
   </div>
 </article>"#,
         html(relative),
+        poster,
         library_query,
         stream_path,
         mime,
@@ -1803,13 +2024,15 @@ fn folder_card(
     media_count: usize,
     library: Option<usize>,
     preview: Option<&std::path::Path>,
+    cover: bool,
+    banner: bool,
 ) -> String {
     let label = if media_count == 1 {
         "1 media file"
     } else {
         "media files"
     };
-    let preview_markup = preview
+    let preview_markup = if cover { None } else { preview }
         .map(|path| {
             format!(
                 r#"<video class="folder-preview-video" muted playsinline preload="auto" src="/web/stream?{}path={}" aria-label="Preview of {}"></video>"#,
@@ -1821,16 +2044,41 @@ fn folder_card(
             )
         })
         .unwrap_or_default();
+    let artwork_markup = if cover {
+        format!(
+            r#"<img class="folder-cover" src="{}" alt="Cover for {}">"#,
+            artwork_url(relative, library, "cover"),
+            html(name)
+        )
+    } else {
+        String::new()
+    };
+    let fallback_icon = if cover || preview.is_some() {
+        String::new()
+    } else {
+        r#"<span class="folder-preview-icon" aria-hidden="true">📁</span>"#.to_owned()
+    };
+    let banner_style = if banner {
+        format!(
+            r#" style="background-image: linear-gradient(90deg, rgba(17,24,39,.45), rgba(17,24,39,.8)), url('{}')""#,
+            artwork_url(relative, library, "banner")
+        )
+    } else {
+        String::new()
+    };
     format!(
         r#"<a class="folder-card" href="/library?{}path={}">
-  <div class="folder-preview">{}<span class="folder-preview-icon" aria-hidden="true">📁</span></div>
+  <div class="folder-preview"{}>{}{}{}</div>
   <div class="folder-info"><h2>{}</h2><span class="note">{} {}</span></div>
 </a>"#,
         library
             .map(|index| format!("library={index}&"))
             .unwrap_or_default(),
         url_encode(&relative.to_string_lossy()),
+        banner_style,
         preview_markup,
+        fallback_icon,
+        artwork_markup,
         html(name),
         media_count,
         label
