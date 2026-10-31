@@ -497,6 +497,11 @@ struct SettingsQuery {
 }
 
 #[derive(Deserialize, Default)]
+struct ScanQuery {
+    force: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
 struct BrowseQuery {
     path: Option<String>,
 }
@@ -600,8 +605,8 @@ async fn settings_page(
         .iter()
         .map(|(id, name, kind, folders)| {
             format!(
-                "<li><strong>{}</strong> <span class=\"note\">({})</span><ul>{}</ul><details><summary>＋ Add folder</summary><form method=\"post\" action=\"/settings/folders\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><input name=\"path\" type=\"text\" placeholder=\"/another/folder\" required><button type=\"submit\">Add folder</button></form></details><form method=\"post\" action=\"/settings/libraries/{}/scan\"><button type=\"submit\">Scan metadata</button></form></li>",
-                html(name), html(library_kind_label(kind)), folders.iter().map(|path| format!("<li>{}</li>", html(path))).collect::<String>(), id, id
+                "<li><strong>{}</strong> <span class=\"note\">({})</span><ul>{}</ul><details><summary>＋ Add folder</summary><form method=\"post\" action=\"/settings/folders\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><input name=\"path\" type=\"text\" placeholder=\"/another/folder\" required><button type=\"submit\">Add folder</button></form></details><form method=\"post\" action=\"/settings/libraries/{}/scan\" style=\"display:inline-flex\"><button type=\"submit\">Scan metadata</button><button type=\"submit\" formaction=\"/settings/libraries/{}/scan?force=true\">Force rescan</button></form></li>",
+                html(name), html(library_kind_label(kind)), folders.iter().map(|path| format!("<li>{}</li>", html(path))).collect::<String>(), id, id, id
             )
         })
         .collect::<String>();
@@ -733,6 +738,7 @@ async fn update_preferences(
 async fn scan_library_metadata(
     State(state): State<AppState>,
     Path(library_id): Path<usize>,
+    Query(scan_query): Query<ScanQuery>,
 ) -> Response {
     let Ok(config) = state.config.lock().map(|config| config.clone()) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -750,6 +756,7 @@ async fn scan_library_metadata(
     let client = reqwest::Client::new();
     let kind = if library.kind == "tv" { "tv" } else { "movie" };
     let mut matched = 0;
+    let forced = scan_query.force.unwrap_or(false);
     for folder in &library.folders {
         let Ok(files) = scan_media(folder).await else {
             continue;
@@ -828,7 +835,8 @@ async fn scan_library_metadata(
             matched += 1;
         }
     }
-    Redirect::to(&format!("/settings?metadata_matched={matched}")).into_response()
+    let suffix = if forced { "&metadata_forced=true" } else { "" };
+    Redirect::to(&format!("/settings?metadata_matched={matched}{suffix}")).into_response()
 }
 
 fn metadata_group_path(root: &PathBuf, media: &std::path::Path, kind: &str) -> PathBuf {
@@ -901,6 +909,7 @@ async fn store_metadata_sidecar(
         number_of_seasons: json_i64(metadata, "number_of_seasons"),
         number_of_episodes: json_i64(metadata, "number_of_episodes"),
         metadata_json: serde_json::to_string_pretty(metadata).unwrap_or_default(),
+        technical: probe_media(&media.path).await,
     };
     let contents = toml::to_string_pretty(&info).map_err(std::io::Error::other)?;
     tokio::fs::write(directory.join("info.toml"), contents).await
@@ -916,6 +925,28 @@ struct MediaInfo {
     number_of_seasons: Option<i64>,
     number_of_episodes: Option<i64>,
     metadata_json: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    technical: Option<serde_json::Value>,
+}
+
+async fn probe_media(path: &std::path::Path) -> Option<serde_json::Value> {
+    let output = tokio::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+        ])
+        .arg(path)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
 }
 
 fn json_string(value: &serde_json::Value, key: &str) -> String {
@@ -1287,6 +1318,18 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
         Ok(_) => return StatusCode::NOT_FOUND.into_response(),
         Err(status) => return status.into_response(),
     };
+    let pane_banner = if tokio::fs::metadata(directory.join(".mplex/banner.jpg"))
+        .await
+        .is_ok()
+    {
+        format!(
+            r#" style="background-size:cover;background-position:center;background-attachment:fixed;background-image:linear-gradient(180deg,rgba(17,24,39,.72),rgba(17,24,39,.96)),url('{}')""#,
+            artwork_url(&relative, query.library, "banner")
+        )
+    } else {
+        String::new()
+    };
+    let info_panel = media_info_panel(&directory).await;
     let mut entries = match tokio::fs::read_dir(&directory).await {
         Ok(entries) => entries,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -1337,7 +1380,6 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
             folder_cards.push_str(&folder_card(
                 &name,
                 &child_relative,
-                media_count,
                 query.library,
                 preview.as_deref(),
                 cover,
@@ -1421,9 +1463,10 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     main {{ min-width: 0; max-width: 1100px; width: 100%; box-sizing: border-box; margin: 0 auto; padding: 2rem 1rem; }}
     h1 {{ margin-top: 0; }}
     .brand {{ color: inherit; text-decoration: none; }}
-    .library {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); align-items: start; gap: 1rem; }}
+    .library {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); align-items: start; gap: 1rem; }}
     .breadcrumb, .empty-folders {{ grid-column: 1 / -1; }}
     article, .folder-card, .empty-folders {{ width: 100%; box-sizing: border-box; }}
+    article {{ grid-column: span 4; min-width: 0; }}
     article {{ overflow: hidden; border: 1px solid #374151; border-radius: .75rem; background: #1f2937; }}
     video {{ display: block; width: 100%; aspect-ratio: 16 / 9; margin: 0 auto; background: #000; }}
     .details {{ padding: .9rem 1rem 1rem; }}
@@ -1446,12 +1489,14 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     .view-toggle {{ display: inline-flex; gap: .2rem; margin: .25rem 0 1rem; padding: .2rem; border: 1px solid #374151; border-radius: .5rem; background: #172033; }}
     .view-toggle a {{ padding: .4rem .75rem; border-radius: .35rem; text-decoration: none; color: #cbd5e1; }}
     .view-toggle a.active, .view-toggle a:hover {{ color: #fff; background: #2563eb; }}
-    .folder-card {{ display: block; overflow: hidden; color: inherit; text-decoration: none; border: 1px solid #374151; border-radius: .75rem; background: #1f2937; transition: border-color .15s, transform .15s; }}
+    .metadata-panel {{ grid-column: 1 / -1; padding: 1rem 1.2rem; border: 1px solid #374151; border-radius: .75rem; background: rgba(17,24,39,.62); backdrop-filter: blur(8px); }}
+    .metadata-panel h2 {{ margin: 0 0 .45rem; }} .metadata-description {{ max-width: 75ch; color: #d1d5db; line-height: 1.5; }} .metadata-details {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: .6rem 1.2rem; margin-top: .8rem; }} .metadata-detail strong {{ display: block; color: #9ca3af; font-size: .75rem; text-transform: uppercase; }}
+    .folder-card {{ display: block; width: 100%; overflow: hidden; color: inherit; text-decoration: none; border: 1px solid #374151; border-radius: .75rem; background: #1f2937; transition: border-color .15s, transform .15s; }}
     .folder-card:hover {{ border-color: #60a5fa; transform: translateY(-2px); }}
-    .folder-preview {{ position: relative; display: grid; place-items: center; overflow: hidden; aspect-ratio: 16 / 6; color: #bfdbfe; font-size: 3rem; background: linear-gradient(135deg, #1e3a8a, #312e81 55%, #111827); }}
+    .folder-preview {{ position: relative; display: grid; place-items: center; overflow: hidden; aspect-ratio: 2 / 3; color: #bfdbfe; font-size: 3rem; background: linear-gradient(135deg, #1e3a8a, #312e81 55%, #111827); }}
     .folder-preview-video {{ width: 100%; height: 100%; object-fit: cover; opacity: .85; }}
     .folder-preview-icon {{ position: absolute; inset: 0; display: grid; place-items: center; text-shadow: 0 2px 8px #000; pointer-events: none; }}
-    .folder-cover {{ position: relative; z-index: 1; width: 28%; max-height: 88%; object-fit: cover; border: 2px solid rgba(255,255,255,.7); border-radius: .3rem; box-shadow: 0 4px 14px #0008; }}
+    .folder-cover {{ position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; object-fit: cover; }}
     .folder-info {{ padding: .9rem 1rem 1rem; }}
     .folder-info h2 {{ margin: 0 0 .25rem; }}
     .empty-folders {{ padding: 1rem; border: 1px solid #374151; border-radius: .75rem; background: #172033; }}
@@ -1469,16 +1514,17 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
       .sidebar-nav {{ display: flex; overflow-x: auto; }}
       .sidebar-link {{ white-space: nowrap; }}
       main {{ padding-top: 1.25rem; }}
+      article {{ grid-column: 1 / -1; }}
     }}
   </style>
 </head>
 <body>
   <div class="app-shell">
     {}
-    <main>
+    <main{}>
     <h1>Library</h1>
     <nav class="view-toggle" aria-label="Library view"><a class="{}" href="/library?{}{}">Media</a><a class="{}" href="/library?{}{}view=folders">Folders</a></nav>
-    <p class="note">Browse the configured directory. Use ←/→ to seek 5 seconds, Space to play/pause, and F for fullscreen.</p>
+    {}
     <section class="library">{}</section>
     </main>
   </div>
@@ -1585,10 +1631,15 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     }});
     document.addEventListener("keydown", event => {{
       const fullscreen = event.key.toLowerCase() === "f";
-      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight" && event.code !== "Space" && !fullscreen) return;
+      const theatre = event.key.toLowerCase() === "t";
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight" && event.code !== "Space" && !fullscreen && !theatre) return;
       const video = selectedVideo || window.document.querySelector("video");
       if (!video) return;
       event.preventDefault();
+      if (theatre) {{
+        video.closest("article")?.querySelector(".theatre-button")?.click();
+        return;
+      }}
       if (fullscreen) {{
         if (window.document.fullscreenElement) window.document.exitFullscreen();
         else video.requestFullscreen().catch(() => {{}});
@@ -1628,6 +1679,7 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
 </body>
 </html>"#,
         sidebar,
+        pane_banner,
         if !folder_view { "active" } else { "" },
         query
             .library
@@ -1648,6 +1700,7 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
             .as_deref()
             .map(|path| format!("path={}&", url_encode(path)))
             .unwrap_or_default(),
+        info_panel,
         items
         )),
     )
@@ -1738,6 +1791,69 @@ async fn web_subtitle(State(s): State<AppState>, Query(query): Query<WebPath>) -
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     ([(header::CONTENT_TYPE, "text/vtt; charset=utf-8")], vtt).into_response()
+}
+
+async fn media_info_panel(directory: &std::path::Path) -> String {
+    let Ok(contents) = tokio::fs::read_to_string(directory.join(".mplex/info.toml")).await else {
+        return String::new();
+    };
+    let Ok(value) = contents.parse::<toml::Value>() else {
+        return String::new();
+    };
+    let title = value
+        .get("title")
+        .and_then(toml::Value::as_str)
+        .unwrap_or("Media information");
+    let description = value
+        .get("description")
+        .and_then(toml::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(r#"<p class="metadata-description">{}</p>"#, html(value)))
+        .unwrap_or_default();
+    let details = value
+        .as_table()
+        .map(render_toml_details)
+        .unwrap_or_default();
+    format!(
+        r#"<section class="metadata-panel"><h2>{}</h2>{}<div class="metadata-details">{}</div></section>"#,
+        html(title),
+        description,
+        details
+    )
+}
+
+fn render_toml_details(table: &toml::map::Map<String, toml::Value>) -> String {
+    table
+        .iter()
+        .filter(|(key, _)| key.as_str() != "metadata_json" && key.as_str() != "description")
+        .map(|(key, value)| {
+            let rendered = match value {
+                toml::Value::Table(table) => render_toml_details(table),
+                toml::Value::Array(values) => values
+                    .iter()
+                    .map(render_toml_value)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                _ => render_toml_value(value),
+            };
+            format!(
+                r#"<div class="metadata-detail"><strong>{}</strong><span>{}</span></div>"#,
+                html(&key.replace('_', " ")),
+                rendered
+            )
+        })
+        .collect()
+}
+
+fn render_toml_value(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(value) => html(value),
+        toml::Value::Integer(value) => value.to_string(),
+        toml::Value::Float(value) => value.to_string(),
+        toml::Value::Boolean(value) => value.to_string(),
+        toml::Value::Datetime(value) => html(&value.to_string()),
+        toml::Value::Array(_) | toml::Value::Table(_) => html(&value.to_string()),
+    }
 }
 
 async fn web_artwork(State(s): State<AppState>, Query(query): Query<WebPath>) -> Response {
@@ -1995,20 +2111,25 @@ fn sidebar_nav_with_library_links(
 }
 
 fn breadcrumb_nav(relative: &std::path::Path, library: Option<usize>) -> String {
+    if relative.as_os_str().is_empty() {
+        return String::new();
+    }
     let mut nav = String::from(r#"<nav class="breadcrumb" aria-label="Breadcrumb">"#);
     let prefix = library
         .map(|index| format!("library={index}&"))
         .unwrap_or_default();
-    nav.push_str(&format!(r#"<a href="/library?{}">mPlex</a>"#, prefix));
     let mut current = PathBuf::new();
-    for component in relative.components() {
+    for (index, component) in relative.components().enumerate() {
         let Component::Normal(name) = component else {
             continue;
         };
         current.push(name);
         let label = name.to_string_lossy();
+        if index > 0 {
+            nav.push_str(r#"<span class="breadcrumb-separator">/</span>"#);
+        }
         nav.push_str(&format!(
-            r#"<span class="breadcrumb-separator">/</span><a href="/library?{}path={}">{}</a>"#,
+            r#"<a href="/library?{}path={}">{}</a>"#,
             prefix,
             url_encode(&current.to_string_lossy()),
             html(&label)
@@ -2021,17 +2142,11 @@ fn breadcrumb_nav(relative: &std::path::Path, library: Option<usize>) -> String 
 fn folder_card(
     name: &str,
     relative: &std::path::Path,
-    media_count: usize,
     library: Option<usize>,
     preview: Option<&std::path::Path>,
     cover: bool,
     banner: bool,
 ) -> String {
-    let label = if media_count == 1 {
-        "1 media file"
-    } else {
-        "media files"
-    };
     let preview_markup = if cover { None } else { preview }
         .map(|path| {
             format!(
@@ -2069,7 +2184,7 @@ fn folder_card(
     format!(
         r#"<a class="folder-card" href="/library?{}path={}">
   <div class="folder-preview"{}>{}{}{}</div>
-  <div class="folder-info"><h2>{}</h2><span class="note">{} {}</span></div>
+  <div class="folder-info"><h2>{}</h2></div>
 </a>"#,
         library
             .map(|index| format!("library={index}&"))
@@ -2080,8 +2195,6 @@ fn folder_card(
         fallback_icon,
         artwork_markup,
         html(name),
-        media_count,
-        label
     )
 }
 

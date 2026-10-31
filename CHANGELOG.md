@@ -2,7 +2,11 @@
 
 ## Unreleased
 
+- Changed content cards to a consistent poster/cover aspect ratio and added a readable metadata panel for folder views using `.mplex/info.toml` descriptions and details.
+- Added optional `ffprobe` technical media probing; when installed, cached `format` and `stream` data is written under `technical` in `info.toml`.
+- Added a visible Force rescan action for each library.
 - Added Home library-card artwork using cached cover/banner files and added a Theatre mode that expands one player across the right-hand content pane without browser fullscreen.
+- Added the selected movie/show banner as a full right-pane background when opening its folder, with a dark overlay for readable controls and cards.
 - Wired cached `.mplex/cover.jpg` and `.mplex/banner.jpg` into web library cards and video posters through a safe artwork route.
 - Corrected content-folder cards to use the cover as the primary image instead of rendering the 10% video frame over it; the frame remains only as a fallback when no cover exists.
 - Metadata scanning now matches one entity per movie folder or TV-show folder instead of querying once per episode/file. Matched metadata is applied to the contained media records, with one sidecar set per entity.
