@@ -33,3 +33,6 @@ Project guidance for the `mplex` repository. `mplex` is a small Rust proof-of-co
 ## Rules
 
 Keep documentation and `CHANGELOG.md` in sync with code changes. For each change, record a short reflection that states what changed, why it changed, and what checks were run.
+- Dialog close controls must remain fixed in the dialog's top-right corner, with an accessible label and tooltip.
+- Pressing Escape must close an open dialog.
+- Follow DRY principles across the project. Anything used in more than one place—UI components, markup, styles, route behavior, data transformations, validation, or media logic—must use a shared reusable implementation whenever sensible. Avoid duplicated implementations that can drift, including but not limited to Home and Library media presentation.

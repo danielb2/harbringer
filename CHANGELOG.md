@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Fixed Library navbar disappearance caused by a shared CSS format argument being inserted before the sidebar placeholder; Home, Library, and Settings continue to use the shared sidebar renderer.
+- Replaced Continue Watching's unique text card detail with the shared folder-card progress bar, so its visual treatment stays aligned with Library and Recently Added.
+- Added per-library Home-section controls for Recently Added and Continue Watching, persisted in `mplex.toml`.
+- Restored the existing folder-card presentation and changed Recently Added to render containing movie/show folders through `folder_card` instead of a separate recent-item card implementation.
+- Refactored Home and Library cover rendering to use the shared `cover_artwork_markup` helper, preventing cover markup and escaping behavior from diverging between views.
+- Added per-media metadata matching controls with editable match titles, so an individual movie or show can be corrected without rescanning the entire library.
+- Added a reusable-component rule to `AGENTS.md` after identifying inconsistent Home and Library card renderers as a maintenance problem.
+- Positioned the technical-info dialog close button in the top-right and added explicit Escape-key dismissal; documented this dialog behavior in `AGENTS.md`.
+- Changed the media Info modal to show only formatted technical `ffprobe` data; show/movie descriptions and presentation metadata remain in the metadata panel.
+- Prevented filesystem polling from replacing a paused video card after playback has started, which was resetting the seek position to zero.
 - Changed content cards to a consistent poster/cover aspect ratio and added a readable metadata panel for folder views using `.mplex/info.toml` descriptions and details.
 - Added optional `ffprobe` technical media probing; when installed, cached `format` and `stream` data is written under `technical` in `info.toml`.
 - Added a visible Force rescan action for each library.

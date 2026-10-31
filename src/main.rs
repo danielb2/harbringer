@@ -25,6 +25,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 const USER_ID: &str = "mplex-user";
+const POSTER_CARD_MIN_WIDTH: usize = 140;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -58,6 +59,10 @@ struct ConfigLibrary {
     kind: String,
     #[serde(default)]
     folders: Vec<PathBuf>,
+    #[serde(default = "default_true")]
+    show_recently_added: bool,
+    #[serde(default = "default_true")]
+    show_continue_watching: bool,
 }
 
 fn default_bind() -> String {
@@ -68,6 +73,9 @@ fn default_token() -> String {
 }
 fn default_metadata_storage() -> String {
     "database".to_owned()
+}
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone)]
@@ -169,11 +177,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/web/progress", get(web_progress).post(update_web_progress))
         .route("/web/subtitle", get(web_subtitle))
         .route("/web/artwork", get(web_artwork))
+        .route("/web/info", get(web_info))
         .route("/settings", get(settings_page))
         .route("/settings/libraries", post(create_library))
         .route("/settings/folders", post(add_library_folder))
+        .route("/settings/libraries/display", post(update_library_display))
         .route("/settings/preferences", post(update_preferences))
         .route("/settings/libraries/:id/scan", post(scan_library_metadata))
+        .route("/settings/media/scan", post(scan_media_metadata))
         .route("/settings/browse", get(settings_browse))
         .route("/identity", get(plex_identity))
         .route("/library/sections", get(plex_sections))
@@ -481,6 +492,13 @@ struct LibraryFolderForm {
 }
 
 #[derive(Deserialize)]
+struct LibraryDisplayForm {
+    library_id: usize,
+    show_recently_added: Option<String>,
+    show_continue_watching: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct PreferencesForm {
     metadata_storage: Option<String>,
     #[serde(default)]
@@ -499,6 +517,13 @@ struct SettingsQuery {
 #[derive(Deserialize, Default)]
 struct ScanQuery {
     force: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct MediaScanForm {
+    path: String,
+    library: Option<usize>,
+    title: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -597,16 +622,18 @@ async fn settings_page(
                         .iter()
                         .map(|path| path.to_string_lossy().into_owned())
                         .collect::<Vec<_>>(),
+                    library.show_recently_added,
+                    library.show_continue_watching,
                 )
             })
             .collect::<Vec<_>>()
     };
     let list = libraries
         .iter()
-        .map(|(id, name, kind, folders)| {
+        .map(|(id, name, kind, folders, show_recently_added, show_continue_watching)| {
             format!(
-                "<li><strong>{}</strong> <span class=\"note\">({})</span><ul>{}</ul><details><summary>＋ Add folder</summary><form method=\"post\" action=\"/settings/folders\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><input name=\"path\" type=\"text\" placeholder=\"/another/folder\" required><button type=\"submit\">Add folder</button></form></details><form method=\"post\" action=\"/settings/libraries/{}/scan\" style=\"display:inline-flex\"><button type=\"submit\">Scan metadata</button><button type=\"submit\" formaction=\"/settings/libraries/{}/scan?force=true\">Force rescan</button></form></li>",
-                html(name), html(library_kind_label(kind)), folders.iter().map(|path| format!("<li>{}</li>", html(path))).collect::<String>(), id, id, id
+                "<li><strong>{}</strong> <span class=\"note\">({})</span><ul>{}</ul><details><summary>＋ Add folder</summary><form method=\"post\" action=\"/settings/folders\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><input name=\"path\" type=\"text\" placeholder=\"/another/folder\" required><button type=\"submit\">Add folder</button></form></details><form method=\"post\" action=\"/settings/libraries/{}/scan\" style=\"display:inline-flex\"><button type=\"submit\">Scan metadata</button><button type=\"submit\" formaction=\"/settings/libraries/{}/scan?force=true\">Force rescan</button></form><form method=\"post\" action=\"/settings/libraries/display\" class=\"library-display\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><label><input type=\"checkbox\" name=\"show_recently_added\" value=\"true\" {}> Recently Added</label><label><input type=\"checkbox\" name=\"show_continue_watching\" value=\"true\" {}> Continue Watching</label><button type=\"submit\">Save Home sections</button></form></li>",
+                html(name), html(library_kind_label(kind)), folders.iter().map(|path| format!("<li>{}</li>", html(path))).collect::<String>(), id, id, id, id, if *show_recently_added { "checked" } else { "" }, if *show_continue_watching { "checked" } else { "" }
             )
         })
         .collect::<String>();
@@ -837,6 +864,109 @@ async fn scan_library_metadata(
     }
     let suffix = if forced { "&metadata_forced=true" } else { "" };
     Redirect::to(&format!("/settings?metadata_matched={matched}{suffix}")).into_response()
+}
+
+async fn scan_media_metadata(
+    State(state): State<AppState>,
+    Form(form): Form<MediaScanForm>,
+) -> Response {
+    let library_id = form.library.unwrap_or(0);
+    let Ok(config) = state.config.lock().map(|config| config.clone()) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Some(library) = config.libraries.get(library_id) else {
+        return settings_error("Library does not exist");
+    };
+    let Some(token) = config
+        .tmdb_bearer_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+    else {
+        return settings_error("Add a TMDB bearer token in Settings before matching media");
+    };
+    let Some(relative) = clean_relative_path(form.path.as_str()) else {
+        return settings_error("Media path is invalid");
+    };
+    let Some(root) = library.folders.first() else {
+        return settings_error("Library has no folders");
+    };
+    let path = match web_path(&state, root, &relative).await {
+        Ok(path) if path.is_file() && media_type(&path).is_some() => path,
+        _ => return settings_error("Media file does not exist"),
+    };
+    let Ok(files) = scan_media(root).await else {
+        return settings_error("Library could not be scanned");
+    };
+    let Some(media) = files.into_iter().find(|media| media.path == path) else {
+        return settings_error("Media file is not in the selected library");
+    };
+    let kind = if library.kind == "tv" { "tv" } else { "movie" };
+    let title = metadata_search_title(form.title.trim());
+    if title.is_empty() {
+        return settings_error("A match title is required");
+    }
+    let client = reqwest::Client::new();
+    let Ok(response) = client
+        .get(format!("https://api.themoviedb.org/3/search/{kind}"))
+        .bearer_auth(token)
+        .query(&[
+            ("query", title.as_str()),
+            ("include_adult", "false"),
+            ("language", "en-US"),
+        ])
+        .send()
+        .await
+    else {
+        return settings_error("TMDB could not be reached");
+    };
+    let Ok(payload) = response.json::<serde_json::Value>().await else {
+        return settings_error("TMDB returned an invalid response");
+    };
+    let Some(result) = payload
+        .get("results")
+        .and_then(|results| results.as_array())
+        .and_then(|results| results.first())
+    else {
+        return settings_error("No metadata match was found");
+    };
+    let media_key = format!("{}-{}", library_id + 1, media.id);
+    let metadata_json = serde_json::to_string(result).unwrap_or_else(|_| "{}".to_owned());
+    let database_ok = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|connection| {
+            connection
+                .execute(
+                    "UPDATE media SET metadata_json = ?1, matched_at = strftime('%s', 'now') WHERE media_key = ?2",
+                    (&metadata_json, &media_key),
+                )
+                .ok()
+        })
+        .is_some();
+    if !database_ok {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if config.metadata_in_media_folder {
+        let group_path = metadata_group_path(root, &media.path, kind);
+        let _ = store_metadata_sidecar(root, &group_path, &title, &media, result).await;
+        let _ = download_tmdb_artwork(
+            &client,
+            token,
+            root,
+            &group_path,
+            &media_key,
+            result,
+            &state,
+        )
+        .await;
+    }
+    let parent = relative.parent().unwrap_or(std::path::Path::new(""));
+    Redirect::to(&format!(
+        "/library?library={library_id}&path={}",
+        url_encode(&parent.to_string_lossy())
+    ))
+    .into_response()
 }
 
 fn metadata_group_path(root: &PathBuf, media: &std::path::Path, kind: &str) -> PathBuf {
@@ -1148,6 +1278,8 @@ async fn create_library(State(state): State<AppState>, RawForm(raw): RawForm) ->
         name: name.to_owned(),
         kind,
         folders: canonical_paths,
+        show_recently_added: true,
+        show_continue_watching: true,
     });
     if save_config(&state.config_path, &config).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -1185,6 +1317,24 @@ async fn add_library_folder(
     Redirect::to("/settings").into_response()
 }
 
+async fn update_library_display(
+    State(state): State<AppState>,
+    Form(form): Form<LibraryDisplayForm>,
+) -> Response {
+    let Ok(mut config) = state.config.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Some(library) = config.libraries.get_mut(form.library_id) else {
+        return settings_error("Library does not exist");
+    };
+    library.show_recently_added = form.show_recently_added.is_some();
+    library.show_continue_watching = form.show_continue_watching.is_some();
+    if save_config(&state.config_path, &config).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    Redirect::to("/settings").into_response()
+}
+
 #[derive(Deserialize, Default)]
 struct WebPath {
     path: Option<String>,
@@ -1214,9 +1364,9 @@ async fn home_client(State(state): State<AppState>) -> Response {
         let artwork_markup = artwork
             .map(|(cover, banner)| {
                 format!(
-                    r#"<span class="library-art" style="display:grid;place-items:center;min-height:120px;background-size:cover;background-position:center;background-image:linear-gradient(90deg,rgba(17,24,39,.2),rgba(17,24,39,.8)),url('{}')"><img style="width:30%;max-height:110px;object-fit:cover;border-radius:.25rem;box-shadow:0 3px 12px #0008" src="{}" alt=""></span>"#,
+                    r#"<span class="library-art" style="display:grid;place-items:center;min-height:120px;background-size:cover;background-position:center;background-image:linear-gradient(90deg,rgba(17,24,39,.2),rgba(17,24,39,.8)),url('{}')">{}</span>"#,
                     banner,
-                    cover
+                    cover_artwork_markup(&cover, &library.name)
                 )
             })
             .unwrap_or_else(|| {
@@ -1242,38 +1392,143 @@ async fn home_client(State(state): State<AppState>) -> Response {
         .lock()
         .ok()
         .and_then(|connection| {
-            let mut statement = connection.prepare("SELECT media_key, position_ms FROM watch_progress WHERE user_id = ?1 AND watched = 0 AND position_ms > 0 ORDER BY updated_at DESC LIMIT 12").ok()?;
-            let rows = statement.query_map([USER_ID], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))).ok()?;
+            let mut statement = connection.prepare("SELECT media_key, position_ms, duration_ms FROM watch_progress WHERE user_id = ?1 AND watched = 0 AND position_ms > 0 ORDER BY updated_at DESC LIMIT 12").ok()?;
+            let rows = statement.query_map([USER_ID], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<i64>>(2)?))).ok()?;
             Some(rows.filter_map(Result::ok).collect::<Vec<_>>())
         })
         .unwrap_or_default()
-        .iter()
-        .map(|(path, position)| {
-            let path_buf = PathBuf::from(path);
-            let title = path_buf.file_stem().and_then(|value| value.to_str()).unwrap_or(path);
-            let folder = path_buf.parent().unwrap_or(std::path::Path::new(""));
-            format!("<a class=\"continue-item\" href=\"/library?path={}\"><strong>{}</strong><span class=\"note\">Resume at {} seconds</span></a>", url_encode(&folder.to_string_lossy()), html(title), position / 1000)
-        })
-        .collect::<String>();
-    let continue_watching = if continue_watching.is_empty() {
+        ;
+    let mut continue_cards = String::new();
+    let mut continue_folders = Vec::new();
+    for (path, position, duration) in continue_watching {
+        let Some((library_index, root, media)) =
+            config
+                .libraries
+                .iter()
+                .enumerate()
+                .find_map(|(index, library)| {
+                    if !library.show_continue_watching {
+                        return None;
+                    }
+                    library.folders.iter().find_map(|root| {
+                        state
+                            .media
+                            .iter()
+                            .find(|media| {
+                                media
+                                    .path
+                                    .strip_prefix(root)
+                                    .ok()
+                                    .is_some_and(|relative| relative.to_string_lossy() == path)
+                            })
+                            .map(|media| (index, root, media))
+                    })
+                })
+        else {
+            continue;
+        };
+        let Some(folder) = media.path.parent() else {
+            continue;
+        };
+        if continue_folders.contains(&folder.to_path_buf()) {
+            continue;
+        }
+        continue_folders.push(folder.to_path_buf());
+        let Ok(relative) = folder.strip_prefix(root) else {
+            continue;
+        };
+        let Some(preview) = first_media_file(folder)
+            .await
+            .and_then(|file| file.strip_prefix(root).ok().map(PathBuf::from))
+        else {
+            continue;
+        };
+        let name = folder
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(&media.title);
+        let cover = tokio::fs::metadata(folder.join(".mplex/cover.jpg"))
+            .await
+            .is_ok();
+        let banner = tokio::fs::metadata(folder.join(".mplex/banner.jpg"))
+            .await
+            .is_ok();
+        let progress = duration
+            .filter(|duration| *duration > 0)
+            .map(|duration| (position as f64 / duration as f64).clamp(0.0, 1.0));
+        continue_cards.push_str(&folder_card(
+            name,
+            relative,
+            Some(library_index),
+            Some(&preview),
+            cover,
+            banner,
+            progress,
+        ));
+    }
+    let continue_watching = if continue_cards.is_empty() {
         "<p class=\"note empty-state\">Nothing to resume yet. Start watching something and it will appear here.</p>".to_owned()
     } else {
-        continue_watching
+        continue_cards
     };
-    let recent = state
-        .media
-        .iter()
-        .take(12)
-        .map(|media| {
-            format!(
-                "<a class=\"recent-item\" href=\"/library\"><strong>{}</strong><span class=\"note\">Recently added</span></a>",
-                html(&media.title)
-            )
-        })
-        .collect::<String>();
+    let mut recent = String::new();
+    let mut recent_folders = Vec::new();
+    for media in state.media.iter().take(12) {
+        let Some((library_index, root)) =
+            config
+                .libraries
+                .iter()
+                .enumerate()
+                .find_map(|(index, library)| {
+                    if !library.show_recently_added {
+                        return None;
+                    }
+                    library
+                        .folders
+                        .iter()
+                        .find(|folder| media.path.starts_with(folder))
+                        .map(|folder| (index, folder))
+                })
+        else {
+            continue;
+        };
+        let Some(folder) = media.path.parent() else {
+            continue;
+        };
+        if recent_folders.contains(&folder.to_path_buf()) {
+            continue;
+        }
+        recent_folders.push(folder.to_path_buf());
+        let Ok(relative) = folder.strip_prefix(root) else {
+            continue;
+        };
+        let preview = media.path.strip_prefix(root).ok();
+        let cover = tokio::fs::metadata(folder.join(".mplex/cover.jpg"))
+            .await
+            .is_ok();
+        let banner = tokio::fs::metadata(folder.join(".mplex/banner.jpg"))
+            .await
+            .is_ok();
+        let name = folder
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(&media.title);
+        recent.push_str(&folder_card(
+            name,
+            relative,
+            Some(library_index),
+            preview,
+            cover,
+            banner,
+            None,
+        ));
+    }
+    if recent.is_empty() {
+        recent = "<p class=\"note empty-state\">No recently added media yet.</p>".to_owned();
+    }
     Html(format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>mPlex</title><style>body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }} .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }} .sidebar-top {{ display: flex; justify-content: space-between; align-items: center; }} .sidebar-toggle {{ background: none; border: 0; color: #cbd5e1; font-size: 1.3rem; cursor: pointer; }} .sidebar-label {{ padding: 1rem .7rem .4rem; color: #6b7280; font-size: .7rem; text-transform: uppercase; }} .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }} .sidebar-link.active, .sidebar-link:hover {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; }} main {{ max-width: 1100px; width: 100%; box-sizing: border-box; margin: auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; text-decoration: none; }} h1 {{ margin-top: 0; }} .section {{ margin: 2rem 0; }} .library-grid, .recent-grid, .continue-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1rem; }} .library-card, .recent-item, .continue-item {{ display: flex; flex-direction: column; gap: .4rem; padding: 1rem; border: 1px solid #374151; border-radius: .7rem; background: #1f2937; }} .continue-item {{ min-height: 130px; justify-content: flex-end; border-color: #2563eb; background: linear-gradient(135deg, #1e3a8a, #1f2937); font-size: 1.05rem; }} .library-card:hover, .recent-item:hover, .continue-item:hover {{ border-color: #60a5fa; }} .library-icon {{ font-size: 2rem; }} .note {{ color: #9ca3af; }} .empty-state {{ padding: 1.5rem; border: 1px dashed #4b5563; border-radius: .7rem; }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; width: 100%; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} .sidebar-label {{ display: none; }} .sidebar-toggle {{ display: none; }} }}</style></head><body><div class="app-shell">{}<main><h1>Home</h1><section class="section"><h2>Continue watching</h2><div class="continue-grid">{}</div></section><section class="section"><h2>Recently added</h2><div class="recent-grid">{}</div></section><section class="section"><h2>Your libraries</h2><div class="library-grid">{}</div></section></main></div><script>const shell=document.querySelector('.app-shell'), toggle=document.querySelector('.sidebar-toggle'); if(localStorage.getItem('mplex-sidebar-collapsed')==='true') shell.classList.add('sidebar-collapsed'); toggle?.addEventListener('click',()=>{{shell.classList.toggle('sidebar-collapsed');localStorage.setItem('mplex-sidebar-collapsed',shell.classList.contains('sidebar-collapsed')?'true':'false')}});</script></body></html>"#,
-        sidebar_nav_for(&state, std::path::Path::new(""), None), continue_watching, recent, libraries
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>mPlex</title><style>body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }} .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }} .sidebar-top {{ display: flex; justify-content: space-between; align-items: center; }} .sidebar-toggle {{ background: none; border: 0; color: #cbd5e1; font-size: 1.3rem; cursor: pointer; }} .sidebar-label {{ padding: 1rem .7rem .4rem; color: #6b7280; font-size: .7rem; text-transform: uppercase; }} .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }} .sidebar-link.active, .sidebar-link:hover {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; }} main {{ max-width: 1100px; width: 100%; box-sizing: border-box; margin: auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; text-decoration: none; }} h1 {{ margin-top: 0; }} .section {{ margin: 2rem 0; }} .library-grid, .recent-grid, .continue-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax({}px, 1fr)); gap: 1rem; }} .library-card, .recent-item, .continue-item {{ display: flex; flex-direction: column; gap: .4rem; padding: 1rem; border: 1px solid #374151; border-radius: .7rem; background: #1f2937; }} .continue-item {{ min-height: 130px; justify-content: flex-end; border-color: #2563eb; background: linear-gradient(135deg, #1e3a8a, #1f2937); font-size: 1.05rem; }} .library-card:hover, .recent-item:hover, .continue-item:hover {{ border-color: #60a5fa; }} .library-icon {{ font-size: 2rem; }} .note {{ color: #9ca3af; }} .empty-state {{ padding: 1.5rem; border: 1px dashed #4b5563; border-radius: .7rem; }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; width: 100%; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} .sidebar-label {{ display: none; }} .sidebar-toggle {{ display: none; }} }}</style></head><body><div class="app-shell">{}<main><h1>Home</h1><section class="section"><h2>Continue watching</h2><div class="continue-grid">{}</div></section><section class="section"><h2>Recently added</h2><div class="recent-grid">{}</div></section><section class="section"><h2>Your libraries</h2><div class="library-grid">{}</div></section></main></div><script>const shell=document.querySelector('.app-shell'), toggle=document.querySelector('.sidebar-toggle'); if(localStorage.getItem('mplex-sidebar-collapsed')==='true') shell.classList.add('sidebar-collapsed'); toggle?.addEventListener('click',()=>{{shell.classList.toggle('sidebar-collapsed');localStorage.setItem('mplex-sidebar-collapsed',shell.classList.contains('sidebar-collapsed')?'true':'false')}});</script></body></html>"#,
+        POSTER_CARD_MIN_WIDTH, sidebar_nav_for(&state, std::path::Path::new(""), None), continue_watching, recent, libraries
     )).into_response()
 }
 
@@ -1301,6 +1556,14 @@ async fn library_artwork(library: &ConfigLibrary, index: usize) -> Option<(Strin
         return Some((cover, banner));
     }
     None
+}
+
+fn cover_artwork_markup(url: &str, label: &str) -> String {
+    format!(
+        r#"<img class="cover-art" style="width:30%;max-height:110px;object-fit:cover;border-radius:.25rem;box-shadow:0 3px 12px #0008" src="{}" alt="Cover for {}">"#,
+        html(url),
+        html(label)
+    )
 }
 
 async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> Response {
@@ -1357,7 +1620,13 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
 
     let mut items = String::new();
     items.push_str(&breadcrumb_nav(&relative, query.library));
-    let sidebar = sidebar_nav_for(&s, &relative, query.library);
+    let sidebar_library = query.library.or_else(|| {
+        s.config
+            .lock()
+            .ok()
+            .and_then(|config| (!config.libraries.is_empty()).then_some(0))
+    });
+    let sidebar = sidebar_nav_for(&s, &relative, sidebar_library);
     let mut folder_cards = String::new();
     let mut empty_folders = String::new();
     let mut has_content = false;
@@ -1384,6 +1653,7 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
                 preview.as_deref(),
                 cover,
                 banner,
+                None,
             ));
         }
     }
@@ -1463,7 +1733,7 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     main {{ min-width: 0; max-width: 1100px; width: 100%; box-sizing: border-box; margin: 0 auto; padding: 2rem 1rem; }}
     h1 {{ margin-top: 0; }}
     .brand {{ color: inherit; text-decoration: none; }}
-    .library {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); align-items: start; gap: 1rem; }}
+    .library {{ display: grid; grid-template-columns: repeat(auto-fill, minmax({}px, 1fr)); align-items: start; gap: 1rem; }}
     .breadcrumb, .empty-folders {{ grid-column: 1 / -1; }}
     article, .folder-card, .empty-folders {{ width: 100%; box-sizing: border-box; }}
     article {{ grid-column: span 4; min-width: 0; }}
@@ -1473,6 +1743,9 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     h2 {{ font-size: 1rem; margin: 0 0 .4rem; overflow-wrap: anywhere; }}
     .play-actions {{ display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .7rem 0; }}
     .play-actions button, .subtitle-picker select {{ padding: .45rem .65rem; }}
+    .match-form {{ display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .6rem; }} .match-form input {{ min-width: 0; flex: 1 1 12rem; padding: .45rem .6rem; border: 1px solid #4b5563; border-radius: .35rem; color: #fff; background: #111827; }} .match-form button {{ padding: .45rem .65rem; }}
+    .info-button {{ background: #374151; }}
+    dialog {{ position: relative; max-width: min(760px, calc(100vw - 2rem)); width: 100%; color: #f9fafb; border: 1px solid #4b5563; border-radius: .75rem; background: #111827; }} dialog::backdrop {{ background: rgba(0,0,0,.7); }} dialog form {{ position: absolute; top: .75rem; right: .75rem; margin: 0; }} dialog form button {{ padding: .35rem .6rem; }} .info-grid {{ display: grid; gap: .45rem; max-height: 65vh; overflow: auto; }} .info-row {{ display: grid; grid-template-columns: minmax(140px, .4fr) 1fr; gap: .8rem; padding: .45rem 0; border-bottom: 1px solid #263244; }} .info-key {{ color: #9ca3af; }} .info-value {{ overflow-wrap: anywhere; }}
     .theatre-button {{ background: #4b5563; }}
     body.theatre-mode main {{ max-width: none; padding: 0; }}
     body.theatre-mode .library {{ display: block; }}
@@ -1526,6 +1799,7 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     <nav class="view-toggle" aria-label="Library view"><a class="{}" href="/library?{}{}">Media</a><a class="{}" href="/library?{}{}view=folders">Folders</a></nav>
     {}
     <section class="library">{}</section>
+    <dialog id="info-modal"><form method="dialog"><button type="submit" aria-label="Close dialog" title="Close">×</button></form><h2>Technical media information</h2><div id="info-content" class="info-grid">Loading…</div></dialog>
     </main>
   </div>
   <script>
@@ -1536,6 +1810,45 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
       const collapsed = shell.classList.toggle("sidebar-collapsed");
       window.localStorage.setItem("mplex-sidebar-collapsed", collapsed ? "true" : "false");
       sidebarToggle.setAttribute("aria-expanded", String(!collapsed));
+    }});
+    const infoModal = document.querySelector('#info-modal');
+    const infoContent = document.querySelector('#info-content');
+    document.addEventListener("keydown", event => {{
+      if (event.key === "Escape" && infoModal.open) infoModal.close();
+    }});
+    function renderTechnicalInfo(value) {{
+      infoContent.replaceChildren();
+      const add = (parent, key, item) => {{
+        if (item && typeof item === "object") {{
+          if (Array.isArray(item)) item.forEach((entry, index) => add(parent, `${{key}} ${{index + 1}}`, entry));
+          else Object.entries(item).forEach(([childKey, childValue]) => add(parent, key ? `${{key}} / ${{childKey}}` : childKey, childValue));
+          return;
+        }}
+        const row = document.createElement("div");
+        row.className = "info-row";
+        const label = document.createElement("span");
+        label.className = "info-key";
+        label.textContent = key.replaceAll("_", " ");
+        const content = document.createElement("span");
+        content.className = "info-value";
+        content.textContent = String(item ?? "");
+        row.append(label, content);
+        parent.append(row);
+      }};
+      add(infoContent, "", value);
+    }}
+    document.querySelectorAll(".info-button").forEach(button => {{
+      button.addEventListener("click", async () => {{
+        infoContent.textContent = "Loading…";
+        infoModal.showModal();
+        try {{
+          const response = await fetch(button.dataset.infoUrl, {{ cache: "no-store" }});
+          if (response.ok) renderTechnicalInfo(await response.json());
+          else infoContent.textContent = "No cached technical analysis found. Run Scan metadata or Force rescan in Settings.";
+        }} catch (_) {{
+          infoContent.textContent = "Media analysis could not be loaded.";
+        }}
+      }});
     }});
     document.querySelectorAll("video").forEach(video => {{
       video.volume = 1;
@@ -1664,9 +1977,9 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
         const document = new DOMParser().parseFromString(await response.text(), "text/html");
         const current = window.document.querySelector(".library");
         const next = document.querySelector(".library");
-        const playing = [...window.document.querySelectorAll("video")]
-          .some(video => !video.paused && !video.ended);
-        if (!playing && current && next && current.innerHTML !== next.innerHTML) {{
+        const hasPlaybackState = [...window.document.querySelectorAll("video")]
+          .some(video => !video.paused && !video.ended || video.currentTime > 0);
+        if (!hasPlaybackState && current && next && current.innerHTML !== next.innerHTML) {{
           current.replaceWith(next);
           selectedVideo = null;
         }}
@@ -1678,6 +1991,7 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
   </script>
 </body>
 </html>"#,
+        POSTER_CARD_MIN_WIDTH,
         sidebar,
         pane_banner,
         if !folder_view { "active" } else { "" },
@@ -1879,6 +2193,40 @@ async fn web_artwork(State(s): State<AppState>, Query(query): Query<WebPath>) ->
     ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response()
 }
 
+async fn web_info(State(s): State<AppState>, Query(query): Query<WebPath>) -> Response {
+    let Some(relative) = query.path.as_deref().and_then(clean_relative_path) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if contains_hidden_component(&relative) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let root = selected_library_root(&s, query.library);
+    let path = match web_path(&s, &root, &relative).await {
+        Ok(path) => path,
+        Err(status) => return status.into_response(),
+    };
+    let directory = if path.is_dir() {
+        path
+    } else {
+        path.parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf()
+    };
+    let Ok(contents) = tokio::fs::read_to_string(directory.join(".mplex/info.toml")).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(info) = contents.parse::<toml::Value>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(technical) = info.get("technical") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(technical) = serde_json::to_value(technical) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    Json(technical).into_response()
+}
+
 fn artwork_url(relative: &std::path::Path, library: Option<usize>, kind: &str) -> String {
     format!(
         "/web/artwork?{}path={}&kind={}",
@@ -2008,6 +2356,13 @@ fn web_client_item(
             subtitle_options
         )
     };
+    let relative_path = PathBuf::from(relative);
+    let info_path = relative_path.parent().unwrap_or(std::path::Path::new(""));
+    let info_url = format!(
+        "/web/info?{}path={}",
+        library_query,
+        url_encode(&info_path.to_string_lossy())
+    );
     let poster = artwork
         .map(|url| format!(r#" poster="{}""#, html(&url)))
         .unwrap_or_default();
@@ -2019,7 +2374,8 @@ fn web_client_item(
   </video>
   <div class="details">
     <h2>{}</h2>
-    <div class="play-actions"><button type="button" class="resume-button" title="Resume from saved position" aria-label="Resume from saved position" hidden>↪ Resume</button><button type="button" class="start-button" title="Play from beginning" aria-label="Play from beginning">▶ Play from beginning</button><button type="button" class="theatre-button" title="Theatre mode" aria-label="Theatre mode">▣ Theatre</button>{}</div>
+    <div class="play-actions"><button type="button" class="resume-button" title="Resume from saved position" aria-label="Resume from saved position" hidden>↪ Resume</button><button type="button" class="start-button" title="Play from beginning" aria-label="Play from beginning">▶ Play from beginning</button><button type="button" class="theatre-button" title="Theatre mode" aria-label="Theatre mode">▣ Theatre</button><button type="button" class="info-button" data-info-url="{}" title="Show media information" aria-label="Show media information">ⓘ Info</button>{}</div>
+    <form class="match-form" method="post" action="/settings/media/scan"><input type="hidden" name="path" value="{}"><input type="hidden" name="library" value="{}"><input name="title" value="{}" aria-label="Metadata match title"><button type="submit">↻ Match metadata</button></form>
     <a href="/web/stream?{}path={}">Open stream</a>
   </div>
 </article>"#,
@@ -2034,7 +2390,11 @@ fn web_client_item(
             .unwrap_or_default(),
         url_encode(relative),
         html(name),
+        html(&info_url),
         subtitle_selector,
+        html(relative),
+        library.map(|index| index.to_string()).unwrap_or_default(),
+        html(name),
         library
             .map(|index| format!("library={index}&"))
             .unwrap_or_default(),
@@ -2146,6 +2506,7 @@ fn folder_card(
     preview: Option<&std::path::Path>,
     cover: bool,
     banner: bool,
+    progress: Option<f64>,
 ) -> String {
     let preview_markup = if cover { None } else { preview }
         .map(|path| {
@@ -2181,10 +2542,19 @@ fn folder_card(
     } else {
         String::new()
     };
+    let progress_markup = progress
+        .map(|progress| {
+            format!(
+                r#"<div aria-label="{} percent watched" style="height:4px;margin-top:.7rem;border-radius:999px;background:#374151;overflow:hidden"><span style="display:block;width:{}%;height:100%;background:#3b82f6"></span></div>"#,
+                (progress * 100.0).round() as u32,
+                progress * 100.0
+            )
+        })
+        .unwrap_or_default();
     format!(
-        r#"<a class="folder-card" href="/library?{}path={}">
-  <div class="folder-preview"{}>{}{}{}</div>
-  <div class="folder-info"><h2>{}</h2></div>
+        r#"<a class="folder-card" style="display:block;overflow:hidden;padding:0;color:inherit;text-decoration:none;border:1px solid #374151;border-radius:.75rem;background:#1f2937" href="/library?{}path={}">
+  <div class="folder-preview" style="position:relative;display:grid;place-items:center;overflow:hidden;aspect-ratio:2/3;background:linear-gradient(135deg,#1e3a8a,#312e81 55%,#111827)"{}>{}{}{}</div>
+  <div class="folder-info" style="padding:.9rem 1rem 1rem"><h2 style="font-size:1rem;line-height:1.25;margin:0;overflow-wrap:anywhere">{}</h2>{}</div>
 </a>"#,
         library
             .map(|index| format!("library={index}&"))
@@ -2195,6 +2565,7 @@ fn folder_card(
         fallback_icon,
         artwork_markup,
         html(name),
+        progress_markup,
     )
 }
 
