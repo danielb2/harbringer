@@ -817,8 +817,10 @@ async fn scan_library_metadata(
             else {
                 continue;
             };
-            let metadata_json = serde_json::to_string(result).unwrap_or_else(|_| "{}".to_owned());
             for media in &group {
+                let media_metadata = tv_metadata_for_media(result, folder, &media.path, kind);
+                let metadata_json =
+                    serde_json::to_string(&media_metadata).unwrap_or_else(|_| "{}".to_owned());
                 let media_key = format!("{}-{}", library_id + 1, media.id);
                 let database_ok = state
                     .db
@@ -844,7 +846,7 @@ async fn scan_library_metadata(
                     &group_path,
                     &group_title,
                     representative,
-                    result,
+                    &tv_metadata_for_media(result, folder, &representative.path, kind),
                 )
                 .await;
                 let media_key = format!("{}-{}", library_id + 1, representative.id);
@@ -858,6 +860,32 @@ async fn scan_library_metadata(
                     &state,
                 )
                 .await;
+                if kind == "tv" {
+                    let mut seasons = BTreeMap::<PathBuf, (u32, String)>::new();
+                    for media in &group {
+                        let Some(episode) = tv_episode_info(folder, &media.path) else {
+                            continue;
+                        };
+                        let Some(season_path) = media.path.parent() else {
+                            continue;
+                        };
+                        seasons.entry(season_path.to_path_buf()).or_insert_with(|| {
+                            (episode.season, format!("{}-{}", library_id + 1, media.id))
+                        });
+                    }
+                    for (season_path, (season, media_key)) in seasons {
+                        let _ = download_tmdb_season_artwork(
+                            &client,
+                            token,
+                            &season_path,
+                            result,
+                            season,
+                            &media_key,
+                            &state,
+                        )
+                        .await;
+                    }
+                }
             }
             matched += 1;
         }
@@ -1011,6 +1039,140 @@ fn metadata_search_title(title: &str) -> String {
         .join(" ")
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct TvEpisodeInfo {
+    season: u32,
+    episode: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    episode_end: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    episode_title: Option<String>,
+}
+
+fn tv_metadata_for_media(
+    metadata: &serde_json::Value,
+    root: &PathBuf,
+    media: &std::path::Path,
+    kind: &str,
+) -> serde_json::Value {
+    if kind != "tv" {
+        return metadata.clone();
+    }
+    let Some(episode) = tv_episode_info(root, media) else {
+        return metadata.clone();
+    };
+    let mut enriched = metadata.clone();
+    if let Some(object) = enriched.as_object_mut() {
+        object.insert(
+            "mplex_season".to_owned(),
+            serde_json::Value::from(episode.season),
+        );
+        object.insert(
+            "mplex_episode".to_owned(),
+            serde_json::Value::from(episode.episode),
+        );
+        if let Some(end) = episode.episode_end {
+            object.insert("mplex_episode_end".to_owned(), serde_json::Value::from(end));
+        }
+        if let Some(title) = episode.episode_title {
+            object.insert(
+                "mplex_episode_title".to_owned(),
+                serde_json::Value::from(title),
+            );
+        }
+    }
+    enriched
+}
+
+fn tv_episode_info(root: &PathBuf, media: &std::path::Path) -> Option<TvEpisodeInfo> {
+    let stem = media.file_stem()?.to_str()?;
+    let (season_from_name, episode, marker_end) = parse_tv_episode_marker(stem)?;
+    let season = media
+        .strip_prefix(root)
+        .ok()?
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .find_map(parse_tv_season_directory)
+        .or(season_from_name)
+        .unwrap_or(1);
+    Some(TvEpisodeInfo {
+        season,
+        episode: episode.0,
+        episode_end: episode.1,
+        episode_title: clean_episode_title(&stem[marker_end..]),
+    })
+}
+
+fn parse_tv_season_directory(name: &str) -> Option<u32> {
+    let normalized_name = name.trim().replace(['.', '_', '-'], " ");
+    let normalized = normalized_name.split_whitespace().collect::<Vec<_>>();
+    if normalized.len() == 1 && normalized[0].eq_ignore_ascii_case("specials") {
+        return Some(0);
+    }
+    if normalized.len() == 2 && normalized[0].eq_ignore_ascii_case("season") {
+        return normalized[1].parse().ok();
+    }
+    None
+}
+
+fn parse_tv_episode_marker(stem: &str) -> Option<(Option<u32>, (u32, Option<u32>), usize)> {
+    let bytes = stem.as_bytes();
+    for start in 0..bytes.len() {
+        if !bytes[start].eq_ignore_ascii_case(&b's')
+            || (start > 0 && bytes[start - 1].is_ascii_alphanumeric())
+        {
+            continue;
+        }
+        let Some((season, after_season)) = parse_digits(bytes, start + 1) else {
+            continue;
+        };
+        if bytes.get(after_season)?.to_ascii_lowercase() != b'e' {
+            continue;
+        }
+        let Some((episode, after_episode)) = parse_digits(bytes, after_season + 1) else {
+            continue;
+        };
+        let (episode_end, marker_end) = if bytes.get(after_episode) == Some(&b'-')
+            && bytes
+                .get(after_episode + 1)
+                .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'e'))
+        {
+            if let Some((end, marker_end)) = parse_digits(bytes, after_episode + 2) {
+                (Some(end), marker_end)
+            } else {
+                (None, after_episode)
+            }
+        } else {
+            (None, after_episode)
+        };
+        return Some((Some(season), (episode, episode_end), marker_end));
+    }
+    None
+}
+
+fn parse_digits(bytes: &[u8], start: usize) -> Option<(u32, usize)> {
+    let mut end = start;
+    while end < bytes.len() && bytes[end].is_ascii_digit() && end - start < 3 {
+        end += 1;
+    }
+    if end == start {
+        return None;
+    }
+    Some((
+        std::str::from_utf8(&bytes[start..end]).ok()?.parse().ok()?,
+        end,
+    ))
+}
+
+fn clean_episode_title(value: &str) -> Option<String> {
+    let title = value
+        .trim_start_matches(|character: char| {
+            character == '-' || character == '_' || character == '.' || character.is_whitespace()
+        })
+        .trim();
+    (!title.is_empty()).then(|| title.to_owned())
+}
+
 async fn store_metadata_sidecar(
     folder: &PathBuf,
     group_path: &std::path::Path,
@@ -1030,6 +1192,7 @@ async fn store_metadata_sidecar(
         .strip_prefix(folder)
         .unwrap_or(&media.path)
         .to_string_lossy();
+    let episode = tv_episode_info(folder, &media.path);
     let info = MediaInfo {
         title: title.to_owned(),
         media_path: path.into_owned(),
@@ -1038,6 +1201,10 @@ async fn store_metadata_sidecar(
         first_air_date: json_string(metadata, "first_air_date"),
         number_of_seasons: json_i64(metadata, "number_of_seasons"),
         number_of_episodes: json_i64(metadata, "number_of_episodes"),
+        season: episode.as_ref().map(|value| value.season),
+        episode: episode.as_ref().map(|value| value.episode),
+        episode_end: episode.as_ref().and_then(|value| value.episode_end),
+        episode_title: episode.and_then(|value| value.episode_title),
         metadata_json: serde_json::to_string_pretty(metadata).unwrap_or_default(),
         technical: probe_media(&media.path).await,
     };
@@ -1054,9 +1221,25 @@ struct MediaInfo {
     first_air_date: String,
     number_of_seasons: Option<i64>,
     number_of_episodes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    season: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    episode: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    episode_end: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    episode_title: Option<String>,
     metadata_json: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     technical: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct SeasonInfo {
+    title: String,
+    description: String,
+    season: u32,
+    metadata_json: String,
 }
 
 async fn probe_media(path: &std::path::Path) -> Option<serde_json::Value> {
@@ -1124,6 +1307,56 @@ async fn download_tmdb_artwork(
         tokio::fs::write(&local, &bytes).await?;
         record_artwork(&state.db, media_key, kind, &local);
     }
+    Ok(())
+}
+
+async fn download_tmdb_season_artwork(
+    client: &reqwest::Client,
+    token: &str,
+    season_directory: &std::path::Path,
+    show_metadata: &serde_json::Value,
+    season: u32,
+    media_key: &str,
+    state: &AppState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(show_id) = show_metadata.get("id").and_then(|value| value.as_i64()) else {
+        return Ok(());
+    };
+    let response = client
+        .get(format!(
+            "https://api.themoviedb.org/3/tv/{show_id}/season/{season}"
+        ))
+        .bearer_auth(token)
+        .query(&[("language", "en-US")])
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Ok(());
+    }
+    let metadata = response.json::<serde_json::Value>().await?;
+    let artwork = season_directory.join(".mplex");
+    tokio::fs::create_dir_all(&artwork).await?;
+    let info = SeasonInfo {
+        title: format!("Season {season:02}"),
+        description: json_string(&metadata, "overview"),
+        season,
+        metadata_json: serde_json::to_string_pretty(&metadata).unwrap_or_default(),
+    };
+    tokio::fs::write(artwork.join("info.toml"), toml::to_string_pretty(&info)?).await?;
+    let Some(path) = metadata.get("poster_path").and_then(|value| value.as_str()) else {
+        return Ok(());
+    };
+    let image = client
+        .get(format!("https://image.tmdb.org/t/p/w780{path}"))
+        .bearer_auth(token)
+        .send()
+        .await?;
+    if !image.status().is_success() {
+        return Ok(());
+    }
+    let local = artwork.join("cover.jpg");
+    tokio::fs::write(&local, image.bytes().await?).await?;
+    record_artwork(&state.db, media_key, "season-cover", &local);
     Ok(())
 }
 
@@ -1342,6 +1575,8 @@ struct WebPath {
     view: Option<String>,
     kind: Option<String>,
     stream: Option<usize>,
+    play: Option<String>,
+    episode: Option<String>,
 }
 
 fn selected_library_root(state: &AppState, library: Option<usize>) -> PathBuf {
@@ -1577,11 +1812,30 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     }
     let library_root = selected_library_root(&s, query.library);
     let folder_view = query.view.as_deref() == Some("folders");
+    let library_kind = query.library.and_then(|index| {
+        s.config.lock().ok().and_then(|config| {
+            config
+                .libraries
+                .get(index)
+                .map(|library| library.kind.clone())
+        })
+    });
     let directory = match web_path(&s, &library_root, &relative).await {
         Ok(path) if path.is_dir() => path,
         Ok(_) => return StatusCode::NOT_FOUND.into_response(),
         Err(status) => return status.into_response(),
     };
+    let selected_relative = query
+        .episode
+        .as_deref()
+        .or(query.play.as_deref())
+        .and_then(clean_relative_path);
+    if let Some(selected_relative) = selected_relative.as_deref() {
+        match web_path(&s, &library_root, selected_relative).await {
+            Ok(path) if path.is_file() && media_type(&path).is_some() => {}
+            _ => return StatusCode::NOT_FOUND.into_response(),
+        }
+    }
     let pane_banner = if tokio::fs::metadata(directory.join(".mplex/banner.jpg"))
         .await
         .is_ok()
@@ -1593,7 +1847,11 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     } else {
         String::new()
     };
-    let info_panel = media_info_panel(&directory).await;
+    let info_panel = if let Some(selected_relative) = selected_relative.as_deref() {
+        episode_info_panel(&s, &library_root, selected_relative).await
+    } else {
+        media_info_panel(&directory).await
+    };
     let mut entries = match tokio::fs::read_dir(&directory).await {
         Ok(entries) => entries,
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -1612,7 +1870,12 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
         let child_relative = relative.join(&name);
         if file_type.is_dir() {
             directories.push((name, child_relative));
-        } else if file_type.is_file() && (folder_view || media_type(&path).is_some()) {
+        } else if file_type.is_file()
+            && (folder_view || media_type(&path).is_some())
+            && selected_relative
+                .as_deref()
+                .is_none_or(|selected| selected == child_relative)
+        {
             files.push((name, child_relative, path));
         }
     }
@@ -1629,11 +1892,67 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     });
     let sidebar = sidebar_nav_for(&s, &relative, sidebar_library);
     let mut folder_cards = String::new();
+    let mut season_sections = String::new();
     let mut empty_folders = String::new();
     let mut has_content = false;
+    let tv_season_view = !folder_view
+        && library_kind.as_deref() == Some("tv")
+        && relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(parse_tv_season_directory)
+            .is_some();
     for (name, child_relative) in directories {
         has_content = true;
         let directory = directory.join(&name);
+        if !folder_view
+            && library_kind.as_deref() == Some("tv")
+            && parse_tv_season_directory(&name).is_some()
+        {
+            let season_number = parse_tv_season_directory(&name).unwrap_or_default();
+            let mut season_entries = match tokio::fs::read_dir(&directory).await {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            let mut episode_count = 0;
+            while let Ok(Some(entry)) = season_entries.next_entry().await {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.')
+                    || !entry.file_type().await.is_ok_and(|kind| kind.is_file())
+                    || media_type(&path).is_none()
+                {
+                    continue;
+                }
+                episode_count += 1;
+            }
+            if episode_count > 0 {
+                let preview = first_media_file(&directory)
+                    .await
+                    .and_then(|path| path.strip_prefix(&library_root).ok().map(PathBuf::from));
+                let cover = tokio::fs::metadata(directory.join(".mplex/cover.jpg"))
+                    .await
+                    .is_ok();
+                let banner = tokio::fs::metadata(directory.join(".mplex/banner.jpg"))
+                    .await
+                    .is_ok();
+                let season_count = episode_count.to_string();
+                let season_card = folder_card_with_badge(
+                    &format!("Season {season_number:02}"),
+                    &child_relative,
+                    query.library,
+                    preview.as_deref(),
+                    cover,
+                    banner,
+                    None,
+                    Some(&season_count),
+                );
+                season_sections.push_str(&format!(
+                    r#"<section class="tv-season"><h2>Season {season_number:02}</h2><div class="tv-season-card">{season_card}</div></section>"#
+                ));
+                continue;
+            }
+        }
         let media_count = media_file_count(&directory).await;
         if media_count == 0 {
             empty_folders.push_str(&empty_folder_item(&name, &child_relative, query.library));
@@ -1661,6 +1980,10 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     for (name, child_relative, path) in files {
         has_content = true;
         if let Some((_, mime)) = media_type(&path) {
+            if tv_season_view && selected_relative.is_none() {
+                items.push_str(&tv_episode_card(&name, &child_relative, query.library));
+                continue;
+            }
             let artwork = if tokio::fs::metadata(
                 path.parent()
                     .unwrap_or(std::path::Path::new("."))
@@ -1688,6 +2011,7 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
         }
     }
     items.push_str(&folder_cards);
+    items.push_str(&season_sections);
     if folder_view && !empty_folders.is_empty() {
         items.push_str(&format!(
             r#"<section class="empty-folders"><h2>Empty folders</h2>{}</section>"#,
@@ -1735,6 +2059,15 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     h1 {{ margin-top: 0; }}
     .brand {{ color: inherit; text-decoration: none; }}
     .library {{ display: grid; grid-template-columns: repeat(auto-fill, minmax({}px, 1fr)); align-items: start; gap: 1rem; }}
+    .tv-season {{ grid-column: 1 / -1; }}
+    .tv-season h2 {{ margin: .75rem 0 .6rem; }}
+    .tv-season-card {{ width: 180px; max-width: 100%; }}
+    .tv-season .media-list {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); align-items: start; gap: 1rem; }}
+    .tv-episode-card {{ display: grid; grid-template-columns: 5rem minmax(0, 1fr) auto; align-items: center; gap: 1rem; grid-column: 1 / -1; padding: .9rem 1rem; color: inherit; text-decoration: none; border: 1px solid #374151; border-radius: .65rem; background: #1f2937; }}
+    .tv-episode-card:hover {{ border-color: #60a5fa; background: #24344d; }}
+    .tv-episode-number {{ color: #93c5fd; font-weight: 700; }}
+    .tv-episode-title {{ overflow-wrap: anywhere; }}
+    .tv-episode-action {{ color: #93c5fd; white-space: nowrap; }}
     .breadcrumb, .empty-folders {{ grid-column: 1 / -1; }}
     article, .folder-card, .empty-folders {{ width: 100%; box-sizing: border-box; }}
     article {{ grid-column: span 4; min-width: 0; }}
@@ -2214,6 +2547,91 @@ async fn media_info_panel(directory: &std::path::Path) -> String {
     )
 }
 
+async fn episode_info_panel(
+    _state: &AppState,
+    root: &std::path::Path,
+    relative: &std::path::Path,
+) -> String {
+    let path = root.join(relative);
+    let season_directory = path.parent().unwrap_or(root);
+    let Ok(contents) = tokio::fs::read_to_string(season_directory.join(".mplex/info.toml")).await
+    else {
+        return String::new();
+    };
+    let Ok(info) = contents.parse::<toml::Value>() else {
+        return String::new();
+    };
+    let Some(metadata) = info
+        .get("metadata_json")
+        .and_then(toml::Value::as_str)
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+    else {
+        return String::new();
+    };
+    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+        return String::new();
+    };
+    let Some((_, (episode, _), _)) = parse_tv_episode_marker(stem) else {
+        return String::new();
+    };
+    let episode_metadata = metadata
+        .get("episodes")
+        .and_then(|episodes| episodes.as_array())
+        .and_then(|episodes| {
+            episodes.iter().find(|item| {
+                item.get("episode_number").and_then(|value| value.as_u64()) == Some(episode as u64)
+            })
+        });
+    let Some(episode_metadata) = episode_metadata else {
+        return String::new();
+    };
+    let title = episode_metadata
+        .get("name")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Episode");
+    let description = episode_metadata
+        .get("overview")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(r#"<p class="metadata-description">{}</p>"#, html(value)))
+        .unwrap_or_default();
+    let details = [
+        ("episode", format!("{}", episode)),
+        (
+            "air date",
+            episode_metadata
+                .get("air_date")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+        ),
+        (
+            "runtime",
+            episode_metadata
+                .get("runtime")
+                .and_then(|value| value.as_i64())
+                .map(|value| format!("{value} minutes"))
+                .unwrap_or_default(),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, value)| !value.is_empty())
+    .map(|(key, value)| {
+        format!(
+            r#"<div class="metadata-detail"><strong>{}</strong><span>{}</span></div>"#,
+            html(key),
+            html(&value)
+        )
+    })
+    .collect::<String>();
+    format!(
+        r#"<section class="metadata-panel"><h2>{}</h2>{}<div class="metadata-details">{}</div></section>"#,
+        html(title),
+        description,
+        details
+    )
+}
+
 fn render_toml_details(table: &toml::map::Map<String, toml::Value>) -> String {
     table
         .iter()
@@ -2394,6 +2812,53 @@ fn strip_ass_tags(value: &str) -> String {
         }
     }
     output
+}
+
+fn tv_episode_card(name: &str, relative: &std::path::Path, library: Option<usize>) -> String {
+    let library_query = library
+        .map(|index| format!("library={index}&"))
+        .unwrap_or_default();
+    let path = url_encode(&relative.to_string_lossy());
+    let folder = relative.parent().unwrap_or(std::path::Path::new(""));
+    format!(
+        r#"<a class="tv-episode-card" href="/library?{}path={}&episode={}"><span class="tv-episode-number">{}</span><span class="tv-episode-title">{}</span><span class="tv-episode-action">▶ Play episode</span></a>"#,
+        library_query,
+        url_encode(&folder.to_string_lossy()),
+        path,
+        html(&tv_episode_number(name)),
+        html(&tv_episode_display_name(name)),
+    )
+}
+
+fn tv_episode_number(name: &str) -> String {
+    let stem = std::path::Path::new(name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(name);
+    parse_tv_episode_marker(stem)
+        .map(|(_, (episode, episode_end), _)| {
+            episode_end
+                .map(|end| format!("E{episode:02}–E{end:02}"))
+                .unwrap_or_else(|| format!("E{episode:02}"))
+        })
+        .unwrap_or_else(|| "Episode".to_owned())
+}
+
+fn tv_episode_display_name(name: &str) -> String {
+    let stem = std::path::Path::new(name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(name);
+    let Some((_, (episode, episode_end), marker_end)) = parse_tv_episode_marker(stem) else {
+        return name.to_owned();
+    };
+    let title = clean_episode_title(&stem[marker_end..]);
+    let episode_label = episode_end
+        .map(|end| format!("Episodes {episode}–{end}"))
+        .unwrap_or_else(|| format!("Episode {episode}"));
+    title
+        .map(|title| format!("{episode_label} · {title}"))
+        .unwrap_or(episode_label)
 }
 
 fn web_client_item(
@@ -2590,6 +3055,21 @@ fn folder_card(
     banner: bool,
     progress: Option<f64>,
 ) -> String {
+    folder_card_with_badge(
+        name, relative, library, preview, cover, banner, progress, None,
+    )
+}
+
+fn folder_card_with_badge(
+    name: &str,
+    relative: &std::path::Path,
+    library: Option<usize>,
+    preview: Option<&std::path::Path>,
+    cover: bool,
+    banner: bool,
+    progress: Option<f64>,
+    badge: Option<&str>,
+) -> String {
     let preview_markup = if cover { None } else { preview }
         .map(|path| {
             format!(
@@ -2633,9 +3113,18 @@ fn folder_card(
             )
         })
         .unwrap_or_default();
+    let badge_markup = badge
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            format!(
+                r#"<span style="position:absolute;top:.55rem;right:.55rem;z-index:2;min-width:1.7rem;padding:.25rem .45rem;border-radius:.35rem;color:#fff;background:rgba(17,24,39,.9);font-weight:700;text-align:center">{}</span>"#,
+                html(value)
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"<a class="folder-card" style="display:block;overflow:hidden;padding:0;color:inherit;text-decoration:none;border:1px solid #374151;border-radius:.75rem;background:#1f2937" href="/library?{}path={}">
-  <div class="folder-preview" style="position:relative;display:grid;place-items:center;overflow:hidden;aspect-ratio:2/3;background:linear-gradient(135deg,#1e3a8a,#312e81 55%,#111827)"{}>{}{}{}</div>
+  <div class="folder-preview" style="position:relative;display:grid;place-items:center;overflow:hidden;aspect-ratio:2/3;background:linear-gradient(135deg,#1e3a8a,#312e81 55%,#111827)"{}>{}{}{}{}</div>
   <div class="folder-info" style="padding:.9rem 1rem 1rem"><h2 style="font-size:1rem;line-height:1.25;margin:0;overflow-wrap:anywhere">{}</h2>{}</div>
 </a>"#,
         library
@@ -2644,6 +3133,7 @@ fn folder_card(
         url_encode(&relative.to_string_lossy()),
         banner_style,
         preview_markup,
+        badge_markup,
         fallback_icon,
         artwork_markup,
         html(name),
@@ -3111,7 +3601,7 @@ fn html(value: &str) -> String {
 mod tests {
     use super::{
         ass_to_vtt, clean_relative_path, contains_hidden_component, html, parse_range,
-        sidebar_nav_with_settings, srt_to_vtt,
+        parse_tv_episode_marker, parse_tv_season_directory, sidebar_nav_with_settings, srt_to_vtt,
     };
     #[test]
     fn full_file() {
@@ -3177,5 +3667,15 @@ mod tests {
         let settings = sidebar_nav_with_settings(false, true);
         assert!(settings.contains("href=\"/settings\""));
         assert!(!settings.contains("<a class=\"sidebar-link active\" href=\"/\""));
+    }
+    #[test]
+    fn parses_plex_season_and_episode_names() {
+        assert_eq!(parse_tv_season_directory("Season 02"), Some(2));
+        assert_eq!(parse_tv_season_directory("season.02"), Some(2));
+        assert_eq!(parse_tv_season_directory("specials"), Some(0));
+        let parsed = parse_tv_episode_marker("Show Name - s02e18-e19 - Finale").unwrap();
+        assert_eq!(parsed.0, Some(2));
+        assert_eq!(parsed.1, (18, Some(19)));
+        assert_eq!(&"Show Name - s02e18-e19 - Finale"[parsed.2..], " - Finale");
     }
 }

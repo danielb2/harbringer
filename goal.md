@@ -15,6 +15,8 @@ The longer-term streaming goal is to preview or watch an NZB before the complete
 
 The same content could be played through Plezy using a compatibility API, or inside Scryer through an embedded player. Scryer would need UI and backend integration for the latter. Its existing provider plugin interfaces should not be assumed to support arbitrary streaming endpoints or player extensions.
 
+Later, mPlex should provide the same kind of compatibility layer for Audiobookshelf, allowing Audiobookshelf clients to connect to mPlex and browse, play, and track audiobooks from configured libraries. Audiobooks are a later goal after the Plex and Jellyfin media-server work is established.
+
 Keep the core small. Serving a local file should not require metadata scraping, a database, background scanning, transcoding, or external services. Rich metadata, persistent watch state, subtitles, transcoding, and other features can be optional additions. Avoid rebuilding the operational complexity that motivated replacing Plex.
 
 The product does need a small persistent database as user-facing features arrive. It should store per-user viewing progress, server/account identity needed for Plex sessions, matched media identities, scraped metadata, and references or cached state for downloaded artwork and presentation metadata. Local files should be matched to movies and series so Plex can present a proper library rather than only filenames. Metadata and artwork work may happen asynchronously and must not prevent direct playback when a match is unavailable.

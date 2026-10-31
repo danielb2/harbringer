@@ -55,6 +55,10 @@ This is the working checklist for making mPlex a drop-in Plex Media Server repla
 - [ ] Add an embeddable Rust library API.
 - [ ] Keep acquisition, Usenet, repair, and discovery outside the mPlex core.
 
+## Later client compatibility
+
+- [ ] Add Audiobookshelf-compatible APIs so Audiobookshelf clients can browse, play, and track audiobooks served by mPlex.
+
 ## Gap log
 
 ### 2026-10-31

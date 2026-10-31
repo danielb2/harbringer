@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Added TV drill-down metadata presentation: show folders show season cards, season folders show season artwork/description and episode cards, and selecting an episode opens one player with its TMDB description and episode details.
+- TV season scans now cache TMDB season metadata in each season’s `.mplex/info.toml` for use by the season and episode views.
+- Changed season episode counts from title text to a compact top-right badge on the shared `folder_card` artwork.
+- TV metadata scans now request each matched season’s poster from TMDB and cache it as `Season/.mplex/cover.jpg`, allowing the shared season `folder_card` to display season artwork.
+- Constrained TV season cards to the shared compact `folder_card` dimensions so their fallback preview video cannot expand to the full content width.
+- Changed TV navigation to match the expected series hierarchy: show pages contain season cards, season pages contain selectable episode rows, and only the selected episode renders a playback canvas.
+- Reflection: episode browsing no longer creates one player per episode or requires all episodes to share a page; `cargo fmt`, `cargo test`, and `git diff --check` were run.
+- Added season-organized TV browsing in Media view. A show now presents a visible Seasons section with season cards and episode counts, followed by playable episode cards labeled from Plex-style filenames; both Plex’s `Season 01` form and existing `season.01`/`season_01` variants are recognized. Folder view still exposes the raw folder structure.
+- Reflection: TV browsing now follows the same season/episode presentation users expect from Plex without changing movie or generic library navigation; `cargo fmt`, `cargo test`, and `git diff --check` were run.
+- Documented a later goal to support Audiobookshelf clients for audiobook libraries through an Audiobookshelf-compatible API.
+- Added Plex-style TV naming awareness: show folders remain the metadata match boundary, `Season XX` and `Specials` directories determine the season, and `sXXeYY`/multi-episode markers are stored with each matched media item along with its optional episode title.
+- Reflection: TV metadata scans now preserve the episode identity Plex expects instead of applying only show-level metadata to every file; `cargo fmt`, `cargo test`, and `git diff --check` were run.
 - Added embedded subtitle tracks from cached ffprobe stream data. Embedded streams are labeled separately and extracted to WebVTT through `ffmpeg`; external sidecar subtitles remain supported.
 - Fixed Library navbar disappearance caused by a shared CSS format argument being inserted before the sidebar placeholder; Home, Library, and Settings continue to use the shared sidebar renderer.
 - Replaced Continue Watching's unique text card detail with the shared folder-card progress bar, so its visual treatment stays aligned with Library and Recently Added.
