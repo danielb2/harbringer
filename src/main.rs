@@ -43,6 +43,10 @@ struct Config {
     token: String,
     #[serde(default)]
     libraries: Vec<ConfigLibrary>,
+    #[serde(default)]
+    metadata_in_media_folder: bool,
+    #[serde(default)]
+    tmdb_bearer_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -157,9 +161,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/web", get(web_client))
         .route("/web/stream", any(web_stream))
         .route("/web/progress", get(web_progress).post(update_web_progress))
+        .route("/web/subtitle", get(web_subtitle))
         .route("/settings", get(settings_page))
         .route("/settings/libraries", post(create_library))
         .route("/settings/folders", post(add_library_folder))
+        .route("/settings/preferences", post(update_preferences))
+        .route("/settings/libraries/:id/scan", post(scan_library_metadata))
         .route("/settings/browse", get(settings_browse))
         .route("/identity", get(plex_identity))
         .route("/library/sections", get(plex_sections))
@@ -207,15 +214,21 @@ Web client: http://{}:{}/
 }
 
 async fn scan_media(dir: &PathBuf) -> Result<Vec<Media>, Box<dyn std::error::Error>> {
-    let mut entries = tokio::fs::read_dir(dir).await?;
+    let mut directories = vec![dir.clone()];
     let mut paths = Vec::new();
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if entry.file_type().await?.is_file()
-            && !is_hidden_path(&path)
-            && media_type(&path).is_some()
-        {
-            paths.push(path);
+    while let Some(directory) = directories.pop() {
+        let mut entries = tokio::fs::read_dir(&directory).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if is_hidden_path(&path) {
+                continue;
+            }
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
+                directories.push(path);
+            } else if file_type.is_file() && media_type(&path).is_some() {
+                paths.push(path);
+            }
         }
     }
     paths.sort_by_key(|path| path.file_name().map(|name| name.to_ascii_lowercase()));
@@ -286,6 +299,8 @@ fn load_config(path: &std::path::Path) -> Result<Config, Box<dyn std::error::Err
             bind: default_bind(),
             token: default_token(),
             libraries: Vec::new(),
+            metadata_in_media_folder: false,
+            tmdb_bearer_token: None,
         });
     }
     Ok(toml::from_str(&std::fs::read_to_string(path)?)?)
@@ -451,10 +466,20 @@ struct LibraryFolderForm {
     path: String,
 }
 
+#[derive(Deserialize)]
+struct PreferencesForm {
+    metadata_storage: Option<String>,
+    #[serde(default)]
+    metadata_in_media_folder: Option<String>,
+    tmdb_bearer_token: Option<String>,
+}
+
 #[derive(Deserialize, Default)]
 struct SettingsQuery {
     folder: Option<String>,
     error: Option<String>,
+    metadata_matched: Option<usize>,
+    metadata_status: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -561,8 +586,8 @@ async fn settings_page(
         .iter()
         .map(|(id, name, kind, folders)| {
             format!(
-                "<li><strong>{}</strong> <span class=\"note\">({})</span><ul>{}</ul><details><summary>＋ Add folder</summary><form method=\"post\" action=\"/settings/folders\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><input name=\"path\" type=\"text\" placeholder=\"/another/folder\" required><button type=\"submit\">Add folder</button></form></details></li>",
-                html(name), html(library_kind_label(kind)), folders.iter().map(|path| format!("<li>{}</li>", html(path))).collect::<String>(), id
+                "<li><strong>{}</strong> <span class=\"note\">({})</span><ul>{}</ul><details><summary>＋ Add folder</summary><form method=\"post\" action=\"/settings/folders\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><input name=\"path\" type=\"text\" placeholder=\"/another/folder\" required><button type=\"submit\">Add folder</button></form></details><form method=\"post\" action=\"/settings/libraries/{}/scan\"><button type=\"submit\">Scan metadata</button></form></li>",
+                html(name), html(library_kind_label(kind)), folders.iter().map(|path| format!("<li>{}</li>", html(path))).collect::<String>(), id, id
             )
         })
         .collect::<String>();
@@ -576,6 +601,28 @@ async fn settings_page(
             )
         })
         .unwrap_or_default();
+    let notice = query
+        .metadata_matched
+        .map(|count| {
+            format!(
+                "<div class=\"flash-notice\" role=\"status\">Matched {} metadata records.</div>",
+                count
+            )
+        })
+        .or_else(|| {
+            query.metadata_status.as_deref().map(|status| {
+                format!(
+                    "<div class=\"flash-notice\" role=\"status\">{}</div>",
+                    html(status)
+                )
+            })
+        })
+        .unwrap_or_default();
+    let metadata_enabled = state
+        .config
+        .lock()
+        .map(|config| config.metadata_in_media_folder)
+        .unwrap_or(false);
     Html(format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -592,12 +639,13 @@ body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, 
 main {{ min-width: 0; max-width: 760px; width: 100%; box-sizing: border-box; margin: 0 auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; }}
 form {{ display: flex; gap: .6rem; margin: 1.5rem 0; }} input, select {{ flex: 1; padding: .7rem; border: 1px solid #4b5563; border-radius: .4rem; color: #fff; background: #1f2937; }} .path-list {{ display: grid; gap: .55rem; flex: 2; }} .path-row {{ display: flex; gap: .5rem; }} .path-row input {{ min-width: 0; }}
 button {{ padding: .7rem 1rem; border: 0; border-radius: .4rem; color: #fff; background: #2563eb; cursor: pointer; }} li {{ margin: .65rem 0; overflow-wrap: anywhere; }} .note {{ color: #9ca3af; }}
- .flash-error {{ margin: 1rem 0; padding: .8rem 1rem; border: 1px solid #ef4444; border-radius: .5rem; color: #fecaca; background: #451a1a; }}
+ .flash-error {{ margin: 1rem 0; padding: .8rem 1rem; border: 1px solid #ef4444; border-radius: .5rem; color: #fecaca; background: #451a1a; }} .flash-notice {{ margin: 1rem 0; padding: .8rem 1rem; border: 1px solid #22c55e; border-radius: .5rem; color: #bbf7d0; background: #14532d; }}
 details {{ margin-top: .7rem; }} summary {{ display: inline-block; padding: .45rem .7rem; border: 1px solid #3b82f6; border-radius: .4rem; color: #bfdbfe; cursor: pointer; list-style: none; }} summary::-webkit-details-marker {{ display: none; }} details form {{ margin: .7rem 0 0; }}
 @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; padding: .7rem; border-right: 0; border-bottom: 1px solid #263244; }} .sidebar-top {{ padding-bottom: .35rem; }} .sidebar-brand {{ padding: .35rem .55rem; }} .sidebar-toggle {{ display: none; }} .sidebar-label {{ display: none; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} }}
 </style></head><body><div class="app-shell">{}
-<main><h1>Settings</h1>{}
+<main><h1>Settings</h1>{}{}
 <p class="note">A library is a named collection with one type and one or more monitored folders. Create it with its first folder, then add more folders to that same library below.</p>
+<form method="post" action="/settings/preferences"><label>Metadata storage <select name="metadata_storage"><option value="database" {}>SQLite database only</option><option value="sidecar" {}>SQLite database + <code>.mplex</code> sidecars in media folders</option></select></label><input name="tmdb_bearer_token" type="password" placeholder="TMDB bearer token (optional)" value="{}"><button type="submit">Save preferences</button></form>
 <details open><summary>＋ Add library</summary><form method="post" action="/settings/libraries"><input name="name" type="text" placeholder="Library name" required><select name="kind"><option value="movie">Movies</option><option value="tv">TV Shows</option><option value="other">Other</option></select><div class="path-list" id="new-library-paths"><div class="path-row"><input name="path[]" type="text" placeholder="/path/to/folder" value="{}" required><a href="/settings/browse">Browse</a><button type="button" class="remove-path" disabled>−</button></div></div><button type="button" id="add-path">＋</button><button type="submit">Create library</button></form></details>
 <h2>Libraries</h2><ul>{}</ul>
  </main></div><script>
@@ -608,10 +656,234 @@ const pathList = document.querySelector('#new-library-paths'); document.querySel
 </script></body></html>"#,
         sidebar_nav_with_settings(false, true),
         error,
+        notice,
+        if metadata_enabled { "" } else { "selected" },
+        if metadata_enabled { "selected" } else { "" },
+        html(&state.config.lock().ok().and_then(|config| config.tmdb_bearer_token.clone()).unwrap_or_default()),
         html(query.folder.as_deref().unwrap_or("")),
         list
     ))
     .into_response()
+}
+
+async fn update_preferences(
+    State(state): State<AppState>,
+    Form(form): Form<PreferencesForm>,
+) -> Response {
+    let token = form
+        .tmdb_bearer_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned);
+    if let Some(token) = token.as_deref() {
+        let Ok(response) = reqwest::Client::new()
+            .get("https://api.themoviedb.org/3/configuration")
+            .bearer_auth(token)
+            .send()
+            .await
+        else {
+            return settings_error("TMDB could not be reached; token was not saved");
+        };
+        if !response.status().is_success() {
+            return settings_error("TMDB rejected this bearer token; token was not saved");
+        }
+    }
+    let Ok(mut config) = state.config.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    config.metadata_in_media_folder = form.metadata_storage.as_deref() == Some("sidecar")
+        || form.metadata_in_media_folder.is_some();
+    config.tmdb_bearer_token = token;
+    if save_config(&state.config_path, &config).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let location = if config.tmdb_bearer_token.is_some() {
+        "/settings?metadata_status=TMDB%20token%20accepted"
+    } else {
+        "/settings?metadata_status=TMDB%20token%20cleared"
+    };
+    Redirect::to(location).into_response()
+}
+
+#[axum::debug_handler]
+async fn scan_library_metadata(
+    State(state): State<AppState>,
+    Path(library_id): Path<usize>,
+) -> Response {
+    let Ok(config) = state.config.lock().map(|config| config.clone()) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Some(library) = config.libraries.get(library_id) else {
+        return settings_error("Library does not exist");
+    };
+    let Some(token) = config
+        .tmdb_bearer_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+    else {
+        return settings_error("Add a TMDB bearer token in Settings before scanning metadata");
+    };
+    let client = reqwest::Client::new();
+    let kind = if library.kind == "tv" { "tv" } else { "movie" };
+    let mut matched = 0;
+    for folder in &library.folders {
+        let Ok(files) = scan_media(folder).await else {
+            continue;
+        };
+        for (index, media) in files.into_iter().enumerate() {
+            let title = metadata_search_title(&media.title);
+            let response = client
+                .get(format!("https://api.themoviedb.org/3/search/{}", kind))
+                .bearer_auth(token)
+                .query(&[
+                    ("query", title.as_str()),
+                    ("include_adult", "false"),
+                    ("language", "en-US"),
+                ])
+                .send()
+                .await;
+            let Ok(response) = response else { continue };
+            let Ok(payload) = response.json::<serde_json::Value>().await else {
+                continue;
+            };
+            let Some(result) = payload
+                .get("results")
+                .and_then(|results| results.as_array())
+                .and_then(|results| results.first())
+            else {
+                continue;
+            };
+            let media_key = format!("{}-{}", library_id + 1, index + 1);
+            let metadata_json = serde_json::to_string(result).unwrap_or_else(|_| "{}".to_owned());
+            let database_ok = state
+                .db
+                .lock()
+                .ok()
+                .and_then(|connection| {
+                    connection
+                        .execute(
+                            "UPDATE media SET metadata_json = ?1, matched_at = strftime('%s', 'now') WHERE media_key = ?2",
+                            (&metadata_json, &media_key),
+                        )
+                        .ok()
+                })
+                .is_some();
+            if !database_ok {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            if config.metadata_in_media_folder {
+                let _ = store_metadata_sidecar(folder, &media, result).await;
+                let _ = download_tmdb_artwork(&client, token, folder, &media, result, &state).await;
+            }
+            matched += 1;
+        }
+    }
+    Redirect::to(&format!("/settings?metadata_matched={matched}")).into_response()
+}
+
+fn metadata_search_title(title: &str) -> String {
+    title
+        .replace('.', " ")
+        .replace('_', " ")
+        .replace('-', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+async fn store_metadata_sidecar(
+    folder: &PathBuf,
+    media: &Media,
+    metadata: &serde_json::Value,
+) -> Result<(), std::io::Error> {
+    let directory = media.path.parent().unwrap_or(folder).join(".mplex");
+    tokio::fs::create_dir_all(&directory).await?;
+    let path = media
+        .path
+        .strip_prefix(folder)
+        .unwrap_or(&media.path)
+        .to_string_lossy();
+    let info = MediaInfo {
+        title: media.title.clone(),
+        media_path: path.into_owned(),
+        description: json_string(metadata, "overview"),
+        release_date: json_string(metadata, "release_date"),
+        first_air_date: json_string(metadata, "first_air_date"),
+        number_of_seasons: json_i64(metadata, "number_of_seasons"),
+        number_of_episodes: json_i64(metadata, "number_of_episodes"),
+        metadata_json: serde_json::to_string_pretty(metadata).unwrap_or_default(),
+    };
+    let contents = toml::to_string_pretty(&info).map_err(std::io::Error::other)?;
+    tokio::fs::write(directory.join("info.toml"), contents).await
+}
+
+#[derive(Serialize)]
+struct MediaInfo {
+    title: String,
+    media_path: String,
+    description: String,
+    release_date: String,
+    first_air_date: String,
+    number_of_seasons: Option<i64>,
+    number_of_episodes: Option<i64>,
+    metadata_json: String,
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn json_i64(value: &serde_json::Value, key: &str) -> Option<i64> {
+    value.get(key).and_then(|value| value.as_i64())
+}
+
+async fn download_tmdb_artwork(
+    client: &reqwest::Client,
+    token: &str,
+    folder: &PathBuf,
+    media: &Media,
+    metadata: &serde_json::Value,
+    state: &AppState,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let artwork = media.path.parent().unwrap_or(folder).join(".mplex");
+    tokio::fs::create_dir_all(&artwork).await?;
+    for (kind, field) in [("cover", "poster_path"), ("banner", "backdrop_path")] {
+        let Some(path) = metadata.get(field).and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let response = client
+            .get(format!("https://image.tmdb.org/t/p/w780{}", path))
+            .bearer_auth(token)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            continue;
+        }
+        let bytes = response.bytes().await?;
+        let local = artwork.join(format!("{kind}.jpg"));
+        tokio::fs::write(&local, &bytes).await?;
+        record_artwork(&state.db, &media.id, kind, &local);
+    }
+    Ok(())
+}
+
+fn record_artwork(
+    db: &Arc<Mutex<Connection>>,
+    media_key: &str,
+    kind: &str,
+    path: &std::path::Path,
+) {
+    if let Ok(connection) = db.lock() {
+        let _ = connection.execute(
+            "INSERT OR REPLACE INTO artwork (media_key, kind, local_path, downloaded_at) VALUES (?1, ?2, ?3, strftime('%s', 'now'))",
+            (media_key, kind, path.to_string_lossy().as_ref()),
+        );
+    }
 }
 
 fn settings_error(message: &str) -> Response {
@@ -792,6 +1064,7 @@ async fn add_library_folder(
 struct WebPath {
     path: Option<String>,
     library: Option<usize>,
+    view: Option<String>,
 }
 
 fn selected_library_root(state: &AppState, library: Option<usize>) -> PathBuf {
@@ -872,6 +1145,7 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
         return StatusCode::NOT_FOUND.into_response();
     }
     let library_root = selected_library_root(&s, query.library);
+    let folder_view = query.view.as_deref() == Some("folders");
     let directory = match web_path(&s, &library_root, &relative).await {
         Ok(path) if path.is_dir() => path,
         Ok(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -895,7 +1169,7 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
         let child_relative = relative.join(&name);
         if file_type.is_dir() {
             directories.push((name, child_relative));
-        } else if file_type.is_file() && media_type(&path).is_some() {
+        } else if file_type.is_file() && (folder_view || media_type(&path).is_some()) {
             files.push((name, child_relative, path));
         }
     }
@@ -915,28 +1189,34 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
         if media_count == 0 {
             empty_folders.push_str(&empty_folder_item(&name, &child_relative, query.library));
         } else {
+            let preview = first_media_file(&directory)
+                .await
+                .and_then(|path| path.strip_prefix(&library_root).ok().map(PathBuf::from));
             folder_cards.push_str(&folder_card(
                 &name,
                 &child_relative,
                 media_count,
                 query.library,
+                preview.as_deref(),
             ));
         }
     }
     for (name, child_relative, path) in files {
         has_content = true;
-        let Some((_, mime)) = media_type(&path) else {
-            continue;
-        };
-        items.push_str(&web_client_item(
-            &name,
-            &child_relative.to_string_lossy(),
-            mime,
-            query.library,
-        ));
+        if let Some((_, mime)) = media_type(&path) {
+            items.push_str(&web_client_item(
+                &name,
+                &child_relative.to_string_lossy(),
+                mime,
+                query.library,
+                &subtitle_tracks(&path, &child_relative).await,
+            ));
+        } else {
+            items.push_str(&file_item(&name));
+        }
     }
     items.push_str(&folder_cards);
-    if !empty_folders.is_empty() {
+    if folder_view && !empty_folders.is_empty() {
         items.push_str(&format!(
             r#"<section class="empty-folders"><h2>Empty folders</h2>{}</section>"#,
             empty_folders
@@ -982,19 +1262,29 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     main {{ min-width: 0; max-width: 1100px; width: 100%; box-sizing: border-box; margin: 0 auto; padding: 2rem 1rem; }}
     h1 {{ margin-top: 0; }}
     .brand {{ color: inherit; text-decoration: none; }}
-    .library {{ display: flex; flex-direction: column; align-items: center; gap: 1.25rem; }}
-    article, .folder-card, .empty-folders {{ width: min(100%, 900px); box-sizing: border-box; }}
+    .library {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); align-items: start; gap: 1rem; }}
+    .breadcrumb, .empty-folders {{ grid-column: 1 / -1; }}
+    article, .folder-card, .empty-folders {{ width: 100%; box-sizing: border-box; }}
     article {{ overflow: hidden; border: 1px solid #374151; border-radius: .75rem; background: #1f2937; }}
     video {{ display: block; width: 100%; aspect-ratio: 16 / 9; margin: 0 auto; background: #000; }}
     .details {{ padding: .9rem 1rem 1rem; }}
     h2 {{ font-size: 1rem; margin: 0 0 .4rem; overflow-wrap: anywhere; }}
-    .breadcrumb {{ display: flex; flex-wrap: wrap; align-items: center; gap: .35rem; width: min(100%, 900px); box-sizing: border-box; color: #9ca3af; }}
+    .play-actions {{ display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .7rem 0; }}
+    .play-actions button, .subtitle-picker select {{ padding: .45rem .65rem; }}
+    .subtitle-picker {{ display: inline-flex; align-items: center; gap: .35rem; color: #cbd5e1; font-size: .9rem; }}
+    .subtitle-picker select {{ border: 1px solid #4b5563; border-radius: .35rem; color: #fff; background: #111827; }}
+    .breadcrumb {{ display: flex; flex-wrap: wrap; align-items: center; gap: .35rem; box-sizing: border-box; color: #9ca3af; }}
     .breadcrumb a {{ padding: .35rem .55rem; border-radius: .35rem; text-decoration: none; }}
     .breadcrumb a:hover {{ background: #24344d; }}
     .breadcrumb-separator {{ color: #6b7280; }}
+    .view-toggle {{ display: inline-flex; gap: .2rem; margin: .25rem 0 1rem; padding: .2rem; border: 1px solid #374151; border-radius: .5rem; background: #172033; }}
+    .view-toggle a {{ padding: .4rem .75rem; border-radius: .35rem; text-decoration: none; color: #cbd5e1; }}
+    .view-toggle a.active, .view-toggle a:hover {{ color: #fff; background: #2563eb; }}
     .folder-card {{ display: block; overflow: hidden; color: inherit; text-decoration: none; border: 1px solid #374151; border-radius: .75rem; background: #1f2937; transition: border-color .15s, transform .15s; }}
     .folder-card:hover {{ border-color: #60a5fa; transform: translateY(-2px); }}
-    .folder-preview {{ display: grid; place-items: center; aspect-ratio: 16 / 6; color: #bfdbfe; font-size: 3rem; background: linear-gradient(135deg, #1e3a8a, #312e81 55%, #111827); }}
+    .folder-preview {{ position: relative; display: grid; place-items: center; overflow: hidden; aspect-ratio: 16 / 6; color: #bfdbfe; font-size: 3rem; background: linear-gradient(135deg, #1e3a8a, #312e81 55%, #111827); }}
+    .folder-preview-video {{ width: 100%; height: 100%; object-fit: cover; opacity: .85; }}
+    .folder-preview-icon {{ position: absolute; inset: 0; display: grid; place-items: center; text-shadow: 0 2px 8px #000; pointer-events: none; }}
     .folder-info {{ padding: .9rem 1rem 1rem; }}
     .folder-info h2 {{ margin: 0 0 .25rem; }}
     .empty-folders {{ padding: 1rem; border: 1px solid #374151; border-radius: .75rem; background: #172033; }}
@@ -1020,6 +1310,7 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     {}
     <main>
     <h1>Library</h1>
+    <nav class="view-toggle" aria-label="Library view"><a class="{}" href="/library?{}{}">Media</a><a class="{}" href="/library?{}{}view=folders">Folders</a></nav>
     <p class="note">Browse the configured directory. Use ←/→ to seek 5 seconds, Space to play/pause, and F for fullscreen.</p>
     <section class="library">{}</section>
     </main>
@@ -1035,14 +1326,59 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     }});
     document.querySelectorAll("video").forEach(video => {{
       video.volume = 1;
-      video.muted = false;
+      video.muted = !video.controls;
+      const capturePoster = () => {{
+        if (video.poster || video.videoWidth === 0 || video.videoHeight === 0) return;
+        const canvas = document.createElement("canvas");
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        const context = canvas.getContext("2d");
+        if (!context) return;
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        try {{ video.poster = canvas.toDataURL("image/jpeg", 0.78); }} catch (_) {{}}
+      }};
+      if (video.controls) {{
+        video.addEventListener("loadeddata", capturePoster, {{ once: true }});
+      }} else {{
+        video.addEventListener("loadedmetadata", () => {{
+          if (Number.isFinite(video.duration) && video.duration > 0) {{
+            video.currentTime = video.duration * 0.1;
+            video.addEventListener("seeked", capturePoster, {{ once: true }});
+          }}
+        }}, {{ once: true }});
+      }}
+      const subtitleSelect = video.closest("article")?.querySelector(".subtitle-select");
+      subtitleSelect?.addEventListener("change", event => {{
+        const selected = Number(event.target.value);
+        [...video.textTracks].forEach((track, index) => {{
+          track.mode = index === selected ? "showing" : "disabled";
+        }});
+      }});
       const path = video.dataset.progressPath;
       if (!path) return;
+      const article = video.closest("article");
+      const resumeButton = article?.querySelector(".resume-button");
+      const startButton = article?.querySelector(".start-button");
+      const playAt = position => {{
+        const start = () => {{
+          video.currentTime = position;
+          video.play().catch(() => {{}});
+        }};
+        if (video.readyState >= 1) start();
+        else video.addEventListener("loadedmetadata", start, {{ once: true }});
+      }};
+      startButton?.addEventListener("click", () => playAt(0));
+      resumeButton?.addEventListener("click", () => playAt(Number(resumeButton.dataset.position || 0)));
       fetch(`/web/progress?path=${{encodeURIComponent(path)}}`, {{ cache: "no-store" }})
         .then(response => response.ok ? response.json() : null)
         .then(progress => {{
           if (!progress || progress.watched || !Number.isFinite(progress.positionMs) || progress.positionMs <= 2) return;
-          const resume = () => {{ if (progress.positionMs / 1000 < video.duration - 5) video.currentTime = progress.positionMs / 1000; }};
+          const position = progress.positionMs / 1000;
+          if (resumeButton) {{
+            resumeButton.hidden = false;
+            resumeButton.dataset.position = String(position);
+          }}
+          const resume = () => {{ if (position < video.duration - 5) video.currentTime = position; }};
           if (video.readyState >= 1) resume();
           else video.addEventListener("loadedmetadata", resume, {{ once: true }});
         }}).catch(() => {{}});
@@ -1110,24 +1446,244 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
 </body>
 </html>"#,
         sidebar,
+        if !folder_view { "active" } else { "" },
+        query
+            .library
+            .map(|index| format!("library={index}&"))
+            .unwrap_or_default(),
+        query
+            .path
+            .as_deref()
+            .map(|path| format!("path={}&", url_encode(path)))
+            .unwrap_or_default(),
+        if folder_view { "active" } else { "" },
+        query
+            .library
+            .map(|index| format!("library={index}&"))
+            .unwrap_or_default(),
+        query
+            .path
+            .as_deref()
+            .map(|path| format!("path={}&", url_encode(path)))
+            .unwrap_or_default(),
         items
         )),
     )
         .into_response()
 }
 
-fn web_client_item(name: &str, relative: &str, mime: &str, library: Option<usize>) -> String {
+struct SubtitleTrack {
+    label: String,
+    path: PathBuf,
+}
+
+async fn subtitle_tracks(video: &PathBuf, relative: &std::path::Path) -> Vec<SubtitleTrack> {
+    let Some(stem) = video.file_stem().and_then(|value| value.to_str()) else {
+        return Vec::new();
+    };
+    let Ok(mut entries) =
+        tokio::fs::read_dir(video.parent().unwrap_or(std::path::Path::new("."))).await
+    else {
+        return Vec::new();
+    };
+    let mut tracks = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let Some(extension) = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+        else {
+            continue;
+        };
+        if !matches!(extension.as_str(), "srt" | "ass" | "vtt")
+            || !entry.file_type().await.is_ok_and(|kind| kind.is_file())
+        {
+            continue;
+        }
+        let Some(candidate_stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if candidate_stem != stem && !candidate_stem.starts_with(&format!("{}.", stem)) {
+            continue;
+        }
+        let label = candidate_stem
+            .strip_prefix(stem)
+            .unwrap_or(candidate_stem)
+            .trim_start_matches('.')
+            .replace('.', " ")
+            .replace('_', " ");
+        tracks.push(SubtitleTrack {
+            label: if label.is_empty() {
+                extension.to_uppercase()
+            } else {
+                label
+            },
+            path: relative
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join(path.file_name().unwrap_or_default()),
+        });
+    }
+    tracks.sort_by_key(|track| track.label.to_ascii_lowercase());
+    tracks
+}
+
+async fn web_subtitle(State(s): State<AppState>, Query(query): Query<WebPath>) -> Response {
+    let Some(relative) = query.path.as_deref().and_then(clean_relative_path) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if contains_hidden_component(&relative) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let root = selected_library_root(&s, query.library);
+    let path = match web_path(&s, &root, &relative).await {
+        Ok(path) => path,
+        Err(status) => return status.into_response(),
+    };
+    let Ok(contents) = tokio::fs::read_to_string(&path).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let vtt = match extension.as_str() {
+        "vtt" => contents,
+        "srt" => srt_to_vtt(&contents),
+        "ass" => ass_to_vtt(&contents),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    ([(header::CONTENT_TYPE, "text/vtt; charset=utf-8")], vtt).into_response()
+}
+
+fn srt_to_vtt(contents: &str) -> String {
+    let mut output = String::from("WEBVTT\n\n");
+    for block in contents.replace("\r\n", "\n").split("\n\n") {
+        let mut lines = block.lines();
+        let first = lines.next().unwrap_or_default();
+        let timing = if first.contains(" --> ") {
+            first
+        } else {
+            lines.next().unwrap_or_default()
+        };
+        if !timing.contains(" --> ") {
+            continue;
+        }
+        output.push_str(&timing.replace(',', "."));
+        output.push('\n');
+        for line in lines {
+            output.push_str(line);
+            output.push('\n');
+        }
+        output.push('\n');
+    }
+    output
+}
+
+fn ass_to_vtt(contents: &str) -> String {
+    let mut output = String::from("WEBVTT\n\n");
+    for line in contents
+        .lines()
+        .filter(|line| line.starts_with("Dialogue:"))
+    {
+        let fields = line
+            .strip_prefix("Dialogue:")
+            .unwrap_or_default()
+            .trim()
+            .splitn(10, ',')
+            .collect::<Vec<_>>();
+        if fields.len() < 10 {
+            continue;
+        }
+        let start = ass_timestamp(fields[1]);
+        let end = ass_timestamp(fields[2]);
+        let text = fields[9].replace("\\N", "\n").replace("\\n", "\n");
+        let text = strip_ass_tags(&text);
+        output.push_str(&format!("{} --> {}\n{}\n\n", start, end, text));
+    }
+    output
+}
+
+fn ass_timestamp(value: &str) -> String {
+    let parts = value.trim().split(':').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return "00:00:00.000".to_owned();
+    }
+    let seconds = parts[2].parse::<f32>().unwrap_or_default();
+    format!(
+        "{:02}:{:02}:{:06.3}",
+        parts[0].parse::<u32>().unwrap_or_default(),
+        parts[1].parse::<u32>().unwrap_or_default(),
+        seconds
+    )
+}
+
+fn strip_ass_tags(value: &str) -> String {
+    let mut output = String::new();
+    let mut in_tag = false;
+    for character in value.chars() {
+        match character {
+            '{' => in_tag = true,
+            '}' => in_tag = false,
+            _ if !in_tag => output.push(character),
+            _ => {}
+        }
+    }
+    output
+}
+
+fn web_client_item(
+    name: &str,
+    relative: &str,
+    mime: &str,
+    library: Option<usize>,
+    subtitles: &[SubtitleTrack],
+) -> String {
     let stream_path = url_encode(relative);
     let library_query = library
         .map(|index| format!("library={index}&"))
         .unwrap_or_default();
+    let tracks = subtitles
+        .iter()
+        .map(|track| {
+            format!(
+                "<track kind=\"subtitles\" label=\"{}\" src=\"/web/subtitle?{}path={}\" />",
+                html(&track.label),
+                library_query,
+                url_encode(&track.path.to_string_lossy())
+            )
+        })
+        .collect::<String>();
+    let subtitle_options = subtitles
+        .iter()
+        .enumerate()
+        .map(|(index, track)| {
+            format!(
+                r#"<option value="{}">{}</option>"#,
+                index,
+                html(&track.label)
+            )
+        })
+        .collect::<String>();
+    let subtitle_selector = if subtitles.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<label class="subtitle-picker">Subtitles <select class="subtitle-select"><option value="-1">Off</option>{}</select></label>"#,
+            subtitle_options
+        )
+    };
     format!(
         r#"<article>
-  <video controls preload="metadata" data-progress-path="{}" src="/web/stream?{}path={}" type="{}">
+  <video controls preload="auto" data-progress-path="{}" src="/web/stream?{}path={}" type="{}">
+    {}
     Your browser does not support HTML video. <a href="/web/stream?{}path={}">Open the stream</a>.
   </video>
   <div class="details">
     <h2>{}</h2>
+    <div class="play-actions"><button type="button" class="resume-button" hidden>Resume</button><button type="button" class="start-button">Play from beginning</button>{}</div>
     <a href="/web/stream?{}path={}">Open stream</a>
   </div>
 </article>"#,
@@ -1135,20 +1691,18 @@ fn web_client_item(name: &str, relative: &str, mime: &str, library: Option<usize
         library_query,
         stream_path,
         mime,
+        tracks,
         library
             .map(|index| format!("library={index}&"))
             .unwrap_or_default(),
         url_encode(relative),
         html(name),
+        subtitle_selector,
         library
             .map(|index| format!("library={index}&"))
             .unwrap_or_default(),
         url_encode(relative)
     )
-}
-
-fn sidebar_nav(relative: &std::path::Path) -> String {
-    sidebar_nav_with_settings(relative.as_os_str().is_empty() == false, false)
 }
 
 fn sidebar_nav_for(
@@ -1248,25 +1802,64 @@ fn folder_card(
     relative: &std::path::Path,
     media_count: usize,
     library: Option<usize>,
+    preview: Option<&std::path::Path>,
 ) -> String {
     let label = if media_count == 1 {
         "1 media file"
     } else {
         "media files"
     };
+    let preview_markup = preview
+        .map(|path| {
+            format!(
+                r#"<video class="folder-preview-video" muted playsinline preload="auto" src="/web/stream?{}path={}" aria-label="Preview of {}"></video>"#,
+                library
+                    .map(|index| format!("library={index}&"))
+                    .unwrap_or_default(),
+                url_encode(&path.to_string_lossy()),
+                html(name)
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"<a class="folder-card" href="/library?{}path={}">
-  <div class="folder-preview" aria-hidden="true">📁</div>
+  <div class="folder-preview">{}<span class="folder-preview-icon" aria-hidden="true">📁</span></div>
   <div class="folder-info"><h2>{}</h2><span class="note">{} {}</span></div>
 </a>"#,
         library
             .map(|index| format!("library={index}&"))
             .unwrap_or_default(),
         url_encode(&relative.to_string_lossy()),
+        preview_markup,
         html(name),
         media_count,
         label
     )
+}
+
+async fn first_media_file(directory: &std::path::Path) -> Option<PathBuf> {
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let mut entries = tokio::fs::read_dir(directory).await.ok()?;
+        let mut children = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            let file_type = entry.file_type().await.ok()?;
+            if file_type.is_file() && media_type(&path).is_some() {
+                return Some(path);
+            }
+            if file_type.is_dir() {
+                children.push(path);
+            }
+        }
+        children.sort();
+        pending.extend(children.into_iter().rev());
+    }
+    None
 }
 
 fn empty_folder_item(name: &str, relative: &std::path::Path, library: Option<usize>) -> String {
@@ -1276,6 +1869,13 @@ fn empty_folder_item(name: &str, relative: &std::path::Path, library: Option<usi
             .map(|index| format!("library={index}&"))
             .unwrap_or_default(),
         url_encode(&relative.to_string_lossy()),
+        html(name)
+    )
+}
+
+fn file_item(name: &str) -> String {
+    format!(
+        r#"<div class="file-item">📄 <span>{}</span></div>"#,
         html(name)
     )
 }
@@ -1696,8 +2296,8 @@ fn html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_relative_path, contains_hidden_component, html, parse_range, sidebar_nav,
-        sidebar_nav_with_settings,
+        ass_to_vtt, clean_relative_path, contains_hidden_component, html, parse_range,
+        sidebar_nav_with_settings, srt_to_vtt,
     };
     #[test]
     fn full_file() {
@@ -1718,6 +2318,19 @@ mod tests {
     #[test]
     fn html_escapes_titles() {
         assert_eq!(html("A & <B>"), "A &amp; &lt;B&gt;");
+    }
+    #[test]
+    fn converts_srt_to_webvtt() {
+        let vtt = srt_to_vtt("1\n00:00:01,250 --> 00:00:03,000\nHello\n");
+        assert!(vtt.starts_with("WEBVTT\n\n"));
+        assert!(vtt.contains("00:00:01.250 --> 00:00:03.000\nHello"));
+    }
+    #[test]
+    fn converts_ass_dialogue_to_webvtt_and_removes_tags() {
+        let vtt = ass_to_vtt(
+            "[Events]\nDialogue: 0,0:01:02.50,0:01:04.00,Default,,0,0,0,,{\\i1}Hello\\Nworld",
+        );
+        assert!(vtt.contains("00:01:02.500 --> 00:01:04.000\nHello\nworld"));
     }
     #[test]
     fn web_paths_stay_relative() {
@@ -1742,7 +2355,7 @@ mod tests {
     }
     #[test]
     fn sidebar_links_to_home_and_library() {
-        let sidebar = sidebar_nav(std::path::Path::new("shows"));
+        let sidebar = sidebar_nav_with_settings(true, false);
         assert!(sidebar.contains("href=\"/\""));
         assert!(sidebar.contains("href=\"/library\""));
         assert!(sidebar.contains("class=\"sidebar-link active\""));

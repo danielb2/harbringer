@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Clarified metadata storage in Settings with an explicit choice between the SQLite cache alone and SQLite plus `.mplex` sidecars in each media folder.
+- Reflection: SQLite remains the runtime cache in both modes; the sidecar option adds portable metadata/artwork files for media folders that may be moved or backed up independently.
+- Changed metadata sidecars to the portable layout `.mplex/cover.jpg`, `.mplex/banner.jpg`, and `.mplex/info.toml`. The TOML includes title, path, description, movie/TV dates, season and episode counts when supplied, plus the complete matched metadata JSON.
+- Folder view now lists every non-hidden file in the current folder, while Media view limits the listing to supported playable media.
+- Restored explicit per-video controls for subtitle selection, Resume, and Play from beginning.
+- Added Plex-style Library view switching: Media hides folders without supported media, while Folders shows the complete structure including empty folders.
+- Reflection: the view is a presentation toggle over the same live filesystem browser and preserves the selected library and current path; `cargo test`, `cargo fmt -- --check`, and `git diff --check` were run.
+- Added web-player subtitle selection for matching `.srt`, `.ass`, and `.vtt` files. SRT and ASS tracks are converted to browser-compatible WebVTT on request and exposed through the native video captions menu.
+- Reflection: subtitle files remain sidecar media assets and are discovered next to each video without changing the shared stream path; `cargo test`, `cargo fmt -- --check`, `just --fmt --check`, and `git diff --check` were run.
+- Fixed library metadata scans to include media inside visible subfolders, so folders such as `Terminator Dark Fate (2019)` are no longer skipped.
+- Added first-media browser previews to content folder cards; the web client captures a frame when the browser can decode the file and keeps the folder icon as a fallback.
+- Reflection: metadata discovery and folder presentation now cover the directory layout used by movie and TV libraries; `cargo test`, `cargo fmt -- --check`, and `git diff --check` were run.
+- Added a browser-generated first-frame poster fallback for video cards when metadata artwork is unavailable.
+- Reworked the Library layout into a compact responsive grid so media and folder tiles no longer render as oversized stacked cards.
+- Added the first TMDB metadata scan path: configure a bearer token in Settings, scan a library, match movie/TV filenames, cache metadata in SQLite, and download poster/backdrop artwork when folder sidecars are enabled.
+- Reflection: metadata acquisition is explicit and repeatable per library rather than running unexpectedly during startup; per-item rematching and richer presentation endpoints remain next.
+- Reduced library browser card width for denser browsing.
+- Added a Settings preference for storing per-media metadata/artwork sidecar cache files under each folder’s `.mplex/metadata` directory; SQLite remains the runtime cache.
 - Preserved the selected library index in folder cards, breadcrumbs, media stream links, and stream requests so paths from secondary libraries no longer fall back to the first library and 404.
 - Fixed Continue Watching links to open the containing library folder instead of treating a media filename as a directory.
 - Promoted Continue Watching to the first and most prominent Home section, with larger cards and a useful empty state.
