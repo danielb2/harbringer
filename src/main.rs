@@ -6,7 +6,10 @@ use axum::{
     routing::{any, get, post},
     Json, Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::Parser;
+use ed25519_dalek::{Signer, SigningKey};
+use rand_core::OsRng;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -183,15 +186,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/settings/folders", post(add_library_folder))
         .route("/settings/libraries/display", post(update_library_display))
         .route("/settings/preferences", post(update_preferences))
+        .route("/settings/plex/start", get(start_plex_auth))
+        .route("/settings/plex/status", get(plex_auth_status))
+        .route("/settings/plex/callback", get(plex_auth_callback))
+        .route("/settings/plex/disconnect", post(disconnect_plex))
         .route("/settings/libraries/:id/scan", post(scan_library_metadata))
         .route("/settings/media/scan", post(scan_media_metadata))
         .route("/settings/browse", get(settings_browse))
         .route("/identity", get(plex_identity))
         .route("/library/sections", get(plex_sections))
-        .route("/library/sections/1/all", get(plex_all))
+        .route("/library/sections/:section", get(plex_section))
+        .route("/library/sections/:section/all", get(plex_all))
         .route("/library/metadata/:id", get(plex_item))
         .route("/library/metadata/:id/children", get(plex_item))
         .route("/library/metadata/:id/media/:part", get(plex_part))
+        .route("/library/metadata/:id/thumb", get(plex_thumb))
+        .route("/library/metadata/:id/art", get(plex_art))
         .route("/media/:id", any(stream_media))
         .route("/System/Info/Public", get(jellyfin_public_system))
         .route("/Users/Public", get(jellyfin_public_users))
@@ -212,23 +222,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         format!("{}", address.ip())
     };
+    print!("\n");
+    print_startup_banner();
     println!(
-        r#"
-           ____  _
- _ __ ___ |  _ \| | _____  __
-| '_ ` _ \| |_) | |/ _ \ \/ /
-| | | | | |  __/| |  __/>  <
-|_| |_| |_|_|   |_|\___/_/\_\
-
-mPlex running on port {}
-Web client: http://{}:{}/
-"#,
+        "harbringer running on port {}\nWeb client: http://{}:{}/\n",
         address.port(),
         host,
         address.port()
     );
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn print_startup_banner() {
+    println!(
+        r#"
+|              |         o
+|---.,---.,---.|---.,---..,---.,---.,---.,---.
+|   |,---||    |   ||    ||   ||   ||---'|
+`   '`---^`    `---'`    ``   '`---|`---'`
+                               `---'`
+"#
+    );
 }
 
 async fn scan_media(dir: &PathBuf) -> Result<Vec<Media>, Box<dyn std::error::Error>> {
@@ -383,7 +398,19 @@ fn open_database(
              machine_identifier TEXT NOT NULL UNIQUE,
              server_name TEXT NOT NULL,
              plex_account_token TEXT,
-             claimed INTEGER NOT NULL DEFAULT 0
+             claimed INTEGER NOT NULL DEFAULT 0,
+             plex_last_error TEXT
+         );
+         CREATE TABLE IF NOT EXISTS plex_auth (
+             id INTEGER PRIMARY KEY,
+             code TEXT NOT NULL,
+             created_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS plex_device_keys (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             private_key BLOB NOT NULL,
+             public_key BLOB NOT NULL,
+             kid TEXT NOT NULL
          );
          CREATE TABLE IF NOT EXISTS users (
              id TEXT PRIMARY KEY,
@@ -434,6 +461,10 @@ fn open_database(
          );",
     )?;
     let _ = connection.execute(
+        "ALTER TABLE server_identity ADD COLUMN plex_last_error TEXT",
+        [],
+    );
+    let _ = connection.execute(
         "ALTER TABLE libraries ADD COLUMN kind TEXT NOT NULL DEFAULT 'other'",
         [],
     );
@@ -452,11 +483,15 @@ fn open_database(
             })?;
             let generated = format!("mplex-{:x}", timestamp.as_nanos());
             connection.execute(
-                "INSERT INTO server_identity (id, machine_identifier, server_name) VALUES (1, ?1, 'mPlex')",
+                "INSERT INTO server_identity (id, machine_identifier, server_name) VALUES (1, ?1, 'harbringer')",
                 [&generated],
             )?;
             Ok(generated)
         })?;
+    let _ = connection.execute(
+        "UPDATE server_identity SET server_name = 'harbringer' WHERE id = 1",
+        [],
+    );
     Ok((connection, machine_identifier))
 }
 
@@ -512,6 +547,87 @@ struct SettingsQuery {
     error: Option<String>,
     metadata_matched: Option<usize>,
     metadata_status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PlexPinResponse {
+    id: i64,
+    code: String,
+    #[serde(rename = "authToken")]
+    auth_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PlexClaimTokenResponse {
+    token: String,
+}
+
+fn plex_auth_client_identifier(state: &AppState) -> String {
+    format!("{}-auth", state.machine_identifier)
+}
+
+fn plex_device_key(state: &AppState) -> Result<(SigningKey, String), String> {
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| "could not access Plex device key storage".to_owned())?;
+    let existing = connection.query_row(
+        "SELECT private_key, kid FROM plex_device_keys WHERE id = 1",
+        [],
+        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?)),
+    );
+    if let Ok((private_key, kid)) = existing {
+        let bytes: [u8; 32] = private_key
+            .try_into()
+            .map_err(|_| "stored Plex device key has an invalid length".to_owned())?;
+        return Ok((SigningKey::from_bytes(&bytes), kid));
+    }
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let kid = format!("{}-jwk", state.machine_identifier);
+    connection
+        .execute(
+            "INSERT INTO plex_device_keys (id, private_key, public_key, kid) VALUES (1, ?1, ?2, ?3)",
+            (
+                signing_key.to_bytes().as_slice(),
+                signing_key.verifying_key().to_bytes().as_slice(),
+                &kid,
+            ),
+        )
+        .map_err(|_| "could not persist Plex device key".to_owned())?;
+    Ok((signing_key, kid))
+}
+
+fn plex_device_jwk(signing_key: &SigningKey, kid: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
+        "kid": kid,
+        "alg": "EdDSA"
+    })
+}
+
+fn plex_device_jwt(signing_key: &SigningKey, kid: &str, client_id: &str) -> String {
+    let header = serde_json::json!({"alg": "EdDSA", "kid": kid, "typ": "JWT"});
+    let issued_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let payload = serde_json::json!({
+        "aud": "plex.tv",
+        "iss": client_id,
+        "iat": issued_at,
+        "exp": issued_at + 3600,
+        "scope": "username,email,friendly_name"
+    });
+    let encoded_header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap_or_default());
+    let encoded_payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap_or_default());
+    let signing_input = format!("{encoded_header}.{encoded_payload}");
+    let signature = signing_key.sign(signing_input.as_bytes());
+    format!(
+        "{signing_input}.{}",
+        URL_SAFE_NO_PAD.encode(signature.to_bytes())
+    )
 }
 
 #[derive(Deserialize, Default)]
@@ -600,6 +716,440 @@ async fn update_web_progress(
     StatusCode::NO_CONTENT.into_response()
 }
 
+async fn start_plex_auth(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let client = reqwest::Client::new();
+    let auth_client_identifier = plex_auth_client_identifier(&state);
+    let Ok((signing_key, kid)) = plex_device_key(&state) else {
+        return settings_error("Could not initialize Plex device authentication");
+    };
+    let response = match client
+        .post("https://clients.plex.tv/api/v2/pins")
+        .json(&serde_json::json!({
+            "jwk": plex_device_jwk(&signing_key, &kid),
+            "strong": true
+        }))
+        .header("Accept", "application/json")
+        .header("X-Plex-Product", "harbringer")
+        .header("X-Plex-Client-Identifier", &auth_client_identifier)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => return settings_error("Plex.tv could not be reached"),
+    };
+    let Ok(pin) = response.json::<PlexPinResponse>().await else {
+        return settings_error("Plex.tv returned an invalid authentication response");
+    };
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if connection
+        .execute(
+            "INSERT OR REPLACE INTO plex_auth (id, code, created_at) VALUES (?1, ?2, strftime('%s', 'now'))",
+            (pin.id, &pin.code),
+        )
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("127.0.0.1:8096");
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("http");
+    let callback = format!("{proto}://{host}/settings/plex/callback");
+    let link = format!(
+        "https://app.plex.tv/auth#?clientID={}&code={}&context%5Bdevice%5D%5Bproduct%5D={}&context%5Bdevice%5D%5Bversion%5D=0.1.0&context%5Bdevice%5D%5Bplatform%5D=macOS&context%5Bdevice%5D%5BdeviceName%5D={}&forwardUrl={}",
+        url_encode(&auth_client_identifier),
+        url_encode(&pin.code),
+        url_encode("harbringer"),
+        url_encode("harbringer"),
+        url_encode(&callback)
+    );
+    Redirect::to(&link).into_response()
+}
+
+async fn plex_auth_callback(State(state): State<AppState>) -> Response {
+    let _ = plex_auth_status(State(state)).await;
+    Redirect::to("/settings").into_response()
+}
+
+async fn plex_auth_status(State(state): State<AppState>) -> Response {
+    let Some((pin_id, _pin_code)) = state.db.lock().ok().and_then(|connection| {
+        connection
+            .query_row("SELECT id, code FROM plex_auth WHERE id != 0", [], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .ok()
+    }) else {
+        return Json(serde_json::json!({"authorized": false})).into_response();
+    };
+    let Ok((signing_key, kid)) = plex_device_key(&state) else {
+        return Json(serde_json::json!({"authorized": false})).into_response();
+    };
+    let device_jwt = plex_device_jwt(&signing_key, &kid, &plex_auth_client_identifier(&state));
+    let response = reqwest::Client::new()
+        .get(format!("https://clients.plex.tv/api/v2/pins/{pin_id}"))
+        .query(&[("deviceJWT", device_jwt.as_str())])
+        .header("Accept", "application/json")
+        .header("X-Plex-Product", "harbringer")
+        .header(
+            "X-Plex-Client-Identifier",
+            plex_auth_client_identifier(&state),
+        )
+        .send()
+        .await;
+    let Ok(response) = response else {
+        return Json(serde_json::json!({"authorized": false})).into_response();
+    };
+    let Ok(pin) = response.json::<PlexPinResponse>().await else {
+        return Json(serde_json::json!({"authorized": false})).into_response();
+    };
+    let Some(token) = pin.auth_token.filter(|token| !token.is_empty()) else {
+        return Json(serde_json::json!({"authorized": false})).into_response();
+    };
+    let claim_result = claim_and_publish_plex_server(&state, &token).await;
+    let (server_token, claimed, claim_error) = match claim_result {
+        Ok(server_token) => (server_token, true, None),
+        Err(error) => {
+            warn!(error = %error, "Plex server claim or resource publication failed");
+            (token.clone(), false, Some(error))
+        }
+    };
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if connection
+        .execute(
+            "UPDATE server_identity SET plex_account_token = ?1, claimed = ?2, plex_last_error = ?3 WHERE id = 1",
+            (&server_token, claimed, claim_error.as_deref()),
+        )
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let _ = connection.execute("DELETE FROM plex_auth", []);
+    Json(serde_json::json!({
+        "authorized": true,
+        "claimed": claimed,
+        "error": claim_error
+    }))
+    .into_response()
+}
+
+async fn disconnect_plex(State(state): State<AppState>) -> Response {
+    let credentials = state.db.lock().ok().and_then(|connection| {
+        connection
+            .query_row(
+                "SELECT plex_account_token FROM server_identity WHERE id = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+            .map(|token| (token, state.machine_identifier.to_string()))
+    });
+    let Some((token, machine_identifier)) = credentials else {
+        return settings_error("harbringer is not connected to Plex.tv");
+    };
+    let client = reqwest::Client::new();
+    let devices = match client
+        .get("https://plex.tv/devices.xml")
+        .header("Accept", "application/xml")
+        .header("X-Plex-Product", "harbringer")
+        .header("X-Plex-Client-Identifier", &machine_identifier)
+        .header("X-Plex-Token", &token)
+        .send()
+        .await
+    {
+        Ok(response) => match response.error_for_status() {
+            Ok(response) => response.text().await.ok(),
+            Err(_) => None,
+        },
+        Err(_) => None,
+    };
+    if let Some(body) = devices {
+        if let Some(device_id) = find_plex_device_id(&body, &machine_identifier) {
+            let result = client
+                .delete(format!("https://plex.tv/devices/{device_id}.xml"))
+                .header("Accept", "application/xml")
+                .header("X-Plex-Product", "harbringer")
+                .header("X-Plex-Client-Identifier", &machine_identifier)
+                .header("X-Plex-Token", &token)
+                .send()
+                .await;
+            if !matches!(
+                result.and_then(|response| response.error_for_status()),
+                Ok(_)
+            ) {
+                return settings_error("Plex.tv refused to revoke harbringer");
+            }
+        }
+    }
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if connection
+        .execute(
+            "UPDATE server_identity SET plex_account_token = NULL, claimed = 0, plex_last_error = NULL WHERE id = 1",
+            [],
+        )
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    Redirect::to("/settings?metadata_status=Disconnected%20and%20revoked%20from%20Plex.tv")
+        .into_response()
+}
+
+fn find_plex_device_id(body: &str, machine_identifier: &str) -> Option<String> {
+    body.split("<Device")
+        .skip(1)
+        .find(|device| {
+            xml_attribute(device, "clientIdentifier").as_deref() == Some(machine_identifier)
+        })
+        .and_then(|device| xml_attribute(device, "id"))
+}
+
+fn xml_attribute(value: &str, name: &str) -> Option<String> {
+    let marker = format!("{name}=\"");
+    let start = value.find(&marker)? + marker.len();
+    let end = value[start..].find('\"')? + start;
+    Some(value[start..end].to_owned())
+}
+
+async fn claim_and_publish_plex_server(
+    state: &AppState,
+    account_token: &str,
+) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let claim_response = client
+        .get("https://plex.tv/api/claim/token.json")
+        .header("Accept", "application/json")
+        .header("X-Plex-Product", "Plex Media Server")
+        .header("X-Plex-Version", "1.43.4.10903-e5521bd8c")
+        .header("X-Plex-Platform", "MacOSX")
+        .header("X-Plex-Platform-Version", std::env::consts::ARCH)
+        .header("X-Plex-Device-Name", "harbringer")
+        .header("X-Plex-Device", "MacOSX")
+        .header(
+            "X-Plex-Client-Identifier",
+            state.machine_identifier.as_ref(),
+        )
+        .header("X-Plex-Token", account_token)
+        .send()
+        .await
+        .map_err(|error| format!("could not request a Plex claim token: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Plex rejected the claim-token request: {error}"))?;
+    let claim = claim_response
+        .json::<PlexClaimTokenResponse>()
+        .await
+        .map_err(|error| format!("Plex returned an invalid claim token: {error}"))?;
+    if !claim.token.starts_with("claim-") {
+        return Err("Plex returned an invalid claim token".to_owned());
+    }
+
+    let exchange_response = client
+        .post("https://plex.tv/api/claim/exchange")
+        .query(&[("token", claim.token.as_str())])
+        .header("Accept", "application/xml")
+        .header("X-Plex-Product", "Plex Media Server")
+        .header("X-Plex-Version", "1.43.4.10903-e5521bd8c")
+        .header("X-Plex-Platform", "MacOSX")
+        .header("X-Plex-Platform-Version", std::env::consts::ARCH)
+        .header("X-Plex-Device-Name", "harbringer")
+        .header("X-Plex-Device", "MacOSX")
+        .header("X-Plex-Provides", "server")
+        .header(
+            "X-Plex-Client-Identifier",
+            state.machine_identifier.as_ref(),
+        )
+        .send()
+        .await
+        .map_err(|error| format!("could not exchange the Plex claim token: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Plex rejected the server claim: {error}"))?;
+    let exchange_body = exchange_response
+        .text()
+        .await
+        .map_err(|error| format!("could not read the Plex claim response: {error}"))?;
+    let server_token = extract_xml_token(&exchange_body)
+        .ok_or_else(|| "Plex claim response did not contain a server token".to_owned())?;
+
+    let urls = plex_connection_urls(state);
+    if urls.is_empty() {
+        return Err("could not determine a local connection address".to_owned());
+    }
+    let query = urls
+        .iter()
+        .map(|url| ("Connection[][uri]", url.as_str()))
+        .collect::<Vec<_>>();
+    client
+        .put(format!(
+            "https://plex.tv/api/v2/devices/{}",
+            url_encode(&state.machine_identifier)
+        ))
+        .query(&query)
+        .header("Accept", "application/xml")
+        .header("X-Plex-Product", "Plex Media Server")
+        .header("X-Plex-Version", "1.43.4.10903-e5521bd8c")
+        .header("X-Plex-Platform", "MacOSX")
+        .header("X-Plex-Platform-Version", std::env::consts::ARCH)
+        .header("X-Plex-Device-Name", "harbringer")
+        .header("X-Plex-Device", "MacOSX")
+        .header(
+            "X-Plex-Client-Identifier",
+            state.machine_identifier.as_ref(),
+        )
+        .header("X-Plex-Token", &server_token)
+        .send()
+        .await
+        .map_err(|error| format!("could not publish harbringer to Plex: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Plex rejected harbringer publication: {error}"))?;
+
+    let registration = plex_server_registration_xml(state)?;
+    client
+        .post("https://servers.plex.tv/servers.xml")
+        .query(&[("auth_token", server_token.as_str())])
+        .header("Content-Type", "application/xml")
+        .header("Accept", "application/xml")
+        .header("X-Plex-Product", "Plex Media Server")
+        .header("X-Plex-Device", "MacOSX")
+        .header(
+            "X-Plex-Client-Identifier",
+            state.machine_identifier.as_ref(),
+        )
+        .header("X-Plex-Provides", "server")
+        .body(registration)
+        .send()
+        .await
+        .map_err(|error| format!("could not register harbringer libraries with Plex: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Plex rejected harbringer library registration: {error}"))?;
+
+    let resources = client
+        .get("https://clients.plex.tv/api/v2/resources")
+        .query(&[("includeHttps", "1"), ("includeRelay", "1")])
+        .header("Accept", "application/json")
+        .header("X-Plex-Product", "harbringer")
+        .header(
+            "X-Plex-Client-Identifier",
+            state.machine_identifier.as_ref(),
+        )
+        .header("X-Plex-Token", account_token)
+        .send()
+        .await
+        .map_err(|error| format!("could not verify harbringer in Plex resources: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Plex resource verification failed: {error}"))?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| format!("Plex returned invalid resource data: {error}"))?;
+    if !plex_resources_contain(&resources, state.machine_identifier.as_ref()) {
+        return Err(
+            "Plex accepted publication but does not list harbringer in this account's resources"
+                .to_owned(),
+        );
+    }
+    Ok(server_token)
+}
+
+fn plex_server_registration_xml(state: &AppState) -> Result<String, String> {
+    let bind = state
+        .config
+        .lock()
+        .map_err(|_| "could not read harbringer configuration".to_owned())?
+        .bind
+        .parse::<SocketAddr>()
+        .map_err(|_| "harbringer has an invalid bind address".to_owned())?;
+    let urls = plex_connection_urls(state);
+    let local_address = urls
+        .first()
+        .and_then(|url| url.strip_prefix("http://"))
+        .and_then(|url| url.rsplit_once(':'))
+        .map(|(host, _)| host)
+        .unwrap_or("127.0.0.1");
+    let libraries = state
+        .config
+        .lock()
+        .map_err(|_| "could not read harbringer libraries".to_owned())?
+        .libraries
+        .clone();
+    let mut directories = String::new();
+    for (index, library) in libraries.iter().enumerate() {
+        let section = index + 1;
+        directories.push_str(&format!(
+            "<Directory key=\"{section}\" type=\"{}\" title=\"{}\" uuid=\"mplex-{section}\" />",
+            xml_escape(plex_kind(&library.kind)),
+            xml_escape(&library.name),
+        ));
+    }
+    let mut registration_date = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".to_owned())?
+        .as_micros() as i64
+        & !0xf;
+    registration_date ^= (registration_date >> 3) & 0x38;
+    registration_date ^= (registration_date >> 3) & 0x7;
+    Ok(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><MediaContainer size=\"{}\"><Server name=\"harbringer\" localAddresses=\"{}\" port=\"{}\" machineIdentifier=\"{}\" version=\"1.43.4.10903-e5521bd8c\" date=\"{}\" relay=\"0\" />{directories}</MediaContainer>",
+        libraries.len() + 1,
+        xml_escape(local_address),
+        bind.port(),
+        xml_escape(&state.machine_identifier),
+        registration_date,
+    ))
+}
+
+fn plex_resources_contain(resources: &serde_json::Value, machine_identifier: &str) -> bool {
+    resources.as_array().into_iter().flatten().any(|resource| {
+        resource
+            .get("clientIdentifier")
+            .or_else(|| resource.get("machineIdentifier"))
+            .and_then(serde_json::Value::as_str)
+            == Some(machine_identifier)
+    })
+}
+
+fn extract_xml_token(body: &str) -> Option<String> {
+    ["authentication-token", "authenticationToken", "authToken"]
+        .iter()
+        .find_map(|tag| {
+            let start = body.find(&format!("<{tag}>"))? + tag.len() + 2;
+            let end = body[start..].find(&format!("</{tag}>"))? + start;
+            let value = body[start..end].trim();
+            (!value.is_empty()).then(|| value.to_owned())
+        })
+}
+
+fn plex_connection_urls(state: &AppState) -> Vec<String> {
+    let bind = state
+        .config
+        .lock()
+        .ok()
+        .and_then(|config| config.bind.parse::<SocketAddr>().ok());
+    let Some(bind) = bind else {
+        return Vec::new();
+    };
+    let host = if bind.ip().is_unspecified() {
+        std::net::UdpSocket::bind("0.0.0.0:0")
+            .ok()
+            .and_then(|socket| {
+                socket.connect("8.8.8.8:80").ok()?;
+                socket.local_addr().ok().map(|address| address.ip())
+            })
+            .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+    } else {
+        bind.ip()
+    };
+    vec![format!("http://{host}:{}", bind.port())]
+}
+
 async fn settings_page(
     State(state): State<AppState>,
     Query(query): Query<SettingsQuery>,
@@ -669,10 +1219,43 @@ async fn settings_page(
         .lock()
         .map(|config| config.metadata_in_media_folder)
         .unwrap_or(false);
+    let plex_status = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|connection| {
+            connection
+                .query_row(
+                    "SELECT plex_account_token IS NOT NULL, claimed, plex_last_error FROM server_identity WHERE id = 1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, bool>(0)?,
+                            row.get::<_, bool>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .ok()
+        })
+        .unwrap_or((false, false, None));
+    let plex_auth = if plex_status.1 {
+        r#"<h2>Plex.tv <span style="color:#4ade80" title="Connected and published" aria-label="Connected and published">✓</span></h2><p class="note">Connected to Plex.tv and published for Plex clients.</p><form method="get" action="/settings/plex/start"><button type="submit">Reconnect to Plex.tv</button></form><form method="post" action="/settings/plex/disconnect" onsubmit="return confirm('Disconnect and revoke harbringer from Plex.tv?')"><button type="submit">Disconnect and revoke</button></form>"#.to_owned()
+    } else if plex_status.0 {
+        match plex_status.2.as_deref() {
+            Some(error) => format!(
+                "<h2>Plex.tv</h2><p class=\"flash-error\" role=\"status\">harbringer is signed in to Plex.tv, but server claiming or resource publication failed: {}.</p><form method=\"get\" action=\"/settings/plex/start\"><button type=\"submit\">Connect to Plex.tv again</button></form><form method=\"post\" action=\"/settings/plex/disconnect\"><button type=\"submit\">Disconnect and revoke</button></form>",
+                html(error)
+            ),
+            None => r#"<h2>Plex.tv</h2><p class="flash-error" role="status">harbringer has an older Plex.tv account token but has not completed server claiming or resource publication.</p><form method="get" action="/settings/plex/start"><button type="submit">Connect to Plex.tv again</button></form><form method="post" action="/settings/plex/disconnect"><button type="submit">Disconnect and revoke</button></form>"#.to_owned(),
+        }
+    } else {
+        r#"<h2>Plex.tv</h2><p class="note">Connect harbringer to your Plex account so Plex clients can discover and authenticate with this server.</p><form method="get" action="/settings/plex/start"><button type="submit">Connect to Plex.tv</button></form>"#.to_owned()
+    };
     Html(format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>mPlex settings</title><style>
+<title>harbringer settings</title><style>
 body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }}
 .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; transition: grid-template-columns .2s ease; }} .app-shell.sidebar-collapsed {{ grid-template-columns: 68px minmax(0, 1fr); }}
 .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }}
@@ -689,9 +1272,9 @@ button {{ padding: .7rem 1rem; border: 0; border-radius: .4rem; color: #fff; bac
 details {{ margin-top: .7rem; }} summary {{ display: inline-block; padding: .45rem .7rem; border: 1px solid #3b82f6; border-radius: .4rem; color: #bfdbfe; cursor: pointer; list-style: none; }} summary::-webkit-details-marker {{ display: none; }} details form {{ margin: .7rem 0 0; }}
 @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; padding: .7rem; border-right: 0; border-bottom: 1px solid #263244; }} .sidebar-top {{ padding-bottom: .35rem; }} .sidebar-brand {{ padding: .35rem .55rem; }} .sidebar-toggle {{ display: none; }} .sidebar-label {{ display: none; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} }}
 </style></head><body><div class="app-shell">{}
-<main><h1>Settings</h1>{}{}
+<main><h1>Settings</h1>{}{}{}
 <p class="note">A library is a named collection with one type and one or more monitored folders. Create it with its first folder, then add more folders to that same library below.</p>
-<h2>Metadata storage</h2><p class="note">Choose where matched movie and TV metadata is stored. SQLite is the runtime database; sidecar mode also writes portable files beside the media.</p><form method="post" action="/settings/preferences"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="database" {}><span><strong>SQLite database {}</strong><br><span class="note">Store metadata in mPlex’s database only.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="sidecar" {}><span><strong>.mplex files in media folders {}</strong><br><span class="note">Also write <code>.mplex/cover.jpg</code>, <code>banner.jpg</code>, and <code>info.toml</code>.</span></span></label></div><input name="tmdb_bearer_token" type="password" placeholder="TMDB bearer token (leave blank to keep current)" value=""><button type="submit">Save preferences</button></form>
+<h2>Metadata storage</h2><p class="note">Choose where matched movie and TV metadata is stored. SQLite is the runtime database; sidecar mode also writes portable files beside the media.</p><form method="post" action="/settings/preferences"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="database" {}><span><strong>SQLite database {}</strong><br><span class="note">Store metadata in harbringer’s database only.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="sidecar" {}><span><strong>.mplex files in media folders {}</strong><br><span class="note">Also write <code>.mplex/cover.jpg</code>, <code>banner.jpg</code>, and <code>info.toml</code>.</span></span></label></div><input name="tmdb_bearer_token" type="password" placeholder="TMDB bearer token (leave blank to keep current)" value=""><button type="submit">Save preferences</button></form>
 <details open><summary>＋ Add library</summary><form method="post" action="/settings/libraries"><input name="name" type="text" placeholder="Library name" required><select name="kind"><option value="movie">Movies</option><option value="tv">TV Shows</option><option value="other">Other</option></select><div class="path-list" id="new-library-paths"><div class="path-row"><input name="path[]" type="text" placeholder="/path/to/folder" value="{}" required><a href="/settings/browse">Browse</a><button type="button" class="remove-path" disabled>−</button></div></div><button type="button" id="add-path">＋</button><button type="submit">Create library</button></form></details>
 <h2>Libraries</h2><ul>{}</ul>
  </main></div><script>
@@ -703,6 +1286,7 @@ const pathList = document.querySelector('#new-library-paths'); document.querySel
         sidebar_nav_with_settings(false, true),
         error,
         notice,
+        plex_auth,
         if metadata_enabled { "" } else { "checked" },
         if metadata_enabled { "" } else { "(current)" },
         if metadata_enabled { "checked" } else { "" },
@@ -1443,7 +2027,7 @@ async fn settings_browse(Query(query): Query<BrowseQuery>) -> Response {
         String::new()
     };
     Html(format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Choose folder · mPlex</title><style>body {{ margin: 0; padding: 2rem; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} main {{ max-width: 820px; margin: auto; }} a {{ color: #93c5fd; }} .toolbar {{ display: flex; flex-wrap: wrap; gap: .6rem; margin: 1.2rem 0; }} .shortcut, .action {{ display: inline-block; padding: .6rem .8rem; border: 1px solid #374151; border-radius: .5rem; text-decoration: none; background: #1f2937; }} .folder-list {{ padding: 0; list-style: none; border: 1px solid #374151; border-radius: .6rem; overflow: hidden; }} .folder {{ display: flex; justify-content: space-between; gap: 1rem; padding: .8rem 1rem; border-bottom: 1px solid #374151; }} .folder:last-child {{ border-bottom: 0; }} .open {{ margin-right: 1rem; }} code, .note {{ color: #9ca3af; overflow-wrap: anywhere; }} </style></head><body><main><p><a href="/settings">← Back to Settings</a></p><h1>Choose a media folder</h1><p class="note">Pick a folder on the mPlex server. You can add more folders to the same library after this.</p><p><strong>Current folder:</strong> <code>{}</code></p><div class="toolbar"><a class="action" href="/settings/browse?path={}">⬆ Parent</a><a class="action" href="/settings?folder={}">Choose this folder</a></div>{}<ul class="folder-list">{}</ul></main></body></html>"#,
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Choose folder · harbringer</title><style>body {{ margin: 0; padding: 2rem; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} main {{ max-width: 820px; margin: auto; }} a {{ color: #93c5fd; }} .toolbar {{ display: flex; flex-wrap: wrap; gap: .6rem; margin: 1.2rem 0; }} .shortcut, .action {{ display: inline-block; padding: .6rem .8rem; border: 1px solid #374151; border-radius: .5rem; text-decoration: none; background: #1f2937; }} .folder-list {{ padding: 0; list-style: none; border: 1px solid #374151; border-radius: .6rem; overflow: hidden; }} .folder {{ display: flex; justify-content: space-between; gap: 1rem; padding: .8rem 1rem; border-bottom: 1px solid #374151; }} .folder:last-child {{ border-bottom: 0; }} .open {{ margin-right: 1rem; }} code, .note {{ color: #9ca3af; overflow-wrap: anywhere; }} </style></head><body><main><p><a href="/settings">← Back to Settings</a></p><h1>Choose a media folder</h1><p class="note">Pick a folder on the harbringer server. You can add more folders to the same library after this.</p><p><strong>Current folder:</strong> <code>{}</code></p><div class="toolbar"><a class="action" href="/settings/browse?path={}">⬆ Parent</a><a class="action" href="/settings?folder={}">Choose this folder</a></div>{}<ul class="folder-list">{}</ul></main></body></html>"#,
         html(&directory.to_string_lossy()),
         url_encode(&parent.to_string_lossy()),
         url_encode(&directory.to_string_lossy()),
@@ -1763,7 +2347,7 @@ async fn home_client(State(state): State<AppState>) -> Response {
         recent = "<p class=\"note empty-state\">No recently added media yet.</p>".to_owned();
     }
     Html(format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>mPlex</title><style>body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }} .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }} .sidebar-top {{ display: flex; justify-content: space-between; align-items: center; }} .sidebar-toggle {{ background: none; border: 0; color: #cbd5e1; font-size: 1.3rem; cursor: pointer; }} .sidebar-label {{ padding: 1rem .7rem .4rem; color: #6b7280; font-size: .7rem; text-transform: uppercase; }} .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }} .sidebar-link.active, .sidebar-link:hover {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; }} main {{ max-width: 1100px; width: 100%; box-sizing: border-box; margin: auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; text-decoration: none; }} h1 {{ margin-top: 0; }} .section {{ margin: 2rem 0; }} .library-grid, .recent-grid, .continue-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax({}px, 1fr)); gap: 1rem; }} .library-card, .recent-item, .continue-item {{ display: flex; flex-direction: column; gap: .4rem; padding: 1rem; border: 1px solid #374151; border-radius: .7rem; background: #1f2937; }} .continue-item {{ min-height: 130px; justify-content: flex-end; border-color: #2563eb; background: linear-gradient(135deg, #1e3a8a, #1f2937); font-size: 1.05rem; }} .library-card:hover, .recent-item:hover, .continue-item:hover {{ border-color: #60a5fa; }} .library-icon {{ font-size: 2rem; }} .note {{ color: #9ca3af; }} .empty-state {{ padding: 1.5rem; border: 1px dashed #4b5563; border-radius: .7rem; }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; width: 100%; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} .sidebar-label {{ display: none; }} .sidebar-toggle {{ display: none; }} }}</style></head><body><div class="app-shell">{}<main><h1>Home</h1><section class="section"><h2>Continue watching</h2><div class="continue-grid">{}</div></section><section class="section"><h2>Recently added</h2><div class="recent-grid">{}</div></section><section class="section"><h2>Your libraries</h2><div class="library-grid">{}</div></section></main></div><script>const shell=document.querySelector('.app-shell'), toggle=document.querySelector('.sidebar-toggle'); if(localStorage.getItem('mplex-sidebar-collapsed')==='true') shell.classList.add('sidebar-collapsed'); toggle?.addEventListener('click',()=>{{shell.classList.toggle('sidebar-collapsed');localStorage.setItem('mplex-sidebar-collapsed',shell.classList.contains('sidebar-collapsed')?'true':'false')}});</script></body></html>"#,
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>harbringer</title><style>body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }} .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }} .sidebar-top {{ display: flex; justify-content: space-between; align-items: center; }} .sidebar-toggle {{ background: none; border: 0; color: #cbd5e1; font-size: 1.3rem; cursor: pointer; }} .sidebar-label {{ padding: 1rem .7rem .4rem; color: #6b7280; font-size: .7rem; text-transform: uppercase; }} .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }} .sidebar-link.active, .sidebar-link:hover {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; }} main {{ max-width: 1100px; width: 100%; box-sizing: border-box; margin: auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; text-decoration: none; }} h1 {{ margin-top: 0; }} .section {{ margin: 2rem 0; }} .library-grid, .recent-grid, .continue-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax({}px, 1fr)); gap: 1rem; }} .library-card, .recent-item, .continue-item {{ display: flex; flex-direction: column; gap: .4rem; padding: 1rem; border: 1px solid #374151; border-radius: .7rem; background: #1f2937; }} .continue-item {{ min-height: 130px; justify-content: flex-end; border-color: #2563eb; background: linear-gradient(135deg, #1e3a8a, #1f2937); font-size: 1.05rem; }} .library-card:hover, .recent-item:hover, .continue-item:hover {{ border-color: #60a5fa; }} .library-icon {{ font-size: 2rem; }} .note {{ color: #9ca3af; }} .empty-state {{ padding: 1.5rem; border: 1px dashed #4b5563; border-radius: .7rem; }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; width: 100%; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} .sidebar-label {{ display: none; }} .sidebar-toggle {{ display: none; }} }}</style></head><body><div class="app-shell">{}<main><h1>Home</h1><section class="section"><h2>Continue watching</h2><div class="continue-grid">{}</div></section><section class="section"><h2>Recently added</h2><div class="recent-grid">{}</div></section><section class="section"><h2>Your libraries</h2><div class="library-grid">{}</div></section></main></div><script>const shell=document.querySelector('.app-shell'), toggle=document.querySelector('.sidebar-toggle'); if(localStorage.getItem('mplex-sidebar-collapsed')==='true') shell.classList.add('sidebar-collapsed'); toggle?.addEventListener('click',()=>{{shell.classList.toggle('sidebar-collapsed');localStorage.setItem('mplex-sidebar-collapsed',shell.classList.contains('sidebar-collapsed')?'true':'false')}});</script></body></html>"#,
         POSTER_CARD_MIN_WIDTH, sidebar_nav_for(&state, std::path::Path::new(""), None), continue_watching, recent, libraries
     )).into_response()
 }
@@ -2999,7 +3583,7 @@ fn sidebar_nav_with_library_links(
     format!(
         r#"<aside class="sidebar">
   <div class="sidebar-top">
-    <a class="sidebar-brand" href="/">mPlex</a>
+    <a class="sidebar-brand" href="/">harbringer</a>
     <button class="sidebar-toggle" type="button" aria-label="Collapse sidebar" aria-expanded="true" title="Collapse sidebar">‹</button>
   </div>
   <div class="sidebar-label">Browse</div>
@@ -3328,9 +3912,12 @@ async fn root_handler(State(s): State<AppState>, headers: HeaderMap) -> Response
 }
 
 async fn plex_root(state: &AppState) -> Response {
+    let sections = plex_section_directories(state);
     plex_xml(format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="1" machineIdentifier="{}" title1="Home" friendlyName="mPlex"><Directory key="/library/sections/1" type="movie" title="Movies" agent="com.plexapp.agents.none" scanner="Plex Movie" /></MediaContainer>"#,
-        xml_escape(&state.machine_identifier)
+        r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="{}" machineIdentifier="{}" title1="Home" friendlyName="harbringer">{}</MediaContainer>"#,
+        sections.0,
+        xml_escape(&state.machine_identifier),
+        sections.1
     ))
 }
 
@@ -3343,21 +3930,76 @@ fn plex_xml(body: String) -> Response {
 }
 
 async fn plex_identity(State(state): State<AppState>) -> Response {
+    let claimed = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|connection| {
+            connection
+                .query_row(
+                    "SELECT claimed FROM server_identity WHERE id = 1",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .ok()
+        })
+        .unwrap_or(false);
     plex_xml(format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="0" claimed="1" machineIdentifier="{}" version="1.0"/>"#,
+        r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="0" claimed="{}" machineIdentifier="{}" version="1.0"/>"#,
+        if claimed { 1 } else { 0 },
         xml_escape(&state.machine_identifier)
     ))
 }
 
-async fn plex_sections() -> Response {
-    plex_xml(r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="1"><Directory key="1" type="movie" title="Movies" agent="com.plexapp.agents.none" scanner="Plex Movie"/></MediaContainer>"#.into())
+async fn plex_sections(State(state): State<AppState>) -> Response {
+    let sections = plex_section_directories(&state);
+    plex_xml(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="{}">{}</MediaContainer>"#,
+        sections.0, sections.1
+    ))
 }
 
-async fn plex_all(State(s): State<AppState>) -> Response {
-    let videos = s.media.iter().map(plex_video).collect::<String>();
+async fn plex_section(State(state): State<AppState>, Path(section): Path<usize>) -> Response {
+    let Some(library) = state
+        .config
+        .lock()
+        .ok()
+        .and_then(|config| config.libraries.get(section.saturating_sub(1)).cloned())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     plex_xml(format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="{}" librarySectionID="1" librarySectionTitle="Movies" librarySectionUUID="mplex">{}</MediaContainer>"#,
-        s.media.len(),
+        r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="1" librarySectionID="{}" librarySectionTitle="{}"><Directory key="/library/sections/{}/all" type="{}" title="{}" /></MediaContainer>"#,
+        section,
+        xml_escape(&library.name),
+        section,
+        plex_kind(&library.kind),
+        xml_escape(&library.name)
+    ))
+}
+
+async fn plex_all(State(s): State<AppState>, Path(section): Path<usize>) -> Response {
+    let Some(library) = s
+        .config
+        .lock()
+        .ok()
+        .and_then(|config| config.libraries.get(section.saturating_sub(1)).cloned())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let videos = s
+        .media
+        .iter()
+        .filter(|media| media_in_library(media, &library))
+        .map(|media| plex_video(media, section, &library))
+        .collect::<String>();
+    let count = videos.matches("<Video ").count();
+    plex_xml(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="{}" librarySectionID="{}" librarySectionTitle="{}" librarySectionUUID="mplex-{}">{}</MediaContainer>"#,
+        count,
+        section,
+        xml_escape(&library.name),
+        section,
         videos
     ))
 }
@@ -3366,9 +4008,14 @@ async fn plex_item(State(s): State<AppState>, Path(id): Path<String>) -> Respons
     let Some(media) = find_media(&s, &id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let Some((section, library)) = media_library(&s, media) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     plex_xml(format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="1" librarySectionID="1" librarySectionTitle="Movies">{}</MediaContainer>"#,
-        plex_video(media)
+        r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="1" librarySectionID="{}" librarySectionTitle="{}">{}</MediaContainer>"#,
+        section,
+        xml_escape(&library.name),
+        plex_video(media, section, &library)
     ))
 }
 
@@ -3379,12 +4026,97 @@ async fn plex_part(
     plex_item(State(s), Path(id)).await
 }
 
-fn plex_video(media: &Media) -> String {
+async fn plex_thumb(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    plex_artwork(&state, &id, "cover.jpg").await
+}
+
+async fn plex_art(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    plex_artwork(&state, &id, "banner.jpg").await
+}
+
+async fn plex_artwork(state: &AppState, id: &str, filename: &str) -> Response {
+    let Some(media) = find_media(state, id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(parent) = media.path.parent() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let artwork = parent.join(".mplex").join(filename);
+    let Ok(bytes) = tokio::fs::read(artwork).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    (
+        [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
+        bytes,
+    )
+        .into_response()
+}
+
+fn plex_section_directories(state: &AppState) -> (usize, String) {
+    let libraries = state
+        .config
+        .lock()
+        .map(|config| config.libraries.clone())
+        .unwrap_or_default();
+    let directories = libraries
+        .iter()
+        .enumerate()
+        .map(|(index, library)| {
+            let section = index + 1;
+            format!(
+                r#"<Directory key="/library/sections/{section}" type="{}" title="{}" agent="com.plexapp.agents.none" scanner="harbringer" />"#,
+                plex_kind(&library.kind),
+                xml_escape(&library.name)
+            )
+        })
+        .collect::<String>();
+    (libraries.len(), directories)
+}
+
+fn plex_kind(kind: &str) -> &'static str {
+    match kind {
+        "tv" => "show",
+        "movie" => "movie",
+        _ => "movie",
+    }
+}
+
+fn media_in_library(media: &Media, library: &ConfigLibrary) -> bool {
+    library
+        .folders
+        .iter()
+        .any(|folder| media.path.starts_with(folder))
+}
+
+fn media_library(state: &AppState, media: &Media) -> Option<(usize, ConfigLibrary)> {
+    state
+        .config
+        .lock()
+        .ok()?
+        .libraries
+        .iter()
+        .enumerate()
+        .find(|(_, library)| media_in_library(media, library))
+        .map(|(index, library)| (index + 1, library.clone()))
+}
+
+fn plex_video(media: &Media, section: usize, library: &ConfigLibrary) -> String {
+    let media_type = plex_kind(&library.kind);
+    let title = if media_type == "show" {
+        tv_episode_display_name(&media.title)
+    } else {
+        media.title.clone()
+    };
     format!(
-        r#"<Video ratingKey="{}" key="/library/metadata/{}" type="movie" title="{}" librarySectionID="1" librarySectionTitle="Movies" duration="0"><Media id="{}" duration="0" container="{}" videoResolution="unknown"><Part id="{}" key="/media/{}" duration="0" file="{}" size="{}" container="{}"/></Media></Video>"#,
+        r#"<Video ratingKey="{}" key="/library/metadata/{}" type="{}" title="{}" thumb="/library/metadata/{}/thumb" art="/library/metadata/{}/art" librarySectionID="{}" librarySectionTitle="{}" duration="0"><Media id="{}" duration="0" container="{}" videoResolution="unknown"><Part id="{}" key="/media/{}" duration="0" file="{}" size="{}" container="{}"/></Media></Video>"#,
         xml(&media.id),
         xml(&media.id),
-        xml(&media.title),
+        media_type,
+        xml(&title),
+        xml(&media.id),
+        xml(&media.id),
+        section,
+        xml(&library.name),
         xml(&media.id),
         xml(&media.container),
         xml(&media.id),
@@ -3600,8 +4332,9 @@ fn html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ass_to_vtt, clean_relative_path, contains_hidden_component, html, parse_range,
-        parse_tv_episode_marker, parse_tv_season_directory, sidebar_nav_with_settings, srt_to_vtt,
+        ass_to_vtt, clean_relative_path, contains_hidden_component, extract_xml_token, html,
+        parse_range, parse_tv_episode_marker, parse_tv_season_directory, sidebar_nav_with_settings,
+        srt_to_vtt,
     };
     #[test]
     fn full_file() {
@@ -3622,6 +4355,16 @@ mod tests {
     #[test]
     fn html_escapes_titles() {
         assert_eq!(html("A & <B>"), "A &amp; &lt;B&gt;");
+    }
+    #[test]
+    fn extracts_plex_server_token() {
+        assert_eq!(
+            extract_xml_token(
+                "<user><authentication-token>server-token</authentication-token></user>"
+            ),
+            Some("server-token".to_owned())
+        );
+        assert_eq!(extract_xml_token("<user />"), None);
     }
     #[test]
     fn converts_srt_to_webvtt() {

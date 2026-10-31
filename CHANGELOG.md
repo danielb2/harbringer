@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Adopted `harbringer` as the working product name and updated the startup splash accordingly.
+- Embedded the `harbringer` thin ASCII startup banner directly so startup does not depend on external `figlet` or `lolcat` installations.
+- Added Plex `thumb` and `art` metadata routes backed by cached `.mplex/cover.jpg` and `.mplex/banner.jpg` artwork, and advertised those routes in Plex media entries.
+- Completed the first Plex account-to-server handoff: after PIN sign-in, harbringer exchanges a Plex claim token for a server token and publishes its local connection URI to Plex resources.
+- Persisted the Plex claim/publication failure reason and display it in Settings instead of directing users to an unspecified log.
+- Verify harbringer appears in Plex’s account resource list after publication, and show successful Plex connection as a compact checkmark in Settings.
+- Changed Plex PIN polling to identify the server as `Plex Media Server` with server capabilities, so Plex registers the entry as a server rather than an ordinary `harbringer` app/device.
+- Switched Plex sign-in to the hosted `app.plex.tv/auth` consent flow with a separate harbringer auth identity, matching Ether’s “would like to sign in” experience; Settings now uses buttons for both connect and disconnect actions.
+- Added the full Plex Auth App device context (product, version, platform, and device name) to the consent URL so Plex can complete the hosted sign-in flow.
+- Changed Plex connection startup to redirect directly to the hosted Auth App and return through a harbringer callback, removing the intermediate code-entry page.
+- Matched Ether’s hosted Plex PIN flow by requesting strong PINs and including the PIN code when polling authorization.
+- Matched Ether’s Plex server device metadata: server product, PMS version, macOS platform, architecture, and harbringer device name are now sent during claim and resource publication.
+- Added the remaining server identity field Ether sends (`X-Plex-Device: MacOSX`) during Plex claim, publication, and registration.
+- Consolidated Plex PIN creation and polling onto harbringer’s server client identifier so the authorization record is not created as a separate `harbringer-auth` client.
+- Replaced legacy Plex claim PIN authentication with the documented Ed25519 JWK/device-JWT flow: harbringer persists a device keypair, creates a JWK-backed strong PIN, and polls with a signed device JWT.
+- Added a persistent `Reconnect to Plex.tv` button alongside disconnect/revoke in Settings.
+- Added Plex.tv PIN linking from Settings. harbringer can open the Plex linking page, poll authorization, and persist the returned account token; it does not mark the server claimed until claim exchange is implemented.
+- Reordered the Plex replacement checklist so Plex.tv sign-in, claim exchange, and resource publication precede Plezy and official-client validation.
+- Added dynamic Plex library sections: configured libraries are exposed separately, TV libraries identify as show sections, and section inventory is filtered to the selected library.
+- Added BookOrbit as the reference project for future ebook/audiobook library organization, metadata matching, and cover-art retrieval; direct API reuse remains to be evaluated because BookOrbit documents its API as an evolving client-facing surface.
+- Updated `ROADMAP.md` to mark the implemented library scanning, metadata/artwork, web playback state, and TV browsing capabilities complete while keeping the remaining Plex.tv, stable-identity, and official-client gaps explicit.
 - Added TV drill-down metadata presentation: show folders show season cards, season folders show season artwork/description and episode cards, and selecting an episode opens one player with its TMDB description and episode details.
 - TV season scans now cache TMDB season metadata in each season’s `.mplex/info.toml` for use by the season and episode views.
 - Changed season episode counts from title text to a compact top-right badge on the shared `folder_card` artwork.
@@ -101,7 +122,7 @@
 - Added a SQLite state database under the configured media root. It persists the server identity and records the current scanned media inventory, with tables reserved for users, watch progress, and artwork.
 - Updated Plex root and identity responses to use the persisted machine identifier.
 - Reflection: this establishes the storage required for a real Plex replacement without making playback depend on database availability beyond startup; metadata matching, watch-state APIs, and Plex.tv registration remain incomplete. `cargo fmt`, `cargo test`, and `git diff --check` were run.
-- Documented the broader mPlex direction: a small shared media engine with Plex/Jellyfin adapters, standalone and embeddable forms, and future Weaver/Scryer seekable-source integration.
+- Documented the broader harbringer direction: a small shared media engine with Plex/Jellyfin adapters, standalone and embeddable forms, and future Weaver/Scryer seekable-source integration.
 - Recorded the persistence requirement for per-user watch progress, Plex/account identity, and artwork/presentation state.
 - Recorded the requirement to match local files to movies and series and scrape metadata/artwork without blocking direct playback.
 - Added `ROADMAP.md` with the drop-in Plex replacement checklist and dated gap log.
