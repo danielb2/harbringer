@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Advertise the universal Plex `playqueue` provider feature at `/playQueues`; this is the client capability gate for showing Play controls.
+- Reflection: Rex's measured Plex Web behavior shows Play is gated on both playable item metadata and the provider's `playqueue` feature. Harbringer already served play queues but omitted the feature from `/media/providers`, leaving Play hidden. Added the PMS-shaped `{type: playqueue, key: /playQueues, flavor: universal}` descriptor and a regression test. Official Plex Web/macOS confirmation remains the final check.
+- Update the roadmap to record Plezy title search as working and keep the latest show-title episode/artwork behavior explicitly pending client recheck.
 - Include TV episodes in title searches for their matching series name, and include the show poster/background routes on episode metadata as `grandparentThumb` and `grandparentArt`.
 - Reflection: Plex search returns episodes when a query matches their parent show; Harbringer previously only compared episode titles. Episode results now match either the episode title or show title, while retaining the direct episode-title match behavior. The episode metadata also points to the show artwork using Plex's parent artwork fields. Regression tests cover show-name and episode-name ranking and the artwork URL.
 - Implement Plex library and hub search, advertise the `/hubs/search` provider feature, and enable the root `hubSearch` capability. Search returns matching movie, show, and episode metadata by title with optional type/section filters.

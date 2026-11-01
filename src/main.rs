@@ -5896,13 +5896,28 @@ async fn plex_media_providers(State(state): State<AppState>) -> Response {
                 "title": "Library",
                 "types": "video",
                 "protocols": "stream,download",
-                "Feature": [{"key": "/library/sections", "type": "content", "Directory": directories},
-                             {"key": "/hubs/search", "type": "search"},
-                             {"key": "/library/metadata", "type": "metadata"},
-                             {"key": "/hubs/promoted", "type": "promoted"}]
+                "Feature": plex_library_provider_features(directories)
             }]
         }
     }))
+}
+
+fn plex_library_provider_features(directories: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "key": "/library/sections",
+            "type": "content",
+            "Directory": directories
+        }),
+        serde_json::json!({"key": "/hubs/search", "type": "search"}),
+        serde_json::json!({"key": "/library/metadata", "type": "metadata"}),
+        serde_json::json!({"key": "/hubs/promoted", "type": "promoted"}),
+        serde_json::json!({
+            "key": "/playQueues",
+            "type": "playqueue",
+            "flavor": "universal"
+        }),
+    ]
 }
 
 async fn plex_security_resources() -> Response {
@@ -8748,16 +8763,16 @@ mod tests {
         plex_children_json, plex_codec, plex_connectivity_url, plex_device_announce_query,
         plex_device_announce_url, plex_direct_play_decision_response, plex_empty_extras_response,
         plex_external_subtitle_id, plex_genre_tokens, plex_hub_categories, plex_language,
-        plex_library_children_container, plex_library_media_container, plex_mark_direct_play,
-        plex_media_id, plex_paged_children, plex_part_id, plex_photo_source,
-        plex_play_queue_response, plex_presence_url, plex_publish_urls, plex_query_media_id,
-        plex_ranked_tv_shows, plex_rating_key_from_source, plex_safe_numeric_id, plex_search_hubs,
-        plex_search_rank, plex_search_result_entries, plex_search_type_matches, plex_stream_id,
-        plex_track_label, plex_tv_episode_parents, plex_tv_season_groups, plex_tv_season_json,
-        plex_tv_show_groups, plex_tv_show_json, plex_video_json, plex_video_resolution,
-        sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms, technical_tracks,
-        tv_show_title, vtt_to_srt, ConfigLibrary, HeaderMap, HeaderValue, Media, PathBuf,
-        PlexStreamSelection, Uri,
+        plex_library_children_container, plex_library_media_container,
+        plex_library_provider_features, plex_mark_direct_play, plex_media_id, plex_paged_children,
+        plex_part_id, plex_photo_source, plex_play_queue_response, plex_presence_url,
+        plex_publish_urls, plex_query_media_id, plex_ranked_tv_shows, plex_rating_key_from_source,
+        plex_safe_numeric_id, plex_search_hubs, plex_search_rank, plex_search_result_entries,
+        plex_search_type_matches, plex_stream_id, plex_track_label, plex_tv_episode_parents,
+        plex_tv_season_groups, plex_tv_season_json, plex_tv_show_groups, plex_tv_show_json,
+        plex_video_json, plex_video_resolution, sidebar_nav_with_settings, srt_to_vtt,
+        technical_duration_ms, technical_tracks, tv_show_title, vtt_to_srt, ConfigLibrary,
+        HeaderMap, HeaderValue, Media, PathBuf, PlexStreamSelection, Uri,
     };
     #[test]
     fn plex_playback_ids_resolve_rating_keys_and_metadata_paths() {
@@ -9279,6 +9294,17 @@ mod tests {
         assert_eq!(entries[0]["Metadata"]["ratingKey"], "1-42");
         assert_eq!(entries[0]["Metadata"]["title"], "Example Movie");
         assert_eq!(entries[0]["score"], 1.0);
+    }
+
+    #[test]
+    fn plex_provider_advertises_the_universal_playqueue_feature() {
+        let features = plex_library_provider_features(Vec::new());
+        let playqueue = features
+            .iter()
+            .find(|feature| feature["type"] == "playqueue")
+            .expect("playqueue feature is required for Plex Play controls");
+        assert_eq!(playqueue["key"], "/playQueues");
+        assert_eq!(playqueue["flavor"], "universal");
     }
 
     #[test]

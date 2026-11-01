@@ -38,7 +38,9 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 
 - [x] Expose configured libraries as Plex sections and return media metadata with technical tracks and matched metadata.
 - [x] Support current title/date/rating sorts, basic recommendations, Plex artwork URLs, external subtitles, and section pagination.
-- [ ] Implement and validate search, all client-used hubs, filters, sorting options, collections, playlists, and library navigation.
+- [x] Implement Plex title search and confirm Plezy returns local-library results.
+- [ ] Recheck in Plezy that show-title searches also display matching episodes and the show cover after the latest response changes.
+- [ ] Complete and validate all client-used hubs, filters, sorting options, collections, playlists, and library navigation.
 - [ ] Replace scan-order IDs with stable media and part IDs; handle moves, renames, removals, rescans, and library updates reliably.
 - [ ] Complete artwork behavior, including missing-art fallback frames and requested image sizes/formats, using portable in-process Rust libraries.
 - [ ] Verify movie and TV show/season/episode hierarchies and metadata in each official client.
@@ -76,7 +78,8 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 
 ### 2026-11-01
 
-- The direct-play decision endpoint returned JSON HTTP 200 with a successful decision, and its advertised file part returned HTTP 206 for a byte-range request on the existing port 32400 dev server. The official Plex client still shows no Play button; that remains the P0 blocker and has not been verified away.
+- Plezy search now returns local-library results after `/library/search` was changed to its expected `SearchResult[].Metadata` shape. Latest follow-up adds episodes to parent-show searches and emits `grandparentThumb`/`grandparentArt`; verify those additions in Plezy after its latest connection refresh.
+- The direct-play decision endpoint returned JSON HTTP 200 with a successful decision, and its advertised file part returned HTTP 206 for a byte-range request on the existing port 32400 dev server. The official Plex client still showed no Play button; investigation found the missing `playqueue` provider feature, now advertised. Verify the button and playback in Plex Web/macOS after the dev server reloads; the P0 gate remains open until confirmed.
 - Live item metadata exposed part and external subtitle stream IDs above JavaScript's exact integer limit (2^53−1). These IDs now use deterministic safe-range numbers; on the reloaded `just dev` server, the revised part URL returned HTTP 206 and an advertised external subtitle URL returned HTTP 200 as WebVTT. The official client still needs a metadata refresh and Play-button check.
 - Replaced the sparse “drop-in” checklist with an operation-by-operation PMS API inventory, implementation gates, and an official-client compatibility matrix. JSON remains the Plex API response format.
 
