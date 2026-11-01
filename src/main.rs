@@ -11,7 +11,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{any, get, post},
+    routing::{any, get, post, put},
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -39,6 +39,7 @@ use tracing::{info, warn, Span};
 
 const USER_ID: &str = "mplex-user";
 const POSTER_CARD_MIN_WIDTH: usize = 140;
+const PLEX_DEFAULT_AUDIO_LANGUAGE: &str = "en";
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -128,6 +129,7 @@ struct AppState {
     machine_identifier: Arc<str>,
     root: Arc<PathBuf>,
     media: Arc<Vec<Media>>,
+    media_info: Arc<Mutex<HashMap<String, serde_json::Value>>>,
     token: Arc<str>,
     plex_tls: PlexTls,
 }
@@ -141,9 +143,27 @@ struct Media {
     mime: String,
 }
 
+struct LocalSecondTimer;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalSecondTimer {
+    fn format_time(
+        &self,
+        writer: &mut tracing_subscriber::fmt::format::Writer<'_>,
+    ) -> std::fmt::Result {
+        write!(
+            writer,
+            "{}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z")
+        )
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_timer(LocalSecondTimer)
+        .init();
     let args = Args::parse();
     let config_arg = args.config.unwrap_or_else(|| PathBuf::from("config"));
     let config_path = if config_arg
@@ -216,6 +236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         machine_identifier: Arc::from(machine_identifier),
         root: Arc::new(root),
         media: Arc::new(media),
+        media_info: Arc::new(Mutex::new(HashMap::new())),
         token: Arc::from(config.token),
         plex_tls,
     };
@@ -303,6 +324,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/library/metadata/:id", get(plex_item))
         .route("/library/metadata/:id/children", get(plex_item))
         .route("/library/metadata/:id/media/:part", get(plex_part))
+        .route("/library/parts/:id", put(plex_set_streams))
+        .route("/library/parts/:id/*path", get(plex_part_file))
+        .route("/library/streams/:stream", get(plex_stream))
         .route("/library/metadata/:id/thumb", get(plex_thumb))
         .route("/library/metadata/:id/art", get(plex_art))
         .route("/media/:id", any(stream_media))
@@ -320,37 +344,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(
             TraceLayer::new_for_http()
                 .on_request(|request: &Request<Body>, _span: &Span| {
-                    let timestamp = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|duration| duration.as_millis())
-                        .unwrap_or_default();
-                    eprintln!(
-                        "Plex client request: t={}ms remote_ip={} {} {} accept={:?} product_header={:?} token_present={}",
-                        timestamp,
-                        request.extensions().get::<SocketAddr>().map(|addr| addr.ip().to_string()).unwrap_or_else(|| "unknown".to_owned()),
+                    let remote_ip = request
+                        .extensions()
+                        .get::<SocketAddr>()
+                        .map(|addr| addr.ip().to_string())
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    info!(
+                        "event=http_request remote_ip={} method={} path={} accept={:?} plex_product={:?} token_present={}",
+                        remote_ip,
                         request.method(),
                         request.uri().path(),
                         request.headers().get(header::ACCEPT),
                         request.headers().get("X-Plex-Product"),
                         plex_request_token(request.headers(), request.uri()).is_some()
                     );
-                    info!(
-                        remote_ip = request.extensions().get::<SocketAddr>().map(|addr| addr.ip().to_string()).unwrap_or_else(|| "unknown".to_owned()),
-                        method = %request.method(),
-                        path = %request.uri().path(),
-                        accept = ?request.headers().get(header::ACCEPT),
-                        plex_product = ?request.headers().get("X-Plex-Product"),
-                        "Plex client request"
-                    );
                 })
                 .on_response(|response: &Response, latency: Duration, _span: &Span| {
-                    let timestamp = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|duration| duration.as_millis())
-                        .unwrap_or_default();
-                    eprintln!(
-                        "Plex client response: t={}ms status={} latency={}ms",
-                        timestamp,
+                    info!(
+                        "event=http_response status={} latency_ms={}",
                         response.status(),
                         latency.as_millis()
                     );
@@ -2536,7 +2547,7 @@ async fn store_metadata_sidecar(
         episode_end: episode.as_ref().and_then(|value| value.episode_end),
         episode_title: episode.and_then(|value| value.episode_title),
         metadata_json: serde_json::to_string_pretty(metadata).unwrap_or_default(),
-        technical: probe_media(&media.path).await,
+        technical: inspect_media(&media.path).await,
     };
     let contents = toml::to_string_pretty(&info).map_err(std::io::Error::other)?;
     tokio::fs::write(directory.join("info.toml"), contents).await
@@ -2572,24 +2583,370 @@ struct SeasonInfo {
     metadata_json: String,
 }
 
-async fn probe_media(path: &std::path::Path) -> Option<serde_json::Value> {
-    let output = tokio::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-        ])
-        .arg(path)
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
+async fn inspect_media(path: &std::path::Path) -> Option<serde_json::Value> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        vuio_media_info::inspect(path)
+            .ok()?
+            .to_json()
+            .ok()
+            .and_then(|json| serde_json::from_str(&json).ok())
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn technical_tracks(info: &serde_json::Value) -> &[serde_json::Value] {
+    info.get("media")
+        .and_then(|media| media.get("track"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+fn technical_text<'a>(track: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    track.get(key).and_then(serde_json::Value::as_str)
+}
+
+fn technical_track_id(track: &serde_json::Value) -> u64 {
+    technical_text(track, "StreamOrder")
+        .or_else(|| technical_text(track, "ID"))
+        .and_then(|id| id.parse::<u64>().ok())
+        .unwrap_or_default()
+}
+
+fn technical_duration_ms(info: &serde_json::Value) -> Option<i64> {
+    technical_tracks(info)
+        .iter()
+        .find(|track| technical_text(track, "@type") == Some("General"))
+        .and_then(|track| technical_text(track, "Duration"))
+        .and_then(|seconds| seconds.parse::<f64>().ok())
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .map(|seconds| (seconds * 1000.0).round() as i64)
+}
+
+fn plex_stream_id(media: &Media, path: &std::path::Path) -> u64 {
+    let digest = Sha256::digest(format!("{}:{}", media.id, path.to_string_lossy()));
+    u64::from_be_bytes(digest[..8].try_into().unwrap_or_default()) & i64::MAX as u64
+}
+
+fn plex_part_id(media: &Media) -> u64 {
+    let digest = Sha256::digest(format!("part:{}", media.id));
+    u64::from_be_bytes(digest[..8].try_into().unwrap_or_default()) & i64::MAX as u64
+}
+
+fn find_media_part<'a>(state: &'a AppState, id: &str) -> Option<&'a Media> {
+    let id = id.parse::<u64>().ok()?;
+    state.media.iter().find(|media| plex_part_id(media) == id)
+}
+
+fn plex_external_subtitle_id(media: &Media, path: &std::path::Path) -> u64 {
+    plex_stream_id(media, path)
+}
+
+fn plex_language(language: &str) -> (&'static str, &'static str) {
+    match language.trim().to_ascii_lowercase().as_str() {
+        "rum" | "ron" | "ro" | "romanian" => ("ro", "Romanian"),
+        "eng" | "en" | "english" => ("en", "English"),
+        "fra" | "fre" | "fr" | "french" => ("fr", "French"),
+        "deu" | "ger" | "de" | "german" => ("de", "German"),
+        "spa" | "es" | "spanish" => ("es", "Spanish"),
+        "ita" | "it" | "italian" => ("it", "Italian"),
+        "por" | "pt" | "portuguese" => ("pt", "Portuguese"),
+        "nld" | "dut" | "nl" | "dutch" => ("nl", "Dutch"),
+        "pol" | "pl" | "polish" => ("pl", "Polish"),
+        "rus" | "ru" | "russian" => ("ru", "Russian"),
+        "jpn" | "ja" | "japanese" => ("ja", "Japanese"),
+        "zho" | "chi" | "zh" | "chinese" => ("zh", "Chinese"),
+        "und" | "unknown" | "" => ("und", "Unknown"),
+        _ => ("und", "Unknown"),
     }
-    serde_json::from_slice(&output.stdout).ok()
+}
+
+fn plex_track_language(track: &serde_json::Value) -> (&'static str, &'static str) {
+    let language = technical_text(track, "Language").unwrap_or("und");
+    let normalized = plex_language(language);
+    if normalized.0 != "und" {
+        return normalized;
+    }
+
+    // Matroska files often store the human-readable language as the track name
+    // while leaving the language tag unset.
+    let title_language = technical_text(track, "Title")
+        .unwrap_or_default()
+        .split(|character: char| !character.is_ascii_alphabetic())
+        .next()
+        .unwrap_or_default();
+    plex_language(title_language)
+}
+
+fn plex_video_resolution(height: u64) -> &'static str {
+    match height {
+        0..=480 => "480",
+        481..=576 => "576",
+        577..=720 => "720",
+        721..=1080 => "1080",
+        _ => "4k",
+    }
+}
+
+fn plex_codec(value: &str) -> String {
+    match value.to_ascii_lowercase().as_str() {
+        "avc" | "avc/h.264" | "h.264" => "h264".to_owned(),
+        "hevc" | "h.265" | "hev1" => "hevc".to_owned(),
+        "ac-3" | "ac3" => "ac3".to_owned(),
+        "e-ac-3" | "eac3" => "eac3".to_owned(),
+        "mpeg audio" | "mp3" => "mp3".to_owned(),
+        _ => value.to_ascii_lowercase().replace(' ', ""),
+    }
+}
+
+fn plex_track_label(track: &serde_json::Value, stream_type: u8) -> String {
+    plex_track_label_with_fallback(track, stream_type, None)
+}
+
+fn plex_track_label_with_fallback(
+    track: &serde_json::Value,
+    stream_type: u8,
+    fallback_language: Option<&str>,
+) -> String {
+    let (_, detected_language) = plex_track_language(track);
+    let language = if detected_language == "Unknown" {
+        fallback_language.unwrap_or(detected_language)
+    } else {
+        detected_language
+    };
+    let codec = match technical_text(track, "Format").unwrap_or("Unknown") {
+        "AC-3" | "AC3" => "AC3",
+        "E-AC-3" | "EAC3" => "EAC3",
+        "AVC" => "H.264",
+        "HEVC" => "H.265",
+        codec => codec,
+    };
+    if stream_type == 1 {
+        let height = technical_text(track, "Height")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default();
+        let resolution = match height {
+            0..=576 => "SD",
+            577..=720 => "720p",
+            721..=1080 => "1080p",
+            _ => "4K",
+        };
+        return format!("{resolution} ({codec})");
+    }
+    let detail = if stream_type == 2 {
+        let count = technical_text(track, "Channels").and_then(|value| value.parse::<u8>().ok());
+        let channels = match count {
+            Some(6) => "5.1",
+            Some(8) => "7.1",
+            Some(2) => "Stereo",
+            _ => technical_text(track, "ChannelLayout").unwrap_or_default(),
+        };
+        let channels = match channels {
+            "6" => "5.1",
+            "8" => "7.1",
+            "2" => "Stereo",
+            other => other,
+        };
+        if channels.is_empty() {
+            codec.to_owned()
+        } else {
+            format!("{codec} {channels}")
+        }
+    } else {
+        codec.to_owned()
+    };
+    if language == "Unknown" {
+        detail
+    } else {
+        format!("{language} ({detail})")
+    }
+}
+
+async fn add_plex_technical_metadata(
+    state: &AppState,
+    item: &mut serde_json::Value,
+    media: &Media,
+) {
+    let cached = state
+        .media_info
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&media.id).cloned());
+    let info = if let Some(info) = cached {
+        info
+    } else {
+        match inspect_media(&media.path).await {
+            Some(info) => {
+                if let Ok(mut cache) = state.media_info.lock() {
+                    cache.insert(media.id.clone(), info.clone());
+                }
+                info
+            }
+            None => serde_json::json!({"media": {"track": []}}),
+        }
+    };
+    let external_subtitles = external_subtitle_files(&media.path).await;
+    apply_plex_technical_metadata(item, media, &info, &external_subtitles);
+}
+
+fn apply_plex_technical_metadata(
+    item: &mut serde_json::Value,
+    media: &Media,
+    info: &serde_json::Value,
+    external_subtitles: &[PathBuf],
+) {
+    let tracks = technical_tracks(info);
+    let duration = technical_duration_ms(&info)
+        .or_else(|| item.get("duration").and_then(serde_json::Value::as_i64))
+        .unwrap_or_default();
+    let selected_stream_id = |stream_type: &str| {
+        tracks
+            .iter()
+            .filter(|track| technical_text(track, "@type") == Some(stream_type))
+            .find(|track| technical_text(track, "Default") == Some("Yes"))
+            .or_else(|| {
+                tracks
+                    .iter()
+                    .find(|track| technical_text(track, "@type") == Some(stream_type))
+            })
+            .map(|track| technical_track_id(track))
+    };
+    let selected_video = selected_stream_id("Video");
+    let selected_audio = selected_stream_id("Audio");
+    let audio_track_count = tracks
+        .iter()
+        .filter(|track| technical_text(track, "@type") == Some("Audio"))
+        .count();
+    if let Some(metadata) = item.as_object_mut() {
+        metadata.insert("duration".to_owned(), serde_json::json!(duration));
+    }
+    let Some(media_json) = item
+        .get_mut("Media")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|media| media.first_mut())
+    else {
+        return;
+    };
+    media_json["duration"] = serde_json::json!(duration);
+    let mut plex_streams = Vec::new();
+    for track in tracks {
+        let stream_type = match technical_text(track, "@type") {
+            Some("Video") => 1,
+            Some("Audio") => 2,
+            Some("Text") => 3,
+            _ => continue,
+        };
+        let track_id = technical_track_id(track);
+        let codec_value = technical_text(track, "Format")
+            .or_else(|| technical_text(track, "CodecID"))
+            .unwrap_or("unknown");
+        let codec = plex_codec(codec_value);
+        let (mut language_code, _) = plex_track_language(track);
+        let fallback_audio_language =
+            (stream_type == 2 && audio_track_count == 1 && language_code == "und")
+                .then_some(plex_language(PLEX_DEFAULT_AUDIO_LANGUAGE).1);
+        if fallback_audio_language.is_some() {
+            language_code = plex_language(PLEX_DEFAULT_AUDIO_LANGUAGE).0;
+        }
+        let display_title = fallback_audio_language
+            .map(|language| plex_track_label_with_fallback(track, stream_type, Some(language)))
+            .unwrap_or_else(|| plex_track_label(track, stream_type));
+        let mut plex_stream = serde_json::json!({
+            "id": track_id + 1,
+            "streamType": stream_type,
+            "type": stream_type,
+            "index": track_id,
+            "codec": codec,
+            "language": language_code,
+            "languageCode": language_code,
+            "displayTitle": display_title,
+            "title": technical_text(track, "Title")
+                .map(str::to_owned)
+                .unwrap_or_else(|| display_title.clone()),
+            "default": technical_text(track, "Default") == Some("Yes"),
+            "selected": match stream_type {
+                1 => selected_video == Some(track_id),
+                2 => selected_audio == Some(track_id),
+                _ => false,
+            },
+            "forced": technical_text(track, "Forced") == Some("Yes")
+        });
+        if stream_type == 1 {
+            let width = technical_text(track, "Width")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_default();
+            let height = technical_text(track, "Height")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_default();
+            if height > 0 {
+                media_json["videoResolution"] = serde_json::json!(plex_video_resolution(height));
+            }
+            media_json["width"] = serde_json::json!(width);
+            media_json["height"] = serde_json::json!(height);
+            media_json["videoCodec"] = serde_json::json!(codec);
+            plex_stream["width"] = serde_json::json!(width);
+            plex_stream["height"] = serde_json::json!(height);
+            if let Some(frame_rate) = technical_text(track, "FrameRate") {
+                media_json["videoFrameRate"] = serde_json::json!(frame_rate);
+                plex_stream["frameRate"] = serde_json::json!(frame_rate);
+            }
+        } else if stream_type == 2 {
+            media_json["audioCodec"] = serde_json::json!(codec);
+            if let Some(layout) = technical_text(track, "ChannelLayout") {
+                media_json["audioChannelLayout"] = serde_json::json!(layout);
+            }
+            if let Some(channels) =
+                technical_text(track, "Channels").and_then(|value| value.parse::<u64>().ok())
+            {
+                media_json["audioChannels"] = serde_json::json!(channels);
+                plex_stream["channels"] = serde_json::json!(channels);
+            }
+            if let Some(rate) =
+                technical_text(track, "SamplingRate").and_then(|value| value.parse::<u64>().ok())
+            {
+                plex_stream["samplingRate"] = serde_json::json!(rate);
+            }
+        }
+        plex_streams.push(plex_stream);
+    }
+    for subtitle_path in external_subtitles {
+        let id = plex_external_subtitle_id(media, &subtitle_path);
+        let label = external_subtitle_label(&media.path, &subtitle_path);
+        plex_streams.push(serde_json::json!({
+            "id": id,
+            "streamType": 3,
+            "type": 3,
+            "index": -1,
+            "codec": subtitle_path.extension().and_then(|value| value.to_str()).unwrap_or("srt").to_ascii_lowercase(),
+            "language": external_subtitle_language(&media.path, &subtitle_path).0,
+            "languageCode": external_subtitle_language(&media.path, &subtitle_path).0,
+            "displayTitle": label,
+            "title": label,
+            "external": true,
+            "key": format!("/library/streams/{id}.vtt"),
+            "default": false,
+            "forced": false
+        }));
+    }
+    media_json["id"] = serde_json::json!(plex_part_id(media));
+    let part = media_json
+        .get_mut("Part")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|parts| parts.first_mut());
+    if let Some(part) = part {
+        let part_id = plex_part_id(media);
+        part["id"] = serde_json::json!(part_id);
+        part["key"] = serde_json::json!(format!(
+            "/library/parts/{part_id}/{}/file.{}",
+            media_modified_at(media),
+            media.container
+        ));
+        part["duration"] = serde_json::json!(duration);
+        part["Stream"] = serde_json::json!(plex_streams);
+    }
 }
 
 fn json_string(value: &serde_json::Value, key: &str) -> String {
@@ -3710,11 +4067,7 @@ struct SubtitleTrack {
     url: String,
 }
 
-async fn subtitle_tracks(
-    video: &PathBuf,
-    relative: &std::path::Path,
-    library: Option<usize>,
-) -> Vec<SubtitleTrack> {
+async fn external_subtitle_files(video: &std::path::Path) -> Vec<PathBuf> {
     let Some(stem) = video.file_stem().and_then(|value| value.to_str()) else {
         return Vec::new();
     };
@@ -3726,36 +4079,97 @@ async fn subtitle_tracks(
     let mut tracks = Vec::new();
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        let Some(extension) = path
+        let extension = path
             .extension()
             .and_then(|value| value.to_str())
-            .map(|value| value.to_ascii_lowercase())
-        else {
-            continue;
-        };
-        if !matches!(extension.as_str(), "srt" | "ass" | "vtt")
-            || !entry.file_type().await.is_ok_and(|kind| kind.is_file())
-        {
-            continue;
-        }
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         let Some(candidate_stem) = path.file_stem().and_then(|value| value.to_str()) else {
             continue;
         };
-        if candidate_stem != stem && !candidate_stem.starts_with(&format!("{}.", stem)) {
-            continue;
+        let candidate_stem_lower = candidate_stem.to_ascii_lowercase();
+        let stem_lower = stem.to_ascii_lowercase();
+        if matches!(extension.as_str(), "srt" | "ass" | "vtt")
+            && entry.file_type().await.is_ok_and(|kind| kind.is_file())
+            && (candidate_stem_lower == stem_lower
+                || candidate_stem_lower.starts_with(&format!("{stem_lower}.")))
+        {
+            tracks.push(path);
         }
-        let label = candidate_stem
-            .strip_prefix(stem)
-            .unwrap_or(candidate_stem)
-            .trim_start_matches('.')
-            .replace('.', " ")
-            .replace('_', " ");
+    }
+    tracks.sort_by_key(|path| path.file_name().unwrap_or_default().to_ascii_lowercase());
+    tracks
+}
+
+fn external_subtitle_label(video: &std::path::Path, subtitle: &std::path::Path) -> String {
+    let stem = video
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let candidate = subtitle
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let (_, language) = plex_language(&external_subtitle_language_token(stem, candidate));
+    let format = subtitle
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if language == "Unknown" {
+        format!("{format} (External)")
+    } else {
+        format!("{language} ({format} External)")
+    }
+}
+
+fn external_subtitle_language(
+    video: &std::path::Path,
+    subtitle: &std::path::Path,
+) -> (&'static str, &'static str) {
+    let stem = video
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let candidate = subtitle
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    plex_language(&external_subtitle_language_token(stem, candidate))
+}
+
+fn external_subtitle_language_token<'a>(stem: &str, candidate: &'a str) -> String {
+    let suffix = candidate
+        .get(stem.len()..)
+        .filter(|_| {
+            candidate
+                .get(..stem.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(stem))
+        })
+        .unwrap_or_default()
+        .trim_start_matches(['.', '_']);
+    suffix
+        .split(['.', '_', ' '])
+        .find(|token| {
+            !token.is_empty()
+                && !matches!(
+                    token.to_ascii_lowercase().as_str(),
+                    "forced" | "default" | "sdh" | "hi"
+                )
+        })
+        .unwrap_or_default()
+        .to_owned()
+}
+
+async fn subtitle_tracks(
+    video: &PathBuf,
+    relative: &std::path::Path,
+    library: Option<usize>,
+) -> Vec<SubtitleTrack> {
+    let mut tracks = Vec::new();
+    for path in external_subtitle_files(video).await {
         tracks.push(SubtitleTrack {
-            label: if label.is_empty() {
-                format!("External: {}", extension.to_uppercase())
-            } else {
-                format!("External: {label}")
-            },
+            label: format!("External: {}", external_subtitle_label(video, &path)),
             url: format!(
                 "/web/subtitle?{}path={}",
                 library
@@ -3770,51 +4184,6 @@ async fn subtitle_tracks(
                 )
             ),
         });
-    }
-    if let Ok(contents) = tokio::fs::read_to_string(
-        video
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join(".mplex/info.toml"),
-    )
-    .await
-    {
-        if let Ok(info) = contents.parse::<toml::Value>() {
-            if let Some(streams) = info
-                .get("technical")
-                .and_then(|value| value.get("streams"))
-                .and_then(toml::Value::as_array)
-            {
-                for stream in streams {
-                    if stream.get("codec_type").and_then(toml::Value::as_str) != Some("subtitle") {
-                        continue;
-                    }
-                    let Some(index) = stream.get("index").and_then(toml::Value::as_integer) else {
-                        continue;
-                    };
-                    let language = stream
-                        .get("tags")
-                        .and_then(|tags| tags.get("language"))
-                        .and_then(toml::Value::as_str)
-                        .unwrap_or("unknown");
-                    let title = stream
-                        .get("tags")
-                        .and_then(|tags| tags.get("title"))
-                        .and_then(toml::Value::as_str)
-                        .unwrap_or(language);
-                    tracks.push(SubtitleTrack {
-                        label: format!("Embedded: {title}"),
-                        url: format!(
-                            "/web/subtitle?{}path={}&stream={index}",
-                            library
-                                .map(|library| format!("library={library}&"))
-                                .unwrap_or_default(),
-                            url_encode(&relative.to_string_lossy())
-                        ),
-                    });
-                }
-            }
-        }
     }
     tracks.sort_by_key(|track| track.label.to_ascii_lowercase());
     tracks
@@ -3832,24 +4201,8 @@ async fn web_subtitle(State(s): State<AppState>, Query(query): Query<WebPath>) -
         Ok(path) => path,
         Err(status) => return status.into_response(),
     };
-    if let Some(stream) = query.stream {
-        let Ok(output) = tokio::process::Command::new("ffmpeg")
-            .args(["-v", "error", "-i"])
-            .arg(&path)
-            .args(["-map", &format!("0:{stream}"), "-f", "webvtt", "-"])
-            .output()
-            .await
-        else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        if !output.status.success() {
-            return StatusCode::NOT_FOUND.into_response();
-        }
-        return (
-            [(header::CONTENT_TYPE, "text/vtt; charset=utf-8")],
-            output.stdout,
-        )
-            .into_response();
+    if query.stream.is_some() {
+        return StatusCode::NOT_FOUND.into_response();
     }
     let Ok(contents) = tokio::fs::read_to_string(&path).await else {
         return StatusCode::NOT_FOUND.into_response();
@@ -5184,7 +5537,7 @@ fn plex_account_value(profile: Option<(String, Option<String>)>) -> Response {
         "id": 1,
         "key": "/accounts/1",
         "name": "harbringer",
-        "defaultAudioLanguage": "en",
+            "defaultAudioLanguage": PLEX_DEFAULT_AUDIO_LANGUAGE,
         "autoSelectAudio": true,
         "defaultSubtitleLanguage": "en",
         "subtitleMode": 2
@@ -5368,7 +5721,7 @@ async fn plex_global_hubs(
     State(state): State<AppState>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
-    plex_hubs_response(&state, None, query.get("count"))
+    plex_hubs_response(&state, None, query.get("count")).await
 }
 
 fn plex_notification_response(upgrade: WebSocketUpgrade) -> Response {
@@ -5416,10 +5769,10 @@ async fn plex_section_hubs(
     Path(section): Path<usize>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
-    plex_hubs_response(&state, Some(section), query.get("count"))
+    plex_hubs_response(&state, Some(section), query.get("count")).await
 }
 
-fn plex_hubs_response(
+async fn plex_hubs_response(
     state: &AppState,
     only_section: Option<usize>,
     count: Option<&String>,
@@ -5483,25 +5836,33 @@ fn plex_hubs_response(
         } else {
             &recently_added
         };
-        hubs.push(plex_recommendation_hub(
-            section,
-            library,
-            recommendation,
-            &metadata,
-            count,
-            rated_count > 0,
-            true,
-        ));
-        if rated_count > 0 {
-            hubs.push(plex_recommendation_hub(
+        hubs.push(
+            plex_recommendation_hub(
+                state,
                 section,
                 library,
-                &recently_added,
+                recommendation,
                 &metadata,
                 count,
-                false,
-                false,
-            ));
+                rated_count > 0,
+                true,
+            )
+            .await,
+        );
+        if rated_count > 0 {
+            hubs.push(
+                plex_recommendation_hub(
+                    state,
+                    section,
+                    library,
+                    &recently_added,
+                    &metadata,
+                    count,
+                    false,
+                    false,
+                )
+                .await,
+            );
         }
     }
 
@@ -5518,7 +5879,8 @@ fn plex_hubs_response(
     plex_json(serde_json::json!({"MediaContainer": container}))
 }
 
-fn plex_recommendation_hub(
+async fn plex_recommendation_hub(
+    state: &AppState,
     section: usize,
     library: &ConfigLibrary,
     media: &[&Media],
@@ -5548,11 +5910,12 @@ fn plex_recommendation_hub(
             "addedAt:desc",
         ),
     };
-    let items = media
-        .iter()
-        .take(count)
-        .map(|item| plex_video_json(item, section, library, metadata.get(&item.id)))
-        .collect::<Vec<_>>();
+    let mut items = Vec::new();
+    for item in media.iter().take(count) {
+        let mut video = plex_video_json(item, section, library, metadata.get(&item.id));
+        add_plex_technical_metadata(state, &mut video, item).await;
+        items.push(video);
+    }
     serde_json::json!({
         "hubKey": format!("/library/sections/{section}/all?sort={sort_key}"),
         "key": format!("/hubs/sections/{section}/{category}"),
@@ -5912,18 +6275,18 @@ async fn plex_all(
     }
     let total = media.len();
     let uuid = plex_library_uuid(&s.machine_identifier, section);
-    let metadata = media
-        .iter()
-        .map(|media| plex_video_json(media, section, &library, metadata_by_id.get(&media.id)))
-        .collect::<Vec<_>>();
-    let (offset, metadata) = match plex_container_page(&headers, &uri) {
-        Some((requested_offset, requested_size)) => {
+    let (offset, end) = plex_container_page(&headers, &uri)
+        .map(|(requested_offset, requested_size)| {
             let offset = requested_offset.min(total);
-            let end = offset.saturating_add(requested_size).min(total);
-            (offset, metadata[offset..end].to_vec())
-        }
-        None => (0, metadata),
-    };
+            (offset, offset.saturating_add(requested_size).min(total))
+        })
+        .unwrap_or((0, total));
+    let mut metadata = Vec::with_capacity(end.saturating_sub(offset));
+    for item in media.iter().skip(offset).take(end.saturating_sub(offset)) {
+        let mut video = plex_video_json(item, section, &library, metadata_by_id.get(&item.id));
+        add_plex_technical_metadata(&s, &mut video, item).await;
+        metadata.push(video);
+    }
     let count = metadata.len();
     let mut response = plex_json(serde_json::json!({
         "MediaContainer": {
@@ -5970,12 +6333,14 @@ async fn plex_item(State(s): State<AppState>, Path(id): Path<String>) -> Respons
         return StatusCode::NOT_FOUND.into_response();
     };
     let metadata_by_id = plex_section_metadata(&s, section);
+    let mut video = plex_video_json(media, section, &library, metadata_by_id.get(&media.id));
+    add_plex_technical_metadata(&s, &mut video, media).await;
     plex_json(serde_json::json!({
         "MediaContainer": {
             "size": 1,
             "librarySectionID": section,
             "librarySectionTitle": library.name,
-            "Metadata": [plex_video_json(media, section, &library, metadata_by_id.get(&media.id))]
+            "Metadata": [video]
         }
     }))
 }
@@ -5985,6 +6350,77 @@ async fn plex_part(
     Path((id, _part)): Path<(String, String)>,
 ) -> Response {
     plex_item(State(s), Path(id)).await
+}
+
+#[derive(Deserialize, Default)]
+struct PlexStreamSelection {
+    #[serde(rename = "audioStreamID")]
+    audio_stream_id: Option<u64>,
+    #[serde(rename = "subtitleStreamID")]
+    subtitle_stream_id: Option<u64>,
+}
+
+async fn plex_set_streams(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(selection): Query<PlexStreamSelection>,
+) -> Response {
+    if find_media_part(&state, &id).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let _selection = (selection.audio_stream_id, selection.subtitle_stream_id);
+    plex_json(serde_json::json!({"MediaContainer": {"size": 0}}))
+}
+
+async fn plex_part_file(
+    State(state): State<AppState>,
+    Path((id, part_path)): Path<(String, String)>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    let Some(media) = find_media_part(&state, &id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let expected = format!("file.{}", media.container);
+    if part_path.rsplit('/').next() != Some(expected.as_str()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    stream_file(media, method, headers).await
+}
+
+async fn plex_stream(State(state): State<AppState>, Path(stream): Path<String>) -> Response {
+    let Some((stream_id, extension)) = stream.rsplit_once('.') else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(stream_id) = stream_id.parse::<u64>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if extension != "vtt" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    for media in state.media.iter() {
+        for subtitle_path in external_subtitle_files(&media.path).await {
+            if plex_external_subtitle_id(media, &subtitle_path) != stream_id {
+                continue;
+            }
+            let Ok(contents) = tokio::fs::read_to_string(&subtitle_path).await else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            let subtitle_extension = subtitle_path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let vtt = match subtitle_extension.as_str() {
+                "vtt" => contents,
+                "srt" => srt_to_vtt(&contents),
+                "ass" => ass_to_vtt(&contents),
+                _ => return StatusCode::NOT_FOUND.into_response(),
+            };
+            return ([(header::CONTENT_TYPE, "text/vtt; charset=utf-8")], vtt).into_response();
+        }
+    }
+    StatusCode::NOT_FOUND.into_response()
 }
 
 async fn plex_thumb(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -6089,47 +6525,8 @@ async fn plex_frame_cover(state: &AppState, media: &Media) -> Option<Vec<u8>> {
         return Some(bytes);
     }
 
-    let probe = probe_media(&media.path).await?;
-    let duration = probe
-        .get("format")?
-        .get("duration")?
-        .as_str()?
-        .parse::<f64>()
-        .ok()?;
-    let seek = plex_frame_seek(duration)?;
-    let output = tokio::process::Command::new("ffmpeg")
-        .args(["-v", "error", "-ss", &seek, "-i"])
-        .arg(&media.path)
-        .args([
-            "-frames:v",
-            "1",
-            "-vf",
-            "scale=640:-2",
-            "-q:v",
-            "3",
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "mjpeg",
-            "pipe:1",
-        ])
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() || output.stdout.is_empty() {
-        warn!(media_id = %media.id, "could not extract 10% Plex cover frame");
-        return None;
-    }
-    if tokio::fs::create_dir_all(&cache_dir).await.is_ok() {
-        if let Err(error) = tokio::fs::write(&cache_path, &output.stdout).await {
-            warn!(media_id = %media.id, %error, "could not cache Plex cover frame");
-        }
-    }
-    Some(output.stdout)
-}
-
-fn plex_frame_seek(duration: f64) -> Option<String> {
-    (duration.is_finite() && duration > 0.0).then(|| format!("{:.3}", duration * 0.1))
+    warn!(media_id = %media.id, "no cached cover; frame extraction requires an in-process decoder");
+    None
 }
 
 fn plex_section_directories(state: &AppState) -> (usize, Vec<serde_json::Value>) {
@@ -6220,17 +6617,22 @@ fn plex_video_json(
         "viewCount": 0,
         "lastViewedAt": 0,
         "Media": [{
-            "id": media.id,
+            "id": plex_part_id(media),
             "duration": playback_duration,
             "container": media.container,
+            "protocol": "http",
+            "has64bitOffsets": media.size > i32::MAX as u64,
+            "optimizedForStreaming": false,
             "videoResolution": "unknown",
             "Part": [{
-                "id": media.id,
-                "key": format!("/media/{}", media.id),
+                "id": plex_part_id(media),
+                "key": format!("/library/parts/{}/{}/file.{}", plex_part_id(media), modified_at, media.container),
                 "duration": playback_duration,
                 "file": media.path,
                 "size": media.size,
-                "container": media.container
+                "container": media.container,
+                "has64bitOffsets": media.size > i32::MAX as u64,
+                "optimizedForStreaming": false
             }]
         }]
     });
@@ -6591,11 +6993,13 @@ fn html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ass_to_vtt, clean_relative_path, contains_hidden_component, extract_xml_token, html,
-        parse_range, parse_sidecar_metadata, parse_tv_episode_marker, parse_tv_season_directory,
-        plex_connectivity_url, plex_device_announce_query, plex_device_announce_url,
-        plex_frame_seek, plex_photo_source, plex_presence_url, plex_publish_urls,
-        plex_query_media_id, sidebar_nav_with_settings, srt_to_vtt,
+        apply_plex_technical_metadata, ass_to_vtt, clean_relative_path, contains_hidden_component,
+        external_subtitle_language_token, extract_xml_token, html, parse_range,
+        parse_sidecar_metadata, parse_tv_episode_marker, parse_tv_season_directory, plex_codec,
+        plex_connectivity_url, plex_device_announce_query, plex_device_announce_url, plex_language,
+        plex_part_id, plex_photo_source, plex_presence_url, plex_publish_urls, plex_query_media_id,
+        plex_track_label, plex_video_json, plex_video_resolution, sidebar_nav_with_settings,
+        srt_to_vtt, technical_duration_ms, technical_tracks, ConfigLibrary, Media, PathBuf,
     };
     #[test]
     fn plex_playback_ids_resolve_rating_keys_and_metadata_paths() {
@@ -6622,11 +7026,90 @@ mod tests {
         assert_eq!(plex_photo_source("/library/metadata/2-42/poster"), None);
     }
     #[test]
-    fn fallback_cover_frame_uses_ten_percent_position() {
-        assert_eq!(plex_frame_seek(120.0), Some("12.000".to_owned()));
-        assert_eq!(plex_frame_seek(0.0), None);
-        assert_eq!(plex_frame_seek(f64::NAN), None);
+    fn media_info_json_duration_and_tracks_map_to_plex_fields() {
+        let info = serde_json::json!({
+            "media": {"track": [
+                {"@type":"General", "Duration":"120.5"},
+                {"@type":"Video", "StreamOrder":"0", "Format":"AVC", "Width":"1920", "Height":"1080"},
+                {"@type":"Audio", "StreamOrder":"1", "Format":"AC-3", "Channels":"6", "Language":"English"},
+                {"@type":"Text", "StreamOrder":"2", "Format":"UTF-8", "Language":"English"}
+            ]}
+        });
+        assert_eq!(technical_duration_ms(&info), Some(120_500));
+        let tracks = technical_tracks(&info);
+        assert_eq!(tracks.len(), 4);
+        assert_eq!(plex_video_resolution(1080), "1080");
+        assert_eq!(plex_codec("AC-3"), "ac3");
+        assert_eq!(plex_track_label(&tracks[2], 2), "English (AC3 5.1)");
     }
+    #[test]
+    fn plex_media_advertises_playable_part_audio_video_and_external_subtitle() {
+        let media = Media {
+            id: "1-7".to_owned(),
+            title: "Film".to_owned(),
+            path: PathBuf::from("/media/Film.mkv"),
+            size: 9_000_000,
+            container: "mkv".to_owned(),
+            mime: "video/x-matroska".to_owned(),
+        };
+        let library = ConfigLibrary {
+            name: "Movies".to_owned(),
+            kind: "movie".to_owned(),
+            folders: Vec::new(),
+            show_recently_added: true,
+            show_continue_watching: true,
+        };
+        let info = serde_json::json!({"media":{"track":[
+            {"@type":"General", "Duration":"120.5"},
+            {"@type":"Video", "StreamOrder":"0", "Format":"AVC", "Width":"1280", "Height":"720"},
+            {"@type":"Audio", "StreamOrder":"1", "Format":"AC-3", "Channels":"6", "Language":"eng"},
+            {"@type":"Text", "StreamOrder":"2", "Format":"UTF-8", "Language":"rum"}
+        ]}});
+        let subtitle = PathBuf::from("/media/Film.rum.srt");
+        let mut item = plex_video_json(&media, 1, &library, None);
+        apply_plex_technical_metadata(&mut item, &media, &info, &[subtitle]);
+
+        assert_eq!(item["duration"], 120_500);
+        assert_eq!(item["Media"][0]["videoResolution"], "720");
+        assert_eq!(item["Media"][0]["videoCodec"], "h264");
+        assert_eq!(item["Media"][0]["audioCodec"], "ac3");
+        assert_eq!(item["Media"][0]["audioChannels"], 6);
+        assert_eq!(item["Media"][0]["Part"][0]["id"], plex_part_id(&media));
+        assert!(item["Media"][0]["Part"][0]["key"]
+            .as_str()
+            .unwrap()
+            .ends_with("/file.mkv"));
+        let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
+        assert_eq!(streams.len(), 4);
+        assert_eq!(streams[1]["type"], 2);
+        assert_eq!(streams[1]["channels"], 6);
+        assert_eq!(streams[1]["selected"], true);
+        assert_eq!(streams[2]["language"], "ro");
+        assert_eq!(streams[3]["displayTitle"], "Romanian (SRT External)");
+        assert!(streams[3]["key"]
+            .as_str()
+            .unwrap()
+            .starts_with("/library/streams/"));
+    }
+
+    #[test]
+    fn romanian_iso_language_codes_are_friendly_and_normalized() {
+        assert_eq!(plex_language("rum"), ("ro", "Romanian"));
+        assert_eq!(plex_language("ron"), ("ro", "Romanian"));
+        assert_eq!(
+            external_subtitle_language_token("Film", "Film.RUM.default"),
+            "RUM"
+        );
+    }
+
+    #[test]
+    fn untagged_audio_track_still_has_a_readable_label() {
+        let track = serde_json::json!({
+            "@type":"Audio", "Format":"AAC", "Channels":"2", "ChannelLayout":"Stereo (2.0)"
+        });
+        assert_eq!(plex_track_label(&track, 2), "AAC Stereo");
+    }
+
     #[test]
     fn sidecar_metadata_json_loads_without_database_state() {
         let info = r#"metadata_json = '{"id":42,"title":"Portable match"}'"#;

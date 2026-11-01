@@ -8,6 +8,7 @@ description = "A minimal single-file Plex and Jellyfin media server"
 axum = { version = "0.7", features = ["macros", "ws"] }
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 get_if_addrs = "0.5"
 hyper = { version = "1", features = ["server", "http1"] }
@@ -30,3 +31,4 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+vuio-media-info = "0.1.4"
