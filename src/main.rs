@@ -4477,7 +4477,21 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-async fn log_not_found(req: Request<Body>) -> Response {
+async fn log_not_found(State(state): State<AppState>, req: Request<Body>) -> Response {
+    if req.uri().path() == "/photo/:/transcode" {
+        let query = req
+            .uri()
+            .query()
+            .and_then(|query| serde_urlencoded::from_str::<BTreeMap<String, String>>(query).ok());
+        let Some(source) = query.and_then(|query| query.get("url").cloned()) else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        let Some((id, filename)) = plex_photo_source(&source) else {
+            warn!(source, "unsupported Plex photo source");
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        return plex_artwork(&state, &id, filename).await;
+    }
     if matches!(
         req.uri().path(),
         "/:/websockets/notifications" | "/:/websocket/notifications"
@@ -4490,6 +4504,25 @@ async fn log_not_found(req: Request<Body>) -> Response {
     }
     warn!(method = %req.method(), path = %req.uri().path(), "unsupported route");
     StatusCode::NOT_FOUND.into_response()
+}
+
+fn plex_photo_source(source: &str) -> Option<(String, &'static str)> {
+    let uri = Uri::try_from(source).ok()?;
+    let segments = uri
+        .path()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let metadata_index = segments
+        .windows(2)
+        .position(|pair| pair == ["library", "metadata"])?;
+    let id = *segments.get(metadata_index + 2)?;
+    let filename = match *segments.get(metadata_index + 3)? {
+        "thumb" => "cover.jpg",
+        "art" => "banner.jpg",
+        _ => return None,
+    };
+    Some((id.to_owned(), filename))
 }
 
 async fn root_handler(State(s): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
@@ -5355,18 +5388,44 @@ async fn plex_artwork(state: &AppState, id: &str, filename: &str) -> Response {
     let Some(media) = find_media(state, id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(parent) = media.path.parent() else {
+    let Some((_, library)) = media_library(state, media) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let artwork = parent.join(".mplex").join(filename);
-    let Ok(bytes) = tokio::fs::read(artwork).await else {
+    let Some(root) = library
+        .folders
+        .iter()
+        .find(|folder| media.path.starts_with(folder))
+    else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    (
-        [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
-        bytes,
-    )
-        .into_response()
+    let group_path = metadata_group_path(root, &media.path, &library.kind);
+    let group_directory = if group_path.is_file() {
+        group_path.parent().unwrap_or(root)
+    } else {
+        group_path.as_path()
+    };
+    let season_directory = media.path.parent().unwrap_or(root);
+    let artwork_paths = if library.kind == "tv" && filename == "cover.jpg" {
+        [
+            season_directory.join(".mplex").join(filename),
+            group_directory.join(".mplex").join(filename),
+        ]
+    } else {
+        [
+            group_directory.join(".mplex").join(filename),
+            season_directory.join(".mplex").join(filename),
+        ]
+    };
+    for artwork in artwork_paths {
+        if let Ok(bytes) = tokio::fs::read(artwork).await {
+            return (
+                [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
+                bytes,
+            )
+                .into_response();
+        }
+    }
+    StatusCode::NOT_FOUND.into_response()
 }
 
 fn plex_section_directories(state: &AppState) -> (usize, Vec<serde_json::Value>) {
@@ -5803,9 +5862,21 @@ mod tests {
     use super::{
         ass_to_vtt, clean_relative_path, contains_hidden_component, extract_xml_token, html,
         parse_range, parse_tv_episode_marker, parse_tv_season_directory, plex_connectivity_url,
-        plex_device_announce_query, plex_device_announce_url, plex_presence_url, plex_publish_urls,
-        sidebar_nav_with_settings, srt_to_vtt,
+        plex_device_announce_query, plex_device_announce_url, plex_photo_source, plex_presence_url,
+        plex_publish_urls, sidebar_nav_with_settings, srt_to_vtt,
     };
+    #[test]
+    fn plex_photo_sources_resolve_thumb_and_art_routes() {
+        assert_eq!(
+            plex_photo_source("/library/metadata/2-42/thumb/1715112705"),
+            Some(("2-42".to_owned(), "cover.jpg"))
+        );
+        assert_eq!(
+            plex_photo_source("https://server.example/library/metadata/2-42/art"),
+            Some(("2-42".to_owned(), "banner.jpg"))
+        );
+        assert_eq!(plex_photo_source("/library/metadata/2-42/poster"), None);
+    }
     #[test]
     fn full_file() {
         assert_eq!(parse_range(None, 10), Ok((0, 9)));

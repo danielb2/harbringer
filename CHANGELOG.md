@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Handle Plezy's `/photo/:/transcode` artwork requests by resolving the supplied Plex thumb/art URL and returning the cached image bytes.
+- Reflection: Plezy requests sized images through `/photo/:/transcode`, which previously fell through to 404 even when the thumb and art routes served JPEGs. Rex's README confirms Plex-visible posters and metadata as core behavior but does not describe its image route implementation. Plex documents this endpoint as an image scaler/converter; Harbringer currently resolves the image and passes through its JPEG bytes, so dimensions/format options are not applied. `cargo fmt`, `cargo check`, and `git diff --check` passed. Live relative-thumb and absolute-art requests returned HTTP 200 `image/jpeg`.
+- Resolve Plex artwork from the metadata group directory for show episodes, then fall back to season artwork for thumbnails. Previously the Plex routes only checked each episode's season folder even though show artwork is stored beside show metadata.
+- Reflection: movie cover and banner routes already served JPEGs, while TV episode routes returned 404 because their art lived at the show-level `.mplex` directory. Artwork lookups now follow the same grouping used by metadata scans; live movie and TV thumb/art requests returned HTTP 200 JPEGs. `cargo fmt`, `cargo check`, and `git diff --check` passed.
 - Implement `/library/sections/{id}/collections` as a valid JSON empty-list response for configured libraries, eliminating the Plezy 404 while collections remain unsupported data. Add documented `X-Plex-Container-Start` / `X-Plex-Container-Size` paging to section inventory, including response headers and total count.
 - Remove provider pivots and feature claims for unsupported hubs, playlists, search, transcoding, and other missing routes; align server capability flags with direct-play-only and single-user behavior.
 - Add Plezy's section sort and filter discovery endpoints. Advertise title sorting and apply it to section inventory; return an empty filter directory because Harbringer does not yet provide filterable metadata.
