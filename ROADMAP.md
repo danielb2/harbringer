@@ -107,9 +107,13 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 - Added Plex-style TV naming support for `Season 01`, `season.01`, `Specials`, `s01e01`, and multi-episode markers such as `s02e18-e19`.
 - Added TMDB season artwork and season metadata caching under each season’s `.mplex` directory.
 - Added movie/show/TV metadata matching, sidecar metadata storage, artwork download, per-media rematching, force rescans, and ffprobe technical metadata caching.
+- Selected web-client movie and episode views read descriptions and details from either SQLite metadata or sidecar metadata.
 - Added web-client watch progress, resume behavior, subtitle selection, and playback controls; Plex account/user authentication and official-client compatibility remain unverified.
+- Added shared media-card actions to mark movies or TV shows watched or unwatched and persist the status.
+- Home’s Continue Watching shelf shows the next unwatched TV episode after an episode is marked watched, unless an episode in the series is already in progress or the next episode is hidden.
 - Added a collapsible shared explorer/sidebar, Home dashboard, Media/Folder library views, and filesystem polling for the built-in web client.
 - Added Plex-aware root negotiation: Plex requests receive XML while ordinary browser requests receive the web client.
+- Shared the Settings page’s radial background gradient with web-client pages, while retaining media banners.
 - Added Settings-based library registration and startup scanning of all saved library directories.
 - Reworked persisted library configuration into named, typed libraries with multiple folders; existing directory records migrate into a Default Library.
 - Replaced `--dir` with `config.toml` configuration and made SQLite the rebuildable cache/state layer beside the TOML file.

@@ -1794,7 +1794,7 @@
       "path": "/{transcodeType}/:/transcode/universal/start.*",
       "operation_id": "transcodeStart",
       "summary": "Start A Transcoding Session",
-      "expected_status": 404
+      "expected_status": 200
     },
     {
       "method": "GET",
