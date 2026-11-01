@@ -8357,15 +8357,9 @@ async fn plex_stream(
     Path(stream): Path<String>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
-    let Some((stream_id, extension)) = stream.rsplit_once('.') else {
+    let Some((stream_id, extension)) = plex_stream_id_and_format(&stream) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Ok(stream_id) = stream_id.parse::<u64>() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if !matches!(extension, "srt" | "ass" | "vtt") {
-        return StatusCode::NOT_FOUND.into_response();
-    }
     for media in state.media.iter() {
         for subtitle_path in external_subtitle_files(&media.path).await {
             if plex_external_subtitle_id(media, &subtitle_path) != stream_id {
@@ -8392,6 +8386,19 @@ async fn plex_stream(
         }
     }
     StatusCode::NOT_FOUND.into_response()
+}
+
+fn plex_stream_id_and_format(stream: &str) -> Option<(u64, &str)> {
+    let (id, extensions) = stream.split_once('.')?;
+    let stream_id = id.parse::<u64>().ok()?;
+    let mut requested_format = None;
+    for extension in extensions.split('.') {
+        if !matches!(extension, "srt" | "ass" | "vtt") {
+            return None;
+        }
+        requested_format = Some(extension);
+    }
+    Some((stream_id, requested_format?))
 }
 
 fn external_subtitle_content(
@@ -8995,11 +9002,11 @@ mod tests {
         plex_presence_url, plex_publish_urls, plex_query_media_id, plex_ranked_tv_shows,
         plex_rating_key, plex_rating_key_from_source, plex_safe_numeric_id, plex_search_hubs,
         plex_search_rank, plex_search_result_entries, plex_search_type_matches, plex_stream_id,
-        plex_track_label, plex_tv_episode_parents, plex_tv_season_groups, plex_tv_season_json,
-        plex_tv_show_groups, plex_tv_show_json, plex_video_json, plex_video_resolution,
-        sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms, technical_tracks,
-        tv_show_title, vtt_to_srt, ConfigLibrary, HeaderMap, HeaderValue, Media, PathBuf,
-        PlexStreamSelection, Uri,
+        plex_stream_id_and_format, plex_track_label, plex_tv_episode_parents,
+        plex_tv_season_groups, plex_tv_season_json, plex_tv_show_groups, plex_tv_show_json,
+        plex_video_json, plex_video_resolution, sidebar_nav_with_settings, srt_to_vtt,
+        technical_duration_ms, technical_tracks, tv_show_title, vtt_to_srt, ConfigLibrary,
+        HeaderMap, HeaderValue, Media, PathBuf, PlexStreamSelection, Uri,
     };
     #[test]
     fn plex_playback_ids_resolve_rating_keys_and_metadata_paths() {
@@ -9012,6 +9019,14 @@ mod tests {
             Some("2-42".to_owned())
         );
         assert_eq!(plex_query_media_id(None, None), None);
+    }
+
+    #[test]
+    fn plex_external_stream_urls_accept_client_appended_extensions() {
+        assert_eq!(plex_stream_id_and_format("123.srt"), Some((123, "srt")));
+        assert_eq!(plex_stream_id_and_format("123.srt.srt"), Some((123, "srt")));
+        assert_eq!(plex_stream_id_and_format("123.ass.srt"), Some((123, "srt")));
+        assert_eq!(plex_stream_id_and_format("123.srt.exe"), None);
     }
     #[test]
     fn plex_section_hubs_include_explicit_recently_added_even_without_ratings() {
@@ -10218,6 +10233,20 @@ mod plex_endpoint_tests {
                 &fixture.app,
                 Method::GET,
                 &format!("/library/streams/{}.srt?format=vtt", fixture.subtitle_id),
+                Body::empty()
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(
+                &fixture.app,
+                Method::GET,
+                &format!(
+                    "/library/streams/{}.srt.srt?format=vtt",
+                    fixture.subtitle_id
+                ),
                 Body::empty()
             )
             .await

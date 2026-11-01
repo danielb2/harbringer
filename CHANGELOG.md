@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Accept external subtitle requests with repeated file extensions, as Plezy appends `.srt` to the advertised stream key and was requesting `/library/streams/{id}.srt.srt`.
+- Reflection: the request trace showed Plezy's subtitle fetch getting 404 immediately after selection, which made the client turn the track back off. Parse the numeric stream ID while accepting repeated recognized subtitle extensions, and cover both ordinary and Plezy URL shapes in route/unit tests. `cargo fmt` and `cargo test` (41 passed) passed; the repeated-extension URL returned 200 from the restarted server.
 - Put successful direct-play decision codes on the Plex play-queue and selected-item metadata responses, using one shared builder, and keep the queue's media and part marked for direct play.
 - Reflection: the latest Plex Web trace showed it created the play queue and refetched the selected item, but never called the separate universal decision route or requested the media part. The direct-play result was only present in the route it skipped, so both responses it consumes now carry the direct-play/general success codes. The universal decision response uses the same fields; video transcoding remains unadvertised. `cargo test` (40 passed), `cargo fmt --check`, `cargo build`, and `git diff --check` passed. Official-client playback remains unverified.
 - Update the project guidance and overview to reflect that mplex is past MVP and targets a fully functional Plex Media Server replacement, including client-required transcoding with portable in-process Rust libraries.
