@@ -9,6 +9,7 @@ use axum::{
         Form, FromRequestParts, Path, Query, RawForm, State,
     },
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{any, get, post},
     Json, Router,
@@ -309,6 +310,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/Videos/:id/stream", any(jellyfin_stream))
         .route("/Videos/:id/stream.mp4", any(jellyfin_stream))
         .fallback(log_not_found)
+        .layer(middleware::from_fn(plex_cors))
         .layer(
             TraceLayer::new_for_http()
                 .on_request(|request: &Request<Body>, _span: &Span| {
@@ -4525,6 +4527,79 @@ fn plex_photo_source(source: &str) -> Option<(String, &'static str)> {
     Some((id.to_owned(), filename))
 }
 
+async fn plex_cors(request: Request<Body>, next: Next) -> Response {
+    if !plex_cors_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+
+    let origin = request.headers().get(header::ORIGIN).cloned();
+    let preflight = request.method() == Method::OPTIONS
+        && request
+            .headers()
+            .contains_key("access-control-request-method");
+    if preflight {
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::OK;
+        let headers = response.headers_mut();
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+        headers.insert("x-plex-protocol", HeaderValue::from_static("1.0"));
+        headers.insert("cache-control", HeaderValue::from_static("no-cache"));
+        if let Some(origin) = origin {
+            headers.insert("access-control-allow-origin", origin);
+            headers.insert(
+                "access-control-allow-methods",
+                HeaderValue::from_static("GET, POST, PUT, DELETE, HEAD, OPTIONS"),
+            );
+            if let Some(asked_headers) = request.headers().get("access-control-request-headers") {
+                headers.insert("access-control-allow-headers", asked_headers.clone());
+            } else {
+                headers.insert(
+                    "access-control-allow-headers",
+                    HeaderValue::from_static(
+                        "Accept, Accept-Language, Content-Type, Range, X-Plex-Token, X-Plex-Client-Identifier, X-Plex-Product, X-Plex-Version, X-Plex-Platform, X-Plex-Platform-Version, X-Plex-Device, X-Plex-Device-Name, X-Plex-Device-Vendor, X-Plex-Model, X-Plex-Language, X-Plex-Features, X-Plex-Provides, X-Plex-Container-Start, X-Plex-Container-Size, X-Plex-Client-Profile-Extra, X-Plex-Client-Profile-Name, X-Plex-Session-Identifier, X-Plex-Marketplace, X-Plex-Sync-Version",
+                    ),
+                );
+            }
+            headers.insert(
+                "access-control-max-age",
+                HeaderValue::from_static("1209600"),
+            );
+            headers.insert("vary", HeaderValue::from_static("Origin, X-Plex-Token"));
+        }
+        return response;
+    }
+
+    let mut response = next.run(request).await;
+    if let Some(origin) = origin {
+        let headers = response.headers_mut();
+        headers.insert("access-control-allow-origin", origin);
+        headers.insert(
+            "access-control-expose-headers",
+            HeaderValue::from_static(
+                "Content-Length, Content-Range, Content-Type, Date, Location, X-Plex-Protocol, X-Plex-Container-Start, X-Plex-Container-Total-Size, X-Plex-Content-Original-Length, X-Plex-Content-Compressed-Length, X-Plex-Activity",
+            ),
+        );
+        headers.insert("vary", HeaderValue::from_static("Origin, X-Plex-Token"));
+    }
+    response
+}
+
+fn plex_cors_path(path: &str) -> bool {
+    path == "/"
+        || matches!(
+            path,
+            "/identity"
+                | "/myplex/account"
+                | "/servers"
+                | "/media/providers"
+                | "/security/resources"
+        )
+        || ["/:/", "/hubs", "/library/", "/photo/", "/media/"]
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
+}
+
 async fn root_handler(State(s): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
     let is_plex_client = headers.contains_key("X-Plex-Product")
         || headers.contains_key("X-Plex-Client-Identifier")
@@ -4584,7 +4659,7 @@ async fn plex_root(state: &AppState) -> Response {
             "allowTuners": false,
             "apiVersion": "1.2.3",
             "backgroundProcessing": false,
-            "certificate": false,
+            "certificate": state.plex_tls.hash().is_some(),
             "companionProxy": false,
             "countryCode": "usa",
             "diagnostics": "",
@@ -4780,7 +4855,7 @@ async fn plex_media_providers(State(state): State<AppState>) -> Response {
             "allowTuners": false,
             "apiVersion": "1.2.3",
             "backgroundProcessing": false,
-            "certificate": false,
+            "certificate": state.plex_tls.hash().is_some(),
             "companionProxy": false,
             "countryCode": "usa",
             "diagnostics": "",
