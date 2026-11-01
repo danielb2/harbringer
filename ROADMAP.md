@@ -112,7 +112,7 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 - Added Plex-aware root negotiation: Plex requests receive XML while ordinary browser requests receive the web client.
 - Added Settings-based library registration and startup scanning of all saved library directories.
 - Reworked persisted library configuration into named, typed libraries with multiple folders; existing directory records migrate into a Default Library.
-- Replaced `--dir` with `mplex.toml` configuration and made SQLite the rebuildable cache/state layer beside the TOML file.
+- Replaced `--dir` with `config.toml` configuration and made SQLite the rebuildable cache/state layer beside the TOML file.
 - Added a SQLite state database under the configured library root, with persistent server identity, initial media records, users, watch-progress, and artwork tables.
 - Plex `/` and `/identity` now return the persisted machine identifier, and startup records the current local media inventory.
 - Confirmed the current server is not yet discoverable through Plex.tv: it lacks persistent identity, PIN authentication, claim exchange, and resource publication.

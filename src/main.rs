@@ -30,7 +30,7 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -124,6 +124,7 @@ struct AppState {
     config: Arc<Mutex<Config>>,
     config_path: Arc<PathBuf>,
     db: Arc<Mutex<Connection>>,
+    server_name: Arc<RwLock<String>>,
     machine_identifier: Arc<str>,
     root: Arc<PathBuf>,
     media: Arc<Vec<Media>>,
@@ -178,6 +179,15 @@ enum RunOutcome {
     Shutdown,
 }
 
+fn config_path_in_dir(config_dir: &std::path::Path) -> Result<PathBuf, std::io::Error> {
+    let new_path = config_dir.join("config.toml");
+    let old_path = config_dir.join("mplex.toml");
+    if !new_path.exists() && old_path.exists() {
+        std::fs::rename(old_path, &new_path)?;
+    }
+    Ok(new_path)
+}
+
 async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>> {
     let config_arg = args.config.unwrap_or_else(|| PathBuf::from("config"));
     let config_path = if config_arg
@@ -195,7 +205,7 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
         } else {
             std::env::current_dir()?.join(config_arg)
         };
-        config_dir.join("mplex.toml")
+        config_path_in_dir(&config_dir)?
     };
     let mut config = load_config(&config_path)?;
     if let Some(bind) = args.bind {
@@ -203,6 +213,13 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
     }
     save_config(&config_path, &config)?;
     let (db, machine_identifier) = open_database(&config_path)?;
+    let server_name = db
+        .query_row(
+            "SELECT server_name FROM server_identity WHERE id = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| "harbringer".to_owned());
     migrate_library_model(&db)?;
     sync_config_libraries(&db, &config)?;
     let root = config
@@ -244,6 +261,7 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
         config: Arc::new(Mutex::new(config.clone())),
         config_path: Arc::new(config_path),
         db: Arc::new(Mutex::new(db)),
+        server_name: Arc::new(RwLock::new(server_name)),
         machine_identifier: Arc::from(machine_identifier),
         root: Arc::new(root),
         media: Arc::new(media),
@@ -291,7 +309,11 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
     let app = build_app(state.clone());
     let listener = tokio::net::TcpListener::bind(config.bind.parse::<SocketAddr>()?).await?;
     let address = listener.local_addr()?;
-    let gdm_task = tokio::spawn(run_gdm_responder(gdm_machine_identifier, address.port()));
+    let gdm_task = tokio::spawn(run_gdm_responder(
+        gdm_machine_identifier,
+        address.port(),
+        state.server_name.clone(),
+    ));
     let host = if address.ip().is_unspecified() {
         "127.0.0.1".to_owned()
     } else {
@@ -378,9 +400,11 @@ fn build_app(state: AppState) -> Router {
         .route("/web/info", get(web_info))
         .route("/settings", get(settings_page))
         .route("/settings/libraries", post(create_library))
+        .route("/settings/libraries/:id/delete", post(delete_library))
         .route("/settings/folders", post(add_library_folder))
         .route("/settings/libraries/display", post(update_library_display))
         .route("/settings/preferences", post(update_preferences))
+        .route("/settings/server-name", post(update_server_name))
         .route("/settings/plex/start", get(start_plex_auth))
         .route("/settings/plex/status", get(plex_auth_status))
         .route("/settings/plex/callback", get(plex_auth_callback))
@@ -486,9 +510,12 @@ fn build_app(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn run_gdm_responder(machine_identifier: String, port: u16) {
+async fn run_gdm_responder(
+    machine_identifier: String,
+    port: u16,
+    configured_name: Arc<RwLock<String>>,
+) {
     let multicast = std::net::Ipv4Addr::new(239, 0, 0, 250);
-    let response = gdm_message("HTTP/1.0 200 OK", &machine_identifier, port);
     for gdm_port in [32410, 32412, 32413, 32414] {
         let socket = match std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, gdm_port)) {
             Ok(socket) => socket,
@@ -508,7 +535,8 @@ async fn run_gdm_responder(machine_identifier: String, port: u16) {
             warn!(gdm_port, "could not hand Plex GDM socket to Tokio");
             continue;
         };
-        let response = response.clone();
+        let configured_name = configured_name.clone();
+        let machine_identifier = machine_identifier.clone();
         tokio::spawn(async move {
             let mut buffer = [0u8; 2048];
             loop {
@@ -516,26 +544,35 @@ async fn run_gdm_responder(machine_identifier: String, port: u16) {
                     return;
                 };
                 if buffer[..size].starts_with(b"M-SEARCH * HTTP/1.") {
+                    let name = configured_name
+                        .read()
+                        .map(|name| name.clone())
+                        .unwrap_or_else(|_| "harbringer".to_owned());
+                    let response = gdm_message("HTTP/1.0 200 OK", &machine_identifier, port, &name);
                     let _ = socket.send_to(response.as_bytes(), peer).await;
                 }
             }
         });
     }
 
-    let announcement = gdm_message("HELLO", &machine_identifier, port);
+    let name = configured_name
+        .read()
+        .map(|name| name.clone())
+        .unwrap_or_else(|_| "harbringer".to_owned());
+    let announcement = gdm_message("HELLO", &machine_identifier, port, &name);
     let announcement_socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0));
     if let Ok(announcement_socket) = announcement_socket {
         let _ = announcement_socket.send_to(announcement.as_bytes(), (multicast, 32413));
     }
 }
 
-fn gdm_message(prefix: &str, machine_identifier: &str, port: u16) -> String {
+fn gdm_message(prefix: &str, machine_identifier: &str, port: u16, name: &str) -> String {
     let updated_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
     format!(
-        "{prefix}\r\nContent-Type: plex/media-server\r\nResource-Identifier: {machine_identifier}\r\nName: harbringer\r\nPort: {port}\r\nUpdated-At: {updated_at}\r\nVersion: 1.43.4.10903-e5521bd8c\r\n\r\n"
+        "{prefix}\r\nContent-Type: plex/media-server\r\nResource-Identifier: {machine_identifier}\r\nName: {name}\r\nPort: {port}\r\nUpdated-At: {updated_at}\r\nVersion: 1.43.4.10903-e5521bd8c\r\n\r\n"
     )
 }
 
@@ -822,10 +859,6 @@ fn open_database(
         )?;
         migrated
     };
-    let _ = connection.execute(
-        "UPDATE server_identity SET server_name = 'harbringer' WHERE id = 1",
-        [],
-    );
     Ok((connection, machine_identifier))
 }
 
@@ -875,12 +908,18 @@ struct PreferencesForm {
     tmdb_bearer_token: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ServerNameForm {
+    server_name: String,
+}
+
 #[derive(Deserialize, Default)]
 struct SettingsQuery {
     folder: Option<String>,
     error: Option<String>,
     metadata_matched: Option<usize>,
     metadata_status: Option<String>,
+    server_name_saved: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1704,8 +1743,9 @@ fn plex_server_registration_xml(state: &AppState) -> Result<String, String> {
     registration_date ^= (registration_date >> 3) & 0x38;
     registration_date ^= (registration_date >> 3) & 0x7;
     Ok(format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><MediaContainer size=\"{}\"><Server name=\"harbringer\" localAddresses=\"{}\" port=\"{}\" machineIdentifier=\"{}\" version=\"1.43.4.10903-e5521bd8c\" date=\"{}\" relay=\"0\" />{directories}</MediaContainer>",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><MediaContainer size=\"{}\"><Server name=\"{}\" localAddresses=\"{}\" port=\"{}\" machineIdentifier=\"{}\" version=\"1.43.4.10903-e5521bd8c\" date=\"{}\" relay=\"0\" />{directories}</MediaContainer>",
         libraries.len() + 1,
+        xml_escape(&server_name(state)),
         xml_escape(&local_addresses),
         bind.port(),
         xml_escape(&state.machine_identifier),
@@ -1891,8 +1931,8 @@ async fn settings_page(
         .iter()
         .map(|(id, name, kind, folders, show_recently_added, show_continue_watching)| {
             format!(
-                "<li><strong>{}</strong> <span class=\"note\">({})</span><ul>{}</ul><details><summary>＋ Add folder</summary><form method=\"post\" action=\"/settings/folders\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><input name=\"path\" type=\"text\" placeholder=\"/another/folder\" required><button type=\"submit\">Add folder</button></form></details><form method=\"post\" action=\"/settings/libraries/{}/scan\" style=\"display:inline-flex\"><button type=\"submit\">Scan metadata</button><button type=\"submit\" formaction=\"/settings/libraries/{}/scan?force=true\">Force rescan</button></form><form method=\"post\" action=\"/settings/libraries/display\" class=\"library-display\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><label><input type=\"checkbox\" name=\"show_recently_added\" value=\"true\" {}> Recently Added</label><label><input type=\"checkbox\" name=\"show_continue_watching\" value=\"true\" {}> Continue Watching</label><button type=\"submit\">Save Home sections</button></form></li>",
-                html(name), html(library_kind_label(kind)), folders.iter().map(|path| format!("<li>{}</li>", html(path))).collect::<String>(), id, id, id, id, if *show_recently_added { "checked" } else { "" }, if *show_continue_watching { "checked" } else { "" }
+                "<details class=\"library-card\"><summary class=\"library-summary\"><span class=\"library-summary-title\"><strong>{}</strong><span class=\"type-pill\">{}</span></span><span class=\"folder-count\">{} folders</span></summary><div class=\"library-content\"><section class=\"library-folders\" aria-label=\"Folders\"><h4>Folders</h4><ul>{}</ul></section><details class=\"library-add-folder\"><summary>Add folder</summary><form method=\"post\" action=\"/settings/folders\" class=\"inline-form\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><label class=\"sr-only\" for=\"folder-{}\">Folder path</label><input id=\"folder-{}\" name=\"path\" type=\"text\" placeholder=\"/another/folder\" required><button type=\"submit\">Add folder</button></form></details><div class=\"library-tools\"><form method=\"post\" action=\"/settings/libraries/{}/scan\" class=\"inline-form\"><button type=\"submit\">Scan metadata</button><button class=\"button-secondary\" type=\"submit\" formaction=\"/settings/libraries/{}/scan?force=true\">Force rescan</button></form><form method=\"post\" action=\"/settings/libraries/display\" class=\"library-display\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><fieldset><legend>Show on Home</legend><label><input type=\"checkbox\" name=\"show_recently_added\" value=\"true\" {}> Recently Added</label><label><input type=\"checkbox\" name=\"show_continue_watching\" value=\"true\" {}> Continue Watching</label><button class=\"button-secondary\" type=\"submit\">Save Home sections</button></fieldset></form><form method=\"post\" action=\"/settings/libraries/{}/delete\" class=\"library-delete\" onsubmit=\"return confirm('Delete this library from Harbringer? Media files will not be deleted.')\"><button class=\"button-danger\" type=\"submit\">Delete library</button></form></div></div></details>",
+                html(name), html(library_kind_label(kind)), folders.len(), folders.iter().map(|path| format!("<li><code>{}</code></li>", html(path))).collect::<String>(), id, id, id, id, id, id, if *show_recently_added { "checked" } else { "" }, if *show_continue_watching { "checked" } else { "" }, id
             )
         })
         .collect::<String>();
@@ -1922,7 +1962,13 @@ async fn settings_page(
                 )
             })
         })
+        .or_else(|| {
+            query.server_name_saved.map(|_| {
+                "<div class=\"flash-notice\" role=\"status\">Server name saved.</div>".to_owned()
+            })
+        })
         .unwrap_or_default();
+    let current_server_name = html(&server_name(&state));
     let metadata_enabled = state
         .config
         .lock()
@@ -1950,64 +1996,68 @@ async fn settings_page(
     let plex_auth = if plex_status.1 {
         if let Some(error) = plex_status.2.as_deref() {
             format!(
-                "<h2>Plex.tv</h2><p class=\"flash-error\" role=\"status\">Signed in, but secure Plex client publication failed: {}. HTTP access remains published.</p><form method=\"get\" action=\"/settings/plex/start\"><button type=\"submit\">Reconnect to Plex.tv</button></form><form method=\"post\" action=\"/settings/plex/disconnect\"><button type=\"submit\">Disconnect and revoke</button></form>",
+                "<p class=\"flash-error\" role=\"status\">Signed in, but secure Plex client publication failed: {}. HTTP access remains published.</p><div class=\"action-row\"><form method=\"get\" action=\"/settings/plex/start\"><button type=\"submit\">Reconnect to Plex.tv</button></form><form method=\"post\" action=\"/settings/plex/disconnect\"><button class=\"button-secondary\" type=\"submit\">Disconnect and revoke</button></form></div>",
                 html(error)
             )
         } else {
-            r#"<h2>Plex.tv <span style="color:#4ade80" title="Connected and published" aria-label="Connected and published">✓</span></h2><p class="note">Connected to Plex.tv and published for Plex clients.</p><form method="get" action="/settings/plex/start"><button type="submit">Reconnect to Plex.tv</button></form><form method="post" action="/settings/plex/disconnect" onsubmit="return confirm('Disconnect and revoke harbringer from Plex.tv?')"><button type="submit">Disconnect and revoke</button></form>"#.to_owned()
+            r#"<p class="status-line"><span class="status-dot"></span>Connected to Plex.tv and published for Plex clients.</p><div class="action-row"><form method="get" action="/settings/plex/start"><button type="submit">Reconnect to Plex.tv</button></form><form method="post" action="/settings/plex/disconnect" onsubmit="return confirm('Disconnect and revoke harbringer from Plex.tv?')"><button class="button-secondary" type="submit">Disconnect and revoke</button></form></div>"#.to_owned()
         }
     } else if plex_status.0 {
         match plex_status.2.as_deref() {
             Some(error) => format!(
-                "<h2>Plex.tv</h2><p class=\"flash-error\" role=\"status\">harbringer is signed in to Plex.tv, but server claiming or resource publication failed: {}.</p><form method=\"get\" action=\"/settings/plex/start\"><button type=\"submit\">Connect to Plex.tv again</button></form><form method=\"post\" action=\"/settings/plex/disconnect\"><button type=\"submit\">Disconnect and revoke</button></form>",
+                "<p class=\"flash-error\" role=\"status\">harbringer is signed in to Plex.tv, but server claiming or resource publication failed: {}.</p><div class=\"action-row\"><form method=\"get\" action=\"/settings/plex/start\"><button type=\"submit\">Connect to Plex.tv again</button></form><form method=\"post\" action=\"/settings/plex/disconnect\"><button class=\"button-secondary\" type=\"submit\">Disconnect and revoke</button></form></div>",
                 html(error)
             ),
-            None => r#"<h2>Plex.tv</h2><p class="flash-error" role="status">harbringer has an older Plex.tv account token but has not completed server claiming or resource publication.</p><form method="get" action="/settings/plex/start"><button type="submit">Connect to Plex.tv again</button></form><form method="post" action="/settings/plex/disconnect"><button type="submit">Disconnect and revoke</button></form>"#.to_owned(),
+            None => r#"<p class="flash-error" role="status">harbringer has an older Plex.tv account token but has not completed server claiming or resource publication.</p><div class="action-row"><form method="get" action="/settings/plex/start"><button type="submit">Connect to Plex.tv again</button></form><form method="post" action="/settings/plex/disconnect"><button class="button-secondary" type="submit">Disconnect and revoke</button></form></div>"#.to_owned(),
         }
     } else {
-        r#"<h2>Plex.tv</h2><p class="note">Connect harbringer to your Plex account so Plex clients can discover and authenticate with this server.</p><form method="get" action="/settings/plex/start"><button type="submit">Connect to Plex.tv</button></form>"#.to_owned()
+        r#"<p class="note">Connect harbringer to your Plex account so Plex clients can discover and authenticate with this server.</p><div class="action-row"><form method="get" action="/settings/plex/start"><button type="submit">Connect to Plex.tv</button></form></div>"#.to_owned()
     };
     Html(format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>harbringer settings</title><style>
-body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }}
+:root {{ color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0b1020; color: #e5eaf4; font-synthesis: none; }}
+* {{ box-sizing: border-box; }} body {{ margin: 0; min-height: 100vh; background: radial-gradient(ellipse at 75% -20%, #1b3151 0, transparent 44rem), #0b1020; }}
 .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; transition: grid-template-columns .2s ease; }} .app-shell.sidebar-collapsed {{ grid-template-columns: 68px minmax(0, 1fr); }}
-.sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }}
-.sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }}
-.sidebar-top {{ display: flex; align-items: center; justify-content: space-between; padding-bottom: 1rem; }}
-.sidebar-top .sidebar-brand {{ padding-bottom: 0; }} .sidebar-toggle {{ width: 2rem; height: 2rem; border: 0; border-radius: .4rem; color: #cbd5e1; background: transparent; cursor: pointer; font-size: 1.15rem; }} .sidebar-collapsed .sidebar-top {{ justify-content: center; }} .sidebar-collapsed .sidebar-brand, .sidebar-collapsed .sidebar-label, .sidebar-collapsed .sidebar-link {{ font-size: 0; }} .sidebar-collapsed .sidebar-link {{ justify-content: center; }} .sidebar-collapsed .sidebar-icon {{ font-size: 1.1rem; }}
-.sidebar-label {{ padding: 0 .7rem .45rem; color: #6b7280; font-size: .7rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }}
-.sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; align-items: center; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }}
-.sidebar-link:hover {{ background: #17243a; color: #fff; }} .sidebar-link.active {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; font-size: 1.1rem; }}
-main {{ min-width: 0; max-width: 760px; width: 100%; box-sizing: border-box; margin: 0 auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; }}
-form {{ display: flex; gap: .6rem; margin: 1.5rem 0; }} input, select {{ flex: 1; padding: .7rem; border: 1px solid #4b5563; border-radius: .4rem; color: #fff; background: #1f2937; }} .path-list {{ display: grid; gap: .55rem; flex: 2; }} .path-row {{ display: flex; gap: .5rem; }} .path-row input {{ min-width: 0; }} .metadata-options {{ display: grid; gap: .6rem; margin: .7rem 0 1rem; }} .metadata-option {{ display: flex; align-items: flex-start; gap: .6rem; padding: .8rem; border: 1px solid #374151; border-radius: .5rem; background: #172033; }} .metadata-option input {{ flex: 0; margin-top: .2rem; }}
-button {{ padding: .7rem 1rem; border: 0; border-radius: .4rem; color: #fff; background: #2563eb; cursor: pointer; }} li {{ margin: .65rem 0; overflow-wrap: anywhere; }} .note {{ color: #9ca3af; }}
- .flash-error {{ margin: 1rem 0; padding: .8rem 1rem; border: 1px solid #ef4444; border-radius: .5rem; color: #fecaca; background: #451a1a; }} .flash-notice {{ margin: 1rem 0; padding: .8rem 1rem; border: 1px solid #22c55e; border-radius: .5rem; color: #bbf7d0; background: #14532d; }}
-details {{ margin-top: .7rem; }} summary {{ display: inline-block; padding: .45rem .7rem; border: 1px solid #3b82f6; border-radius: .4rem; color: #bfdbfe; cursor: pointer; list-style: none; }} summary::-webkit-details-marker {{ display: none; }} details form {{ margin: .7rem 0 0; }}
-@media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; padding: .7rem; border-right: 0; border-bottom: 1px solid #263244; }} .sidebar-top {{ padding-bottom: .35rem; }} .sidebar-brand {{ padding: .35rem .55rem; }} .sidebar-toggle {{ display: none; }} .sidebar-label {{ display: none; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} }}
+.sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #202a3c; background: rgba(10, 16, 29, .9); }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f8fafc; font-size: 1.25rem; font-weight: 750; text-decoration: none; }} .sidebar-top {{ display: flex; align-items: center; justify-content: space-between; padding-bottom: 1rem; }} .sidebar-top .sidebar-brand {{ padding-bottom: 0; }}
+.sidebar-toggle {{ width: 2rem; height: 2rem; border: 0; border-radius: .5rem; color: #cbd5e1; background: transparent; cursor: pointer; font-size: 1.15rem; }} .sidebar-collapsed .sidebar-top {{ justify-content: center; }} .sidebar-collapsed .sidebar-brand, .sidebar-collapsed .sidebar-label, .sidebar-collapsed .sidebar-link {{ font-size: 0; }} .sidebar-collapsed .sidebar-link {{ justify-content: center; }} .sidebar-collapsed .sidebar-icon {{ font-size: 1.1rem; }} .sidebar-label {{ padding: 0 .7rem .45rem; color: #77839a; font-size: .68rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }}
+.sidebar-nav {{ display: grid; gap: .3rem; }} .sidebar-link {{ display: flex; align-items: center; gap: .7rem; padding: .68rem .7rem; border-radius: .55rem; color: #aeb9cc; text-decoration: none; }} .sidebar-link:hover {{ background: #17243a; color: #fff; }} .sidebar-link.active {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; font-size: 1.1rem; }}
+main {{ min-width: 0; width: min(100%, 1020px); margin: 0 auto; padding: clamp(1.5rem, 4vw, 3.25rem); }} a {{ color: #9bc5ff; }} .page-heading {{ margin: 0 0 1.8rem; }} .eyebrow {{ margin: 0 0 .45rem; color: #82a9e5; font-size: .74rem; font-weight: 750; letter-spacing: .14em; text-transform: uppercase; }} h1 {{ margin: 0; color: #f8fafc; font-size: clamp(2rem, 4vw, 2.65rem); letter-spacing: -.04em; }} .page-subtitle {{ max-width: 48rem; margin: .6rem 0 0; color: #9aa8bf; line-height: 1.65; }}
+.settings-stack {{ display: grid; gap: 1.15rem; }} .settings-card {{ min-width: 0; padding: clamp(1.1rem, 2.8vw, 1.65rem); border: 1px solid #29364b; border-radius: 1rem; background: linear-gradient(145deg, rgba(22, 32, 50, .94), rgba(15, 23, 39, .97)); box-shadow: 0 18px 48px rgba(0, 0, 0, .14); }} .section-heading {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; margin-bottom: 1.15rem; }} h2 {{ margin: 0; color: #f1f5fb; font-size: 1.18rem; letter-spacing: -.015em; }} h3 {{ margin: 0; color: #f1f5fb; font-size: 1.05rem; }} h4 {{ margin: 0 0 .6rem; color: #aab8cc; font-size: .77rem; letter-spacing: .07em; text-transform: uppercase; }} .note, .section-description {{ color: #98a6bb; line-height: 1.6; }} .section-description {{ max-width: 48rem; margin: .45rem 0 0; font-size: .91rem; }}
+.flash-error, .flash-notice {{ margin: 0 0 1rem; padding: .85rem 1rem; border-radius: .7rem; line-height: 1.5; }} .flash-error {{ border: 1px solid #793f50; color: #ffd6dc; background: #381d2a; }} .flash-notice {{ border: 1px solid #286a52; color: #c2f5d8; background: #123426; }} .status-line {{ display: flex; align-items: center; gap: .65rem; margin: 0; color: #c4d3e8; }} .status-dot {{ width: .58rem; height: .58rem; border-radius: 50%; background: #4ade80; box-shadow: 0 0 0 .24rem rgba(74, 222, 128, .13); }} .action-row {{ display: flex; flex-wrap: wrap; gap: .65rem; margin-top: 1rem; }}
+.settings-form, .inline-form, .library-display {{ margin: 0; }} .settings-form {{ display: grid; gap: 1rem; }} .server-name-form {{ margin-top: 1.15rem; padding-top: 1.05rem; border-top: 1px solid #26354a; }} .server-name-form .field {{ max-width: 34rem; }} .field small {{ font-size: .78rem; font-weight: 400; }} .form-grid {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(180px, .6fr); gap: 1rem; }} .field {{ display: grid; min-width: 0; gap: .45rem; }} .field > span, .field > label {{ color: #c9d4e4; font-size: .84rem; font-weight: 650; }} input:not([type="checkbox"]):not([type="radio"]), select {{ width: 100%; min-width: 0; min-height: 2.75rem; padding: .68rem .78rem; border: 1px solid #3a4961; border-radius: .6rem; outline: none; color: #f3f6fb; background: #0e1727; font: inherit; }} input::placeholder {{ color: #738198; }} input:focus, select:focus {{ border-color: #60a5fa; box-shadow: 0 0 0 3px rgba(96, 165, 250, .17); }}
+button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: center; justify-content: center; gap: .4rem; padding: .65rem .95rem; border: 1px solid transparent; border-radius: .6rem; color: #fff; background: #2563eb; font: inherit; font-size: .87rem; font-weight: 700; text-decoration: none; cursor: pointer; transition: background .15s, border-color .15s, transform .15s; }} button:hover, .button-link:hover {{ background: #3476f6; }} button:active, .button-link:active {{ transform: translateY(1px); }} button:focus-visible, a:focus-visible, summary:focus-visible {{ outline: 2px solid #93c5fd; outline-offset: 2px; }} .button-secondary {{ border-color: #3a4961; color: #d4deec; background: #182337; }} .button-secondary:hover {{ border-color: #53647e; background: #22314a; }} .button-quiet {{ min-width: 2.65rem; padding-inline: .72rem; border-color: #3a4961; color: #c7d1df; background: #182337; }}
+.metadata-options {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .8rem; }} .metadata-option {{ display: flex; min-height: 9rem; align-items: flex-start; gap: .8rem; padding: 1rem; border: 1px solid #35445b; border-radius: .75rem; background: rgba(12, 21, 36, .68); cursor: pointer; transition: border-color .15s, background .15s; }} .metadata-option:has(input:checked) {{ border-color: #4e8cec; background: rgba(28, 65, 120, .22); }} .metadata-option input {{ flex: 0 0 auto; width: 1.05rem; height: 1.05rem; margin: .14rem 0 0; accent-color: #4389f5; }} .option-copy {{ display: grid; gap: .55rem; }} .option-copy strong {{ color: #e7edf7; }} .option-copy .note {{ margin: 0; font-size: .84rem; }} code {{ color: #c5dcff; font: .88em ui-monospace, SFMono-Regular, Menlo, monospace; }}
+.library-list {{ display: grid; gap: .85rem; margin: 1.2rem 0 0; padding: 0; list-style: none; }} .library-card {{ min-width: 0; padding: 1.05rem; border: 1px solid #2c3a50; border-radius: .8rem; background: rgba(10, 17, 30, .46); }} .library-heading {{ display: flex; align-items: center; justify-content: space-between; gap: 1rem; }} .library-heading > div {{ display: flex; flex-wrap: wrap; align-items: center; gap: .65rem; }} .type-pill {{ padding: .28rem .55rem; border: 1px solid #354a68; border-radius: 999px; color: #b9cee9; background: #17243a; font-size: .72rem; font-weight: 700; }} .library-folders {{ margin-top: 1.15rem; }} .library-folders ul {{ display: grid; gap: .45rem; margin: 0; padding: 0; list-style: none; }} .library-folders li {{ min-width: 0; margin: 0; padding: .6rem .7rem; overflow-wrap: anywhere; border-radius: .48rem; background: #0d1727; }} .library-folders code {{ overflow-wrap: anywhere; }} .library-add-folder, .add-library {{ margin-top: .8rem; }} .add-library {{ margin: 0; }} .add-library .settings-form {{ margin-top: 1rem; }} summary {{ display: inline-flex; align-items: center; gap: .5rem; padding: .48rem .68rem; border: 1px solid #394a63; border-radius: .55rem; color: #bfcee2; background: #172337; font-size: .82rem; font-weight: 650; cursor: pointer; list-style: none; }} summary::before {{ content: "+"; color: #83b4ff; font-size: 1rem; }} details[open] summary::before {{ content: "−"; }} summary::-webkit-details-marker {{ display: none; }} .inline-form {{ display: flex; flex-wrap: wrap; align-items: end; gap: .55rem; margin-top: .75rem; }} .inline-form input:not([type="hidden"]) {{ flex: 1 1 18rem; }} .path-list {{ display: grid; gap: .55rem; }} .path-row {{ display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }} .path-row input {{ flex: 1 1 18rem; }} .path-row .button-link {{ flex: 0 0 auto; }} .library-tools {{ display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr); align-items: start; gap: 1rem; margin-top: 1.1rem; padding-top: 1rem; border-top: 1px solid #26354a; }} .library-tools > .inline-form {{ margin: 0; }} .library-display fieldset {{ display: flex; flex-wrap: wrap; align-items: center; gap: .6rem 1rem; min-width: 0; margin: 0; padding: 0; border: 0; }} .library-display legend {{ width: 100%; margin-bottom: .55rem; color: #91a0b6; font-size: .72rem; font-weight: 750; letter-spacing: .09em; text-transform: uppercase; }} .library-display label {{ display: inline-flex; align-items: center; gap: .4rem; color: #c6d0df; font-size: .82rem; }} input[type="checkbox"] {{ width: 1rem; height: 1rem; margin: 0; accent-color: #4389f5; }} .library-display button {{ min-height: 2.3rem; padding: .48rem .7rem; font-size: .78rem; }} .empty-state {{ margin: 0; padding: 1rem; border: 1px dashed #35445b; border-radius: .7rem; color: #9aa8bf; text-align: center; }} .sr-only {{ position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }}
+.library-card {{ padding: 0; overflow: hidden; }} .library-summary {{ display: flex; width: 100%; align-items: center; justify-content: space-between; gap: .8rem; padding: 1rem 1.05rem; border: 0; border-radius: 0; color: #e8eef8; background: transparent; font-size: .95rem; text-align: left; }} .library-summary::before {{ content: none !important; }} .library-summary::after {{ content: "⌄"; margin-left: auto; color: #91a8c7; transition: transform .15s; }} .library-card[open] > .library-summary::after {{ transform: rotate(180deg); }} .library-summary-title {{ display: flex; flex-wrap: wrap; align-items: center; gap: .65rem; }} .folder-count {{ flex: 0 0 auto; color: #91a0b6; font-size: .78rem; font-weight: 500; }} .library-content {{ padding: 0 1.05rem 1.05rem; }} .library-tools {{ grid-template-columns: minmax(0, auto) minmax(0, 1fr) auto; }} .library-delete {{ display: flex; justify-content: flex-end; }} .button-danger {{ border-color: #713841; color: #ffd3d7; background: #3a202a; }} .button-danger:hover {{ border-color: #9d4b55; background: #512630; }}
+@media (max-width: 820px) {{ .library-tools {{ grid-template-columns: 1fr; }} .library-delete {{ justify-content: flex-start; }} }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; padding: .7rem; border-right: 0; border-bottom: 1px solid #263244; }} .sidebar-top {{ padding-bottom: .35rem; }} .sidebar-brand {{ padding: .35rem .55rem; }} .sidebar-toggle {{ display: none; }} .sidebar-label {{ display: none; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} main {{ padding: 1.35rem 1rem 2.5rem; }} }} @media (max-width: 560px) {{ .metadata-options, .form-grid {{ grid-template-columns: 1fr; }} .metadata-option {{ min-height: auto; }} .section-heading {{ display: block; }} .library-tools .inline-form > * {{ flex: 1 1 auto; }} .library-display fieldset {{ align-items: flex-start; }} .action-row > form, .action-row button {{ width: 100%; }} .action-row > form {{ flex: 1 1 100%; }} }}
 </style></head><body><div class="app-shell">{}
-<main><h1>Settings</h1>{}{}{}
-<p class="note">A library is a named collection with one type and one or more monitored folders. Create it with its first folder, then add more folders to that same library below.</p>
-<h2>Metadata storage</h2><p class="note">Choose one place for matched movie and TV metadata. SQLite mode stores matches in this server’s database. Sidecar mode stores matches and artwork beside the media, so another mplex server can reuse them without its database or a new TMDB lookup. SQLite still stores server identity, library configuration, and playback progress.</p><form method="post" action="/settings/preferences"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="database" {}><span><strong>SQLite database {}</strong><br><span class="note">Matched metadata stays in this server’s database.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="sidecar" {}><span><strong>.mplex files in media folders {}</strong><br><span class="note">Matched metadata and artwork live in <code>.mplex/cover.jpg</code>, <code>banner.jpg</code>, and <code>info.toml</code> beside the media.</span></span></label></div><input name="tmdb_bearer_token" type="password" placeholder="TMDB bearer token (leave blank to keep current)" value=""><button type="submit">Save preferences</button></form>
-<details open><summary>＋ Add library</summary><form method="post" action="/settings/libraries"><input name="name" type="text" placeholder="Library name" required><select name="kind"><option value="movie">Movies</option><option value="tv">TV Shows</option><option value="other">Other</option></select><div class="path-list" id="new-library-paths"><div class="path-row"><input name="path[]" type="text" placeholder="/path/to/folder" value="{}" required><a href="/settings/browse">Browse</a><button type="button" class="remove-path" disabled>−</button></div></div><button type="button" id="add-path">＋</button><button type="submit">Create library</button></form></details>
-<h2>Libraries</h2><ul>{}</ul>
+<main><header class="page-heading"><p class="eyebrow">harbringer</p><h1>Settings</h1><p class="page-subtitle">Manage Plex access, metadata storage, and the libraries available on this server.</p></header>{}{}
+<div class="settings-stack">
+<section class="settings-card" aria-labelledby="plex-heading"><div class="section-heading"><div><h2 id="plex-heading">Plex account</h2><p class="section-description">Connect harbringer to Plex so compatible clients can discover and authenticate with this server.</p></div></div>{}<form method="post" action="/settings/server-name" class="settings-form server-name-form"><label class="field"><span>Server name</span><input name="server_name" type="text" value="{}" maxlength="64" required><small class="note">This is the name Plex clients see. It defaults to harbringer.</small></label><div><button class="button-secondary" type="submit">Save server name</button></div></form></section>
+<section class="settings-card" aria-labelledby="metadata-heading"><div class="section-heading"><div><h2 id="metadata-heading">Metadata storage</h2><p class="section-description">Choose one place for matched movie and TV metadata. Sidecars let another mplex server reuse matches and artwork without its database or a new TMDB lookup. SQLite still stores server identity, library configuration, and playback progress.</p></div></div><form method="post" action="/settings/preferences" class="settings-form"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="database" {}><span class="option-copy"><strong>SQLite database {}</strong><span class="note">Matched metadata stays in this server’s database.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="sidecar" {}><span class="option-copy"><strong>.mplex files in media folders {}</strong><span class="note">Artwork and metadata are written to <code>.mplex/cover.jpg</code>, <code>banner.jpg</code>, and <code>info.toml</code>.</span></span></label></div><label class="field"><span>TMDB bearer token <span class="note">(optional; leave blank to keep the saved token)</span></span><input name="tmdb_bearer_token" type="password" autocomplete="new-password" placeholder="Paste token"></label><div><button type="submit">Save metadata settings</button></div></form></section>
+<section class="settings-card" aria-labelledby="libraries-heading"><div class="section-heading"><div><h2 id="libraries-heading">Libraries</h2><p class="section-description">A library groups media of one type from one or more monitored folders. Add a folder to an existing library when the same collection spans multiple locations.</p></div></div><details class="add-library"><summary>Add a library</summary><form method="post" action="/settings/libraries" class="settings-form"><div class="form-grid"><label class="field"><span>Library name</span><input name="name" type="text" placeholder="e.g. Films" required></label><label class="field"><span>Content type</span><select name="kind"><option value="movie">Movies</option><option value="tv">TV Shows</option><option value="other">Other</option></select></label></div><div class="field"><span>Media folders</span><div class="path-list" id="new-library-paths"><div class="path-row"><label class="sr-only" for="new-path-0">Folder path</label><input id="new-path-0" name="path[]" type="text" placeholder="/path/to/folder" value="{}" required><a class="button-link button-secondary" href="/settings/browse">Browse</a><button type="button" class="button-quiet remove-path" aria-label="Remove folder path" title="Remove folder path" disabled>−</button></div></div></div><div class="action-row path-actions"><button type="button" class="button-secondary" id="add-path" aria-label="Add another folder path" title="Add another folder path">＋ Add folder</button><button type="submit">Create library</button></div></form></details>
+<div class="library-list">{}</div></section>
+</div>
  </main></div><script>
 const shell = document.querySelector('.app-shell'); const toggle = document.querySelector('.sidebar-toggle');
 if (localStorage.getItem('mplex-sidebar-collapsed') === 'true') shell.classList.add('sidebar-collapsed');
 toggle?.addEventListener('click', () => {{ const collapsed = shell.classList.toggle('sidebar-collapsed'); localStorage.setItem('mplex-sidebar-collapsed', collapsed ? 'true' : 'false'); }});
-const pathList = document.querySelector('#new-library-paths'); document.querySelector('#add-path')?.addEventListener('click', () => {{ const row = document.createElement('div'); row.className = 'path-row'; row.innerHTML = '<input name="path[]" type="text" placeholder="/path/to/folder" required><a href="/settings/browse">Browse</a><button type="button" class="remove-path">−</button>'; row.querySelector('.remove-path').addEventListener('click', () => {{ row.remove(); }}); pathList.appendChild(row); }});
+const pathList = document.querySelector('#new-library-paths'); const updatePathButtons = () => {{ const rows = [...pathList.querySelectorAll('.path-row')]; rows.forEach((row, index) => {{ const button = row.querySelector('.remove-path'); button.disabled = rows.length === 1; button.setAttribute('aria-label', `Remove folder path ${{index + 1}}`); button.title = `Remove folder path ${{index + 1}}`; }}); }};
+document.querySelector('#add-path')?.addEventListener('click', () => {{ const index = pathList.querySelectorAll('.path-row').length; const row = document.createElement('div'); row.className = 'path-row'; row.innerHTML = `<label class="sr-only" for="new-path-${{index}}">Folder path</label><input id="new-path-${{index}}" name="path[]" type="text" placeholder="/path/to/folder" required><a class="button-link button-secondary" href="/settings/browse">Browse</a><button type="button" class="button-quiet remove-path">−</button>`; row.querySelector('.remove-path').addEventListener('click', () => {{ row.remove(); updatePathButtons(); }}); pathList.appendChild(row); updatePathButtons(); }});
 </script></body></html>"#,
         sidebar_nav_with_settings(false, true),
         error,
         notice,
-        plex_auth,
+        format!("<div class=\"section-content\">{}</div>", plex_auth),
+        current_server_name,
         if metadata_enabled { "" } else { "checked" },
         if metadata_enabled { "" } else { "(current)" },
         if metadata_enabled { "checked" } else { "" },
         if metadata_enabled { "(current)" } else { "" },
         html(query.folder.as_deref().unwrap_or("")),
-        list
+        if list.is_empty() { "<p class=\"empty-state\">No libraries yet. Add a library to start organizing your media.</p>".to_owned() } else { list }
     ))
     .into_response()
 }
@@ -2056,6 +2106,42 @@ async fn update_preferences(
         "/settings?metadata_status=TMDB%20token%20cleared"
     };
     Redirect::to(location).into_response()
+}
+
+async fn update_server_name(
+    State(state): State<AppState>,
+    Form(form): Form<ServerNameForm>,
+) -> Response {
+    let name = form.server_name.trim();
+    if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+        return settings_error(
+            "Server name must be 1–64 characters and contain no control characters",
+        );
+    }
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if connection
+        .execute(
+            "UPDATE server_identity SET server_name = ?1 WHERE id = 1",
+            [name],
+        )
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if let Ok(mut current_name) = state.server_name.write() {
+        *current_name = name.to_owned();
+    }
+    Redirect::to("/settings?server_name_saved=true").into_response()
+}
+
+fn server_name(state: &AppState) -> String {
+    state
+        .server_name
+        .read()
+        .map(|name| name.clone())
+        .unwrap_or_else(|_| "harbringer".to_owned())
 }
 
 #[axum::debug_handler]
@@ -3618,6 +3704,45 @@ async fn update_library_display(
     if save_config(&state.config_path, &config).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    Redirect::to("/settings").into_response()
+}
+
+async fn delete_library(State(state): State<AppState>, Path(library_id): Path<usize>) -> Response {
+    let Ok(mut config) = state.config.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Some(library) = config.libraries.get(library_id) else {
+        return settings_error("Library does not exist");
+    };
+    let library_name = library.name.clone();
+    let mut updated_config = config.clone();
+    updated_config.libraries.remove(library_id);
+
+    let Ok(mut connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(transaction) = connection.transaction() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if transaction
+        .execute(
+            "DELETE FROM library_folders WHERE library_id = (SELECT id FROM library_groups WHERE name = ?1)",
+            [&library_name],
+        )
+        .and_then(|_| {
+            transaction.execute("DELETE FROM library_groups WHERE name = ?1", [&library_name])
+        })
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if save_config(&state.config_path, &updated_config).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if transaction.commit().is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    *config = updated_config;
     Redirect::to("/settings").into_response()
 }
 
@@ -5481,7 +5606,7 @@ async fn log_not_found(State(state): State<AppState>, req: Request<Body>) -> Res
         return plex_timeline(&state, query);
     }
     if req.uri().path() == "/:/prefs" {
-        return plex_prefs();
+        return plex_prefs(&state);
     }
     if matches!(req.uri().path(), "/:/scrobble" | "/:/unscrobble") {
         let watched = req.uri().path() == "/:/scrobble";
@@ -5753,7 +5878,7 @@ async fn plex_root(state: &AppState) -> Response {
             "countryCode": "usa",
             "diagnostics": "",
             "eventStream": false,
-            "friendlyName": "harbringer",
+            "friendlyName": server_name(state),
             "hubSearch": true,
             "itemClusters": false,
             "livetv": 0,
@@ -5839,6 +5964,7 @@ async fn plex_identity(State(state): State<AppState>) -> Response {
             "size": 0,
             "apiVersion": "1.2.3",
             "claimed": claimed,
+            "friendlyName": server_name(&state),
             "machineIdentifier": state.machine_identifier.as_ref(),
             "version": "1.43.4.10903-e5521bd8c"
         }
@@ -5962,9 +6088,9 @@ async fn plex_sessions() -> Response {
     plex_json(serde_json::json!({"MediaContainer": {"size": 0}}))
 }
 
-fn plex_prefs() -> Response {
+fn plex_prefs(state: &AppState) -> Response {
     let settings = serde_json::json!([
-        {"id":"FriendlyName","label":"Friendly name","summary":"Other computers on your network see this server under this name.","type":"text","default":"","value":"harbringer","hidden":false,"advanced":false,"group":"general"},
+        {"id":"FriendlyName","label":"Friendly name","summary":"Other computers on your network see this server under this name.","type":"text","default":"harbringer","value":server_name(state),"hidden":false,"advanced":false,"group":"general"},
         {"id":"OnDeckLimit","label":"On Deck limit","summary":"The maximum number of items shown in Continue Watching.","type":"int","default":40,"value":40,"hidden":false,"advanced":false,"group":"library"},
         {"id":"ScannerLowPriority","label":"Run scans at a lower priority","summary":"","type":"bool","default":false,"value":false,"hidden":false,"advanced":false,"group":"library"},
         {"id":"AllowLegacyAgents","label":"Allow legacy agents","summary":"","type":"bool","default":true,"value":true,"hidden":true,"advanced":false,"group":"library"},
@@ -5996,7 +6122,7 @@ async fn plex_servers(State(state): State<AppState>) -> Response {
         "MediaContainer": {
             "size": 1,
             "Server": [{
-                "name": "harbringer",
+                "name": server_name(&state),
                 "address": host,
                 "port": bind,
                 "machineIdentifier": state.machine_identifier.as_ref(),
@@ -6062,7 +6188,7 @@ async fn plex_media_providers(State(state): State<AppState>) -> Response {
             "countryCode": "usa",
             "diagnostics": "",
             "eventStream": false,
-            "friendlyName": "harbringer",
+            "friendlyName": server_name(&state),
             "hubSearch": true,
             "itemClusters": false,
             "livetv": 0,
@@ -9784,7 +9910,7 @@ mod plex_endpoint_tests {
         )
         .unwrap();
 
-        let config_path = config_dir.join("mplex.toml");
+        let config_path = config_dir.join("config.toml");
         let (db, machine_identifier) = open_database(&config_path).unwrap();
         migrate_library_model(&db).unwrap();
         let library = ConfigLibrary {
@@ -9818,6 +9944,7 @@ mod plex_endpoint_tests {
             config: Arc::new(Mutex::new(config)),
             config_path: Arc::new(config_path),
             db: Arc::new(Mutex::new(db)),
+            server_name: Arc::new(super::RwLock::new("harbringer".to_owned())),
             machine_identifier: Arc::from(machine_identifier),
             root: Arc::new(media_dir),
             media: Arc::new(vec![media]),
@@ -9847,6 +9974,86 @@ mod plex_endpoint_tests {
             )
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn settings_server_name_is_saved_and_advertised_to_plex_clients() {
+        let fixture = fixture();
+        let saved = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/settings/server-name")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("server_name=Living+Room+Plex"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            saved.headers()[header::LOCATION],
+            "/settings?server_name_saved=true"
+        );
+
+        let identity = send(&fixture.app, Method::GET, "/identity", Body::empty()).await;
+        assert_eq!(identity.status(), StatusCode::OK);
+        let identity_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(identity.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            identity_json["MediaContainer"]["friendlyName"],
+            "Living Room Plex"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_library_removes_its_settings_but_keeps_media_files() {
+        let fixture = fixture();
+        let media_file = fixture.root.join("media/Demo.mkv");
+        assert!(media_file.exists());
+
+        let response = send(
+            &fixture.app,
+            Method::POST,
+            "/settings/libraries/0/delete",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(media_file.exists());
+
+        let sections = send(
+            &fixture.app,
+            Method::GET,
+            "/library/sections",
+            Body::empty(),
+        )
+        .await;
+        let sections_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(sections.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(sections_json["MediaContainer"]["size"], 0);
+    }
+
+    #[test]
+    fn old_config_filename_migrates_to_the_new_name() {
+        let id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let config_dir = std::env::temp_dir().join(format!(
+            "mplex-config-migration-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let old_path = config_dir.join("mplex.toml");
+        std::fs::write(&old_path, "bind = \"127.0.0.1:32400\"\n").unwrap();
+
+        let new_path = super::config_path_in_dir(&config_dir).unwrap();
+        assert_eq!(new_path.file_name().unwrap(), "config.toml");
+        assert!(!old_path.exists());
+        assert!(new_path.exists());
+        std::fs::remove_dir_all(config_dir).unwrap();
     }
 
     #[tokio::test]

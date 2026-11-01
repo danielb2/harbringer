@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Renamed the default configuration file from `config/mplex.toml` to `config/config.toml`, updated `just dev` and documentation, and added automatic migration from the old filename when the new one is absent.
+- Made each library's Settings card collapsible and added a confirmed delete action that removes the library configuration and database folder mappings while leaving media files untouched.
+- Reflection: the generic filename makes it clearer that this is the server's main configuration file, while startup migration preserves existing settings and keeps `state.sqlite` beside it. The local configuration file was renamed. `cargo fmt`, `cargo build`, `git diff --check`, and focused old-config migration and library-deletion tests passed.
+- Redesigned Settings into a responsive page with distinct Plex account, metadata storage, and library cards; added explicit labels, clearer folder and library actions, and accessible add/remove controls.
+- Added a saved Plex server-name override, defaulting to `harbringer`, and use it in Plex client descriptors, server registration, and LAN discovery. Documented the setting and added a focused route regression test.
+- Reflection: the old page put operations in one narrow column and applied the same flex styling to every form, making settings hard to scan. The revised page groups related controls and adapts to small screens. The server name now persists in the existing identity row and is advertised to clients. `cargo fmt`, `cargo build`, `git diff --check`, and the focused server-name regression test passed.
 - Accept external subtitle requests with repeated file extensions, as Plezy appends `.srt` to the advertised stream key and was requesting `/library/streams/{id}.srt.srt`.
 - Reflection: the request trace showed Plezy's subtitle fetch getting 404 immediately after selection, which made the client turn the track back off. Parse the numeric stream ID while accepting repeated recognized subtitle extensions, and cover both ordinary and Plezy URL shapes in route/unit tests. `cargo fmt` and `cargo test` (41 passed) passed; the repeated-extension URL returned 200 from the restarted server.
 - Put successful direct-play decision codes on the Plex play-queue and selected-item metadata responses, using one shared builder, and keep the queue's media and part marked for direct play.
