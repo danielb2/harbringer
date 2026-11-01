@@ -17,6 +17,7 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::Parser;
 use ed25519_dalek::{Signer, SigningKey};
+use isolang::Language;
 use plex_tls::PlexTls;
 use rand_core::{OsRng, RngCore};
 use rusqlite::Connection;
@@ -26,7 +27,10 @@ use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,
     path::{Component, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -130,6 +134,9 @@ struct AppState {
     root: Arc<PathBuf>,
     media: Arc<Vec<Media>>,
     media_info: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    plex_stream_selections: Arc<Mutex<HashMap<u64, PlexStreamSelection>>>,
+    plex_play_queues: Arc<Mutex<HashMap<u64, serde_json::Value>>>,
+    next_plex_play_queue_id: Arc<AtomicU64>,
     token: Arc<str>,
     plex_tls: PlexTls,
 }
@@ -237,6 +244,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         root: Arc::new(root),
         media: Arc::new(media),
         media_info: Arc::new(Mutex::new(HashMap::new())),
+        plex_stream_selections: Arc::new(Mutex::new(HashMap::new())),
+        plex_play_queues: Arc::new(Mutex::new(HashMap::new())),
+        next_plex_play_queue_id: Arc::new(AtomicU64::new(1)),
         token: Arc::from(config.token),
         plex_tls,
     };
@@ -308,6 +318,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/hubs", get(plex_global_hubs))
         .route("/hubs/promoted", get(plex_global_hubs))
         .route("/hubs/sections/:section", get(plex_section_hubs))
+        .route(
+            "/hubs/sections/:section/:hub",
+            get(plex_section_hub),
+        )
         .route("/library/sections", get(plex_sections))
         .route("/library/sections/:section", get(plex_section))
         .route(
@@ -327,6 +341,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/library/parts/:id", put(plex_set_streams))
         .route("/library/parts/:id/*path", get(plex_part_file))
         .route("/library/streams/:stream", get(plex_stream))
+        .route("/playQueues", post(plex_create_play_queue))
+        .route("/playQueues/:id", get(plex_get_play_queue))
         .route("/library/metadata/:id/thumb", get(plex_thumb))
         .route("/library/metadata/:id/art", get(plex_art))
         .route("/media/:id", any(stream_media))
@@ -2444,6 +2460,87 @@ fn tv_episode_info(root: &PathBuf, media: &std::path::Path) -> Option<TvEpisodeI
     })
 }
 
+struct PlexTvShowGroup<'a> {
+    title: String,
+    rating_key: String,
+    episodes: Vec<&'a Media>,
+}
+
+fn tv_show_title(root: &PathBuf, media: &std::path::Path) -> String {
+    let relative = media.strip_prefix(root).unwrap_or(media);
+    let components = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if components.len() > 1 {
+        if parse_tv_season_directory(components[0]).is_some() {
+            return root
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("TV Shows")
+                .to_owned();
+        }
+        return components[0].to_owned();
+    }
+    let stem = media
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Episode");
+    if let Some(marker_start) = (0..stem.len()).find(|index| {
+        stem.is_char_boundary(*index) && parse_tv_episode_marker(&stem[*index..]).is_some()
+    }) {
+        let prefix = stem[..marker_start]
+            .trim_end_matches([' ', '.', '_', '-'])
+            .replace(['.', '_'], " ");
+        if !prefix.trim().is_empty() {
+            return prefix.trim().to_owned();
+        }
+    }
+    root.file_name()
+        .and_then(|value| value.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(stem)
+        .to_owned()
+}
+
+fn plex_tv_show_key(section: usize, title: &str) -> String {
+    format!(
+        "{section}-show-{}",
+        plex_safe_numeric_id(&format!("tv-show:{section}:{}", title.to_lowercase()))
+    )
+}
+
+fn plex_tv_season_key(show_key: &str, season: u32) -> String {
+    format!("{show_key}-season-{season}")
+}
+
+fn plex_tv_show_groups<'a>(
+    section: usize,
+    roots: &[PathBuf],
+    media: impl IntoIterator<Item = &'a Media>,
+) -> Vec<PlexTvShowGroup<'a>> {
+    let mut groups = BTreeMap::<String, PlexTvShowGroup<'a>>::new();
+    for item in media {
+        let Some(root) = roots.iter().find(|root| item.path.starts_with(root)) else {
+            continue;
+        };
+        let title = tv_show_title(root, &item.path);
+        let grouping_key = title.to_lowercase();
+        let group = groups
+            .entry(grouping_key)
+            .or_insert_with(|| PlexTvShowGroup {
+                rating_key: plex_tv_show_key(section, &title),
+                title,
+                episodes: Vec::new(),
+            });
+        group.episodes.push(item);
+    }
+    groups.into_values().collect()
+}
+
 fn parse_tv_season_directory(name: &str) -> Option<u32> {
     let normalized_name = name.trim().replace(['.', '_', '-'], " ");
     let normalized = normalized_name.split_whitespace().collect::<Vec<_>>();
@@ -2626,14 +2723,24 @@ fn technical_duration_ms(info: &serde_json::Value) -> Option<i64> {
         .map(|seconds| (seconds * 1000.0).round() as i64)
 }
 
+const PLEX_MAX_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
+
+fn plex_safe_numeric_id(value: &str) -> u64 {
+    let digest = Sha256::digest(value.as_bytes());
+    let id = u64::from_be_bytes(digest[..8].try_into().unwrap_or_default()) & PLEX_MAX_SAFE_INTEGER;
+    id.max(1)
+}
+
 fn plex_stream_id(media: &Media, path: &std::path::Path) -> u64 {
-    let digest = Sha256::digest(format!("{}:{}", media.id, path.to_string_lossy()));
-    u64::from_be_bytes(digest[..8].try_into().unwrap_or_default()) & i64::MAX as u64
+    plex_safe_numeric_id(&format!("stream:{}:{}", media.id, path.to_string_lossy()))
 }
 
 fn plex_part_id(media: &Media) -> u64 {
-    let digest = Sha256::digest(format!("part:{}", media.id));
-    u64::from_be_bytes(digest[..8].try_into().unwrap_or_default()) & i64::MAX as u64
+    plex_safe_numeric_id(&format!("part:{}", media.id))
+}
+
+fn plex_media_id(media: &Media) -> u64 {
+    plex_safe_numeric_id(&format!("media:{}", media.id))
 }
 
 fn find_media_part<'a>(state: &'a AppState, id: &str) -> Option<&'a Media> {
@@ -2646,21 +2753,53 @@ fn plex_external_subtitle_id(media: &Media, path: &std::path::Path) -> u64 {
 }
 
 fn plex_language(language: &str) -> (&'static str, &'static str) {
-    match language.trim().to_ascii_lowercase().as_str() {
-        "rum" | "ron" | "ro" | "romanian" => ("ro", "Romanian"),
-        "eng" | "en" | "english" => ("en", "English"),
-        "fra" | "fre" | "fr" | "french" => ("fr", "French"),
-        "deu" | "ger" | "de" | "german" => ("de", "German"),
-        "spa" | "es" | "spanish" => ("es", "Spanish"),
-        "ita" | "it" | "italian" => ("it", "Italian"),
-        "por" | "pt" | "portuguese" => ("pt", "Portuguese"),
-        "nld" | "dut" | "nl" | "dutch" => ("nl", "Dutch"),
-        "pol" | "pl" | "polish" => ("pl", "Polish"),
-        "rus" | "ru" | "russian" => ("ru", "Russian"),
-        "jpn" | "ja" | "japanese" => ("ja", "Japanese"),
-        "zho" | "chi" | "zh" | "chinese" => ("zh", "Chinese"),
-        "und" | "unknown" | "" => ("und", "Unknown"),
-        _ => ("und", "Unknown"),
+    let input = language.trim();
+    if input.is_empty()
+        || input.eq_ignore_ascii_case("und")
+        || input.eq_ignore_ascii_case("unknown")
+    {
+        return ("und", "Unknown");
+    }
+    let input_code = input.split(['-', '_']).next().unwrap_or(input);
+    let normalized = input_code.to_ascii_lowercase();
+    let code = iso_639_2_bibliographic_alias(&normalized).unwrap_or(&normalized);
+    let language = Language::from_639_1(code)
+        .or_else(|| Language::from_639_3(code))
+        .or_else(|| Language::from_name(input))
+        .or_else(|| Language::from_name_lowercase(&input.to_ascii_lowercase()));
+    language
+        .map(|language| {
+            (
+                language.to_639_1().unwrap_or_else(|| language.to_639_3()),
+                language.to_name(),
+            )
+        })
+        .unwrap_or(("und", "Unknown"))
+}
+
+fn iso_639_2_bibliographic_alias(code: &str) -> Option<&'static str> {
+    match code {
+        "alb" => Some("sqi"),
+        "arm" => Some("hye"),
+        "baq" => Some("eus"),
+        "bur" => Some("mya"),
+        "chi" => Some("zho"),
+        "cze" => Some("ces"),
+        "dut" => Some("nld"),
+        "fre" => Some("fra"),
+        "geo" => Some("kat"),
+        "ger" => Some("deu"),
+        "gre" => Some("ell"),
+        "ice" => Some("isl"),
+        "mac" => Some("mkd"),
+        "mao" => Some("mri"),
+        "may" => Some("msa"),
+        "per" => Some("fas"),
+        "rum" => Some("ron"),
+        "slo" => Some("slk"),
+        "tib" => Some("bod"),
+        "wel" => Some("cym"),
+        _ => None,
     }
 }
 
@@ -2789,7 +2928,12 @@ async fn add_plex_technical_metadata(
         }
     };
     let external_subtitles = external_subtitle_files(&media.path).await;
-    apply_plex_technical_metadata(item, media, &info, &external_subtitles);
+    let selection = state
+        .plex_stream_selections
+        .lock()
+        .ok()
+        .and_then(|selections| selections.get(&plex_part_id(media)).copied());
+    apply_plex_technical_metadata(item, media, &info, &external_subtitles, selection);
 }
 
 fn apply_plex_technical_metadata(
@@ -2797,6 +2941,7 @@ fn apply_plex_technical_metadata(
     media: &Media,
     info: &serde_json::Value,
     external_subtitles: &[PathBuf],
+    selection: Option<PlexStreamSelection>,
 ) {
     let tracks = technical_tracks(info);
     let duration = technical_duration_ms(&info)
@@ -2869,7 +3014,13 @@ fn apply_plex_technical_metadata(
             "default": technical_text(track, "Default") == Some("Yes"),
             "selected": match stream_type {
                 1 => selected_video == Some(track_id),
-                2 => selected_audio == Some(track_id),
+                2 => selection
+                    .and_then(|selection| selection.audio_stream_id)
+                    .map(|selected| selected == track_id + 1)
+                    .unwrap_or(selected_audio == Some(track_id)),
+                3 => selection
+                    .and_then(|selection| selection.subtitle_stream_id)
+                    .is_some_and(|selected| selected == track_id + 1),
                 _ => false,
             },
             "forced": technical_text(track, "Forced") == Some("Yes")
@@ -2926,12 +3077,18 @@ fn apply_plex_technical_metadata(
             "displayTitle": label,
             "title": label,
             "external": true,
-            "key": format!("/library/streams/{id}.vtt"),
+            "key": format!(
+                "/library/streams/{id}.{}",
+                subtitle_path.extension().and_then(|value| value.to_str()).unwrap_or("srt").to_ascii_lowercase()
+            ),
             "default": false,
+            "selected": selection
+                .and_then(|selection| selection.subtitle_stream_id)
+                .is_some_and(|selected| selected == id),
             "forced": false
         }));
     }
-    media_json["id"] = serde_json::json!(plex_part_id(media));
+    media_json["id"] = serde_json::json!(plex_media_id(media));
     let part = media_json
         .get_mut("Part")
         .and_then(serde_json::Value::as_array_mut)
@@ -5029,6 +5186,16 @@ fn xml_escape(value: &str) -> String {
 }
 
 async fn log_not_found(State(state): State<AppState>, req: Request<Body>) -> Response {
+    if req.uri().path() == "/video/:/transcode/universal/decision" {
+        let query = req
+            .uri()
+            .query()
+            .and_then(|query| serde_urlencoded::from_str::<BTreeMap<String, String>>(query).ok());
+        let Some(query) = query else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        return plex_playback_decision(State(state), Query(query)).await;
+    }
     if req.uri().path() == "/photo/:/transcode" {
         let query = req
             .uri()
@@ -5721,7 +5888,7 @@ async fn plex_global_hubs(
     State(state): State<AppState>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
-    plex_hubs_response(&state, None, query.get("count")).await
+    plex_hubs_response(&state, None, query.get("count"), None).await
 }
 
 fn plex_notification_response(upgrade: WebSocketUpgrade) -> Response {
@@ -5769,13 +5936,25 @@ async fn plex_section_hubs(
     Path(section): Path<usize>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
-    plex_hubs_response(&state, Some(section), query.get("count")).await
+    plex_hubs_response(&state, Some(section), query.get("count"), None).await
+}
+
+async fn plex_section_hub(
+    State(state): State<AppState>,
+    Path((section, hub)): Path<(usize, String)>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    if !matches!(hub.as_str(), "recommended" | "recentlyAdded") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    plex_hubs_response(&state, Some(section), query.get("count"), Some(&hub)).await
 }
 
 async fn plex_hubs_response(
     state: &AppState,
     only_section: Option<usize>,
     count: Option<&String>,
+    only_hub: Option<&str>,
 ) -> Response {
     let count = count
         .and_then(|value| value.parse::<usize>().ok())
@@ -5836,47 +6015,60 @@ async fn plex_hubs_response(
         } else {
             &recently_added
         };
-        hubs.push(
-            plex_recommendation_hub(
-                state,
-                section,
-                library,
-                recommendation,
-                &metadata,
-                count,
-                rated_count > 0,
-                true,
-            )
-            .await,
-        );
-        if rated_count > 0 {
-            hubs.push(
-                plex_recommendation_hub(
-                    state,
-                    section,
-                    library,
-                    &recently_added,
-                    &metadata,
-                    count,
-                    false,
-                    false,
-                )
-                .await,
-            );
+        for category in plex_hub_categories(rated_count > 0, only_hub) {
+            if category == "recommended" {
+                hubs.push(
+                    plex_recommendation_hub(
+                        state,
+                        section,
+                        library,
+                        recommendation,
+                        &metadata,
+                        count,
+                        rated_count > 0,
+                        true,
+                    )
+                    .await,
+                );
+            } else {
+                hubs.push(
+                    plex_recommendation_hub(
+                        state,
+                        section,
+                        library,
+                        &recently_added,
+                        &metadata,
+                        count,
+                        false,
+                        false,
+                    )
+                    .await,
+                );
+            }
         }
     }
 
     let mut container = serde_json::json!({"size": hubs.len(), "Hub": hubs});
+    container["allowSync"] = serde_json::json!(false);
+    container["identifier"] = serde_json::json!("com.plexapp.plugins.library");
     if let Some(section) = only_section {
         let library = &libraries[section - 1];
         container["librarySectionID"] = serde_json::json!(section);
         container["librarySectionTitle"] = serde_json::json!(library.name);
         container["librarySectionUUID"] =
             serde_json::json!(plex_library_uuid(&state.machine_identifier, section));
-    } else {
-        container["identifier"] = serde_json::json!("com.plexapp.plugins.library");
     }
     plex_json(serde_json::json!({"MediaContainer": container}))
+}
+
+fn plex_hub_categories(has_rated_items: bool, requested: Option<&str>) -> Vec<&'static str> {
+    match requested {
+        Some("recommended") => vec!["recommended"],
+        Some("recentlyAdded") => vec!["recentlyAdded"],
+        Some(_) => Vec::new(),
+        None if has_rated_items => vec!["recommended", "recentlyAdded"],
+        None => vec!["recommended"],
+    }
 }
 
 async fn plex_recommendation_hub(
@@ -5910,9 +6102,40 @@ async fn plex_recommendation_hub(
             "addedAt:desc",
         ),
     };
+    let tv_shows = (library.kind == "tv").then(|| {
+        plex_tv_show_groups(
+            section,
+            &library.folders,
+            state
+                .media
+                .iter()
+                .filter(|media| media_in_library(media, library)),
+        )
+    });
     let mut items = Vec::new();
     for item in media.iter().take(count) {
         let mut video = plex_video_json(item, section, library, metadata.get(&item.id));
+        if let Some(show) = tv_shows.as_ref().and_then(|shows| {
+            shows
+                .iter()
+                .find(|show| show.episodes.iter().any(|episode| episode.id == item.id))
+        }) {
+            let episode = library
+                .folders
+                .iter()
+                .find(|root| item.path.starts_with(root))
+                .and_then(|root| tv_episode_info(root, &item.path));
+            let season = episode.as_ref().map(|episode| episode.season).unwrap_or(1);
+            let episode_number = episode.as_ref().map(|episode| episode.episode).unwrap_or(1);
+            plex_tv_episode_parents(&mut video, show, season, episode_number);
+            if let Some(show_title) = metadata
+                .get(&item.id)
+                .and_then(|metadata| metadata.get("name"))
+                .and_then(serde_json::Value::as_str)
+            {
+                video["grandparentTitle"] = serde_json::json!(show_title);
+            }
+        }
         add_plex_technical_metadata(state, &mut video, item).await;
         items.push(video);
     }
@@ -6217,6 +6440,9 @@ async fn plex_all(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    if library.kind == "tv" {
+        return plex_tv_all(&s, section, library, &headers, &query, &uri).await;
+    }
     let mut media = s
         .media
         .iter()
@@ -6288,17 +6514,10 @@ async fn plex_all(
         metadata.push(video);
     }
     let count = metadata.len();
-    let mut response = plex_json(serde_json::json!({
-        "MediaContainer": {
-            "size": count,
-            "totalSize": total,
-            "offset": offset,
-            "librarySectionID": section,
-            "librarySectionTitle": library.name,
-            "librarySectionUUID": uuid,
-            "Metadata": metadata
-        }
-    }));
+    let mut container =
+        plex_library_media_container(&library, section, &uuid, count, offset, total);
+    container["Metadata"] = serde_json::json!(metadata);
+    let mut response = plex_json(serde_json::json!({"MediaContainer": container}));
     response.headers_mut().insert(
         "X-Plex-Container-Start",
         HeaderValue::from_str(&offset.to_string()).expect("numeric header value"),
@@ -6308,6 +6527,238 @@ async fn plex_all(
         HeaderValue::from_str(&total.to_string()).expect("numeric header value"),
     );
     response
+}
+
+async fn plex_tv_all(
+    state: &AppState,
+    section: usize,
+    library: ConfigLibrary,
+    headers: &HeaderMap,
+    query: &BTreeMap<String, String>,
+    uri: &Uri,
+) -> Response {
+    let metadata = plex_section_metadata(state, section);
+    let mut shows = plex_tv_show_groups(
+        section,
+        &library.folders,
+        state
+            .media
+            .iter()
+            .filter(|media| media_in_library(media, &library)),
+    );
+    let requested_sort = query.get("sort").map(String::as_str).unwrap_or_default();
+    let descending = requested_sort.ends_with(":desc");
+    shows.sort_by(|left, right| {
+        let ordering = left.title.to_lowercase().cmp(&right.title.to_lowercase());
+        if descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    });
+    let total = shows.len();
+    let (offset, end) = plex_container_page(headers, uri)
+        .map(|(requested_offset, requested_size)| {
+            let offset = requested_offset.min(total);
+            (offset, offset.saturating_add(requested_size).min(total))
+        })
+        .unwrap_or((0, total));
+    let items = shows
+        .iter()
+        .skip(offset)
+        .take(end.saturating_sub(offset))
+        .map(|show| plex_tv_show_json(show, section, &library, &metadata))
+        .collect::<Vec<_>>();
+    let mut container = plex_library_media_container(
+        &library,
+        section,
+        &plex_library_uuid(&state.machine_identifier, section),
+        items.len(),
+        offset,
+        total,
+    );
+    container["Metadata"] = serde_json::json!(items);
+    let mut response = plex_json(serde_json::json!({"MediaContainer": container}));
+    response.headers_mut().insert(
+        "X-Plex-Container-Start",
+        HeaderValue::from_str(&offset.to_string()).expect("numeric header value"),
+    );
+    response.headers_mut().insert(
+        "X-Plex-Container-Total-Size",
+        HeaderValue::from_str(&total.to_string()).expect("numeric header value"),
+    );
+    response
+}
+
+fn plex_tv_season_groups<'a>(
+    show: &PlexTvShowGroup<'a>,
+    roots: &[PathBuf],
+) -> BTreeMap<u32, Vec<&'a Media>> {
+    let mut seasons = BTreeMap::<u32, Vec<&Media>>::new();
+    for media in &show.episodes {
+        let season = roots
+            .iter()
+            .find(|root| media.path.starts_with(root))
+            .and_then(|root| tv_episode_info(root, &media.path))
+            .map(|episode| episode.season)
+            .unwrap_or(1);
+        seasons.entry(season).or_default().push(media);
+    }
+    for episodes in seasons.values_mut() {
+        episodes.sort_by_key(|media| {
+            roots
+                .iter()
+                .find(|root| media.path.starts_with(root))
+                .and_then(|root| tv_episode_info(root, &media.path))
+                .map(|episode| (episode.episode, media.title.to_lowercase()))
+                .unwrap_or((u32::MAX, media.title.to_lowercase()))
+        });
+    }
+    seasons
+}
+
+fn plex_tv_show_json(
+    show: &PlexTvShowGroup<'_>,
+    section: usize,
+    library: &ConfigLibrary,
+    metadata: &HashMap<String, serde_json::Value>,
+) -> serde_json::Value {
+    let Some(representative) = show.episodes.first() else {
+        return serde_json::Value::Null;
+    };
+    let item_metadata = metadata.get(&representative.id);
+    let mut item = plex_video_json(representative, section, library, item_metadata);
+    let title = item_metadata
+        .and_then(|metadata| metadata.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&show.title);
+    item["ratingKey"] = serde_json::json!(show.rating_key);
+    item["key"] = serde_json::json!(format!("/library/metadata/{}/children", show.rating_key));
+    item["type"] = serde_json::json!("show");
+    item["title"] = serde_json::json!(title);
+    item["titleSort"] = serde_json::json!(title.to_lowercase());
+    item["originalTitle"] = serde_json::json!(title);
+    item["childCount"] = serde_json::json!(plex_tv_season_groups(show, &library.folders).len());
+    item["leafCount"] = serde_json::json!(show.episodes.len());
+    if let Some(tmdb_id) = item_metadata
+        .and_then(|metadata| metadata.get("id"))
+        .and_then(serde_json::Value::as_i64)
+    {
+        item["guid"] = serde_json::json!(format!("tmdb://tv/{tmdb_id}"));
+    }
+    if let Some(object) = item.as_object_mut() {
+        object.remove("Media");
+        object.remove("duration");
+        object.remove("viewOffset");
+        object.remove("viewCount");
+        object.remove("lastViewedAt");
+        object.remove("parentIndex");
+        object.remove("parentTitle");
+        object.remove("grandparentTitle");
+    }
+    item
+}
+
+fn plex_tv_season_json(
+    show: &PlexTvShowGroup<'_>,
+    season: u32,
+    section: usize,
+    library: &ConfigLibrary,
+    metadata: &HashMap<String, serde_json::Value>,
+    episode_count: usize,
+) -> serde_json::Value {
+    let season_key = plex_tv_season_key(&show.rating_key, season);
+    let representative = show
+        .episodes
+        .iter()
+        .find(|media| {
+            library
+                .folders
+                .iter()
+                .find(|root| media.path.starts_with(root))
+                .and_then(|root| tv_episode_info(root, &media.path))
+                .map(|episode| episode.season == season)
+                .unwrap_or(season == 1)
+        })
+        .or_else(|| show.episodes.first());
+    let mut item = representative
+        .map(|media| plex_video_json(media, section, library, metadata.get(&media.id)))
+        .unwrap_or_else(|| serde_json::json!({}));
+    let title = if season == 0 {
+        "Specials".to_owned()
+    } else {
+        format!("Season {season}")
+    };
+    item["ratingKey"] = serde_json::json!(season_key);
+    item["key"] = serde_json::json!(format!("/library/metadata/{season_key}/children"));
+    item["type"] = serde_json::json!("season");
+    item["title"] = serde_json::json!(title);
+    item["titleSort"] = serde_json::json!(title.to_lowercase());
+    item["index"] = serde_json::json!(season);
+    item["parentRatingKey"] = serde_json::json!(show.rating_key);
+    item["parentKey"] =
+        serde_json::json!(format!("/library/metadata/{}/children", show.rating_key));
+    item["parentTitle"] = serde_json::json!(show.title);
+    item["parentIndex"] = serde_json::json!(season);
+    item["childCount"] = serde_json::json!(episode_count);
+    item["leafCount"] = serde_json::json!(episode_count);
+    if let Some(object) = item.as_object_mut() {
+        object.remove("Media");
+        object.remove("duration");
+        object.remove("viewOffset");
+        object.remove("viewCount");
+        object.remove("lastViewedAt");
+        object.remove("grandparentTitle");
+        object.remove("grandparentRatingKey");
+    }
+    item
+}
+
+fn plex_tv_episode_parents(
+    item: &mut serde_json::Value,
+    show: &PlexTvShowGroup<'_>,
+    season: u32,
+    episode: u32,
+) {
+    let season_key = plex_tv_season_key(&show.rating_key, season);
+    item["grandparentRatingKey"] = serde_json::json!(show.rating_key);
+    item["grandparentKey"] =
+        serde_json::json!(format!("/library/metadata/{}/children", show.rating_key));
+    item["grandparentTitle"] = serde_json::json!(show.title);
+    item["parentRatingKey"] = serde_json::json!(season_key);
+    item["parentKey"] = serde_json::json!(format!("/library/metadata/{season_key}/children"));
+    item["parentTitle"] = serde_json::json!(if season == 0 {
+        "Specials".to_owned()
+    } else {
+        format!("Season {season}")
+    });
+    item["parentIndex"] = serde_json::json!(season);
+    item["index"] = serde_json::json!(episode);
+}
+
+fn plex_library_media_container(
+    library: &ConfigLibrary,
+    section: usize,
+    library_uuid: &str,
+    size: usize,
+    offset: usize,
+    total_size: usize,
+) -> serde_json::Value {
+    let view_group = plex_kind(&library.kind);
+    serde_json::json!({
+        "size": size,
+        "totalSize": total_size,
+        "offset": offset,
+        "allowSync": false,
+        "identifier": "com.plexapp.plugins.library",
+        "content": "secondary",
+        "librarySectionID": section,
+        "librarySectionTitle": library.name,
+        "librarySectionUUID": library_uuid,
+        "title1": library.name,
+        "title2": format!("All {}", library.name),
+        "viewGroup": view_group
+    })
 }
 
 fn plex_container_page(headers: &HeaderMap, uri: &Uri) -> Option<(usize, usize)> {
@@ -6325,7 +6776,166 @@ fn plex_container_page(headers: &HeaderMap, uri: &Uri) -> Option<(usize, usize)>
     ))
 }
 
-async fn plex_item(State(s): State<AppState>, Path(id): Path<String>) -> Response {
+fn plex_paged_children<T: Clone>(items: &[T], headers: &HeaderMap, uri: &Uri) -> (usize, Vec<T>) {
+    let total = items.len();
+    let (offset, size) = plex_container_page(headers, uri).unwrap_or((0, 20));
+    let offset = offset.min(total);
+    let end = offset.saturating_add(size).min(total);
+    (offset, items[offset..end].to_vec())
+}
+
+fn plex_children_json(
+    items: Vec<serde_json::Value>,
+    total: usize,
+    offset: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "size": items.len(),
+        "totalSize": total,
+        "offset": offset,
+        "Metadata": items
+    })
+}
+
+fn find_plex_tv_location<'a>(
+    state: &'a AppState,
+    rating_key: &str,
+) -> Option<(usize, ConfigLibrary, PlexTvShowGroup<'a>, Option<u32>)> {
+    let libraries = state.config.lock().ok()?.libraries.clone();
+    for (index, library) in libraries.into_iter().enumerate() {
+        if library.kind != "tv" {
+            continue;
+        }
+        let section = index + 1;
+        let shows = plex_tv_show_groups(
+            section,
+            &library.folders,
+            state
+                .media
+                .iter()
+                .filter(|media| media_in_library(media, &library)),
+        );
+        for show in shows {
+            if show.rating_key == rating_key {
+                return Some((section, library, show, None));
+            }
+            for season in plex_tv_season_groups(&show, &library.folders)
+                .keys()
+                .copied()
+            {
+                if plex_tv_season_key(&show.rating_key, season) == rating_key {
+                    return Some((section, library, show, Some(season)));
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn plex_item(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let wants_children = uri.path().ends_with("/children");
+    let include_children = plex_query_value(&uri, "includeChildren") == Some("1");
+    if let Some((section, library, mut show, season)) = find_plex_tv_location(&s, &id) {
+        let metadata = plex_section_metadata(&s, section);
+        if let Some(show_title) = show
+            .episodes
+            .first()
+            .and_then(|episode| metadata.get(&episode.id))
+            .and_then(|metadata| metadata.get("name"))
+            .and_then(serde_json::Value::as_str)
+        {
+            show.title = show_title.to_owned();
+        }
+        let uuid = plex_library_uuid(&s.machine_identifier, section);
+        if let Some(season) = season {
+            let season_episodes = plex_tv_season_groups(&show, &library.folders)
+                .remove(&season)
+                .unwrap_or_default();
+            let mut episodes = Vec::with_capacity(season_episodes.len());
+            for (index, media) in season_episodes.iter().enumerate() {
+                let episode_number = library
+                    .folders
+                    .iter()
+                    .find(|root| media.path.starts_with(root))
+                    .and_then(|root| tv_episode_info(root, &media.path))
+                    .map(|episode| episode.episode)
+                    .unwrap_or(index as u32 + 1);
+                let mut item = plex_video_json(media, section, &library, metadata.get(&media.id));
+                plex_tv_episode_parents(&mut item, &show, season, episode_number);
+                add_plex_technical_metadata(&s, &mut item, media).await;
+                episodes.push(item);
+            }
+            if wants_children {
+                let (offset, episodes) = plex_paged_children(&episodes, &headers, &uri);
+                let mut container = plex_library_media_container(
+                    &library,
+                    section,
+                    &uuid,
+                    episodes.len(),
+                    offset,
+                    season_episodes.len(),
+                );
+                container["Metadata"] = serde_json::json!(episodes);
+                container["offset"] = serde_json::json!(offset);
+                container["title2"] = serde_json::json!(if season == 0 {
+                    "Specials".to_owned()
+                } else {
+                    format!("Season {season}")
+                });
+                return plex_json(serde_json::json!({"MediaContainer": container}));
+            }
+            let mut item = plex_tv_season_json(
+                &show,
+                season,
+                section,
+                &library,
+                &metadata,
+                season_episodes.len(),
+            );
+            if include_children {
+                let (offset, episodes) = plex_paged_children(&episodes, &headers, &uri);
+                item["Children"] = plex_children_json(episodes, season_episodes.len(), offset);
+            }
+            let mut container = plex_library_media_container(&library, section, &uuid, 1, 0, 1);
+            container["Metadata"] = serde_json::json!([item]);
+            return plex_json(serde_json::json!({"MediaContainer": container}));
+        }
+        let seasons = plex_tv_season_groups(&show, &library.folders);
+        let season_items = seasons
+            .iter()
+            .map(|(season, episodes)| {
+                plex_tv_season_json(&show, *season, section, &library, &metadata, episodes.len())
+            })
+            .collect::<Vec<_>>();
+        if wants_children {
+            let (offset, items) = plex_paged_children(&season_items, &headers, &uri);
+            let mut container = plex_library_media_container(
+                &library,
+                section,
+                &uuid,
+                items.len(),
+                offset,
+                season_items.len(),
+            );
+            container["Metadata"] = serde_json::json!(items);
+            container["offset"] = serde_json::json!(offset);
+            container["title2"] = serde_json::json!(show.title);
+            return plex_json(serde_json::json!({"MediaContainer": container}));
+        }
+        let mut item = plex_tv_show_json(&show, section, &library, &metadata);
+        if include_children {
+            let (offset, items) = plex_paged_children(&season_items, &headers, &uri);
+            item["Children"] = plex_children_json(items, season_items.len(), offset);
+        }
+        let mut container = plex_library_media_container(&library, section, &uuid, 1, 0, 1);
+        container["Metadata"] = serde_json::json!([item]);
+        return plex_json(serde_json::json!({"MediaContainer": container}));
+    }
     let Some(media) = find_media(&s, &id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -6334,14 +6944,53 @@ async fn plex_item(State(s): State<AppState>, Path(id): Path<String>) -> Respons
     };
     let metadata_by_id = plex_section_metadata(&s, section);
     let mut video = plex_video_json(media, section, &library, metadata_by_id.get(&media.id));
-    add_plex_technical_metadata(&s, &mut video, media).await;
-    plex_json(serde_json::json!({
-        "MediaContainer": {
-            "size": 1,
-            "librarySectionID": section,
-            "librarySectionTitle": library.name,
-            "Metadata": [video]
+    if library.kind == "tv" {
+        let groups = plex_tv_show_groups(
+            section,
+            &library.folders,
+            s.media
+                .iter()
+                .filter(|candidate| media_in_library(candidate, &library)),
+        );
+        if let Some(show) = groups
+            .into_iter()
+            .find(|show| show.episodes.iter().any(|episode| episode.id == media.id))
+        {
+            let episode_info = library
+                .folders
+                .iter()
+                .find(|root| media.path.starts_with(root))
+                .and_then(|root| tv_episode_info(root, &media.path));
+            let season = episode_info
+                .as_ref()
+                .map(|episode| episode.season)
+                .unwrap_or(1);
+            let episode = episode_info
+                .as_ref()
+                .map(|episode| episode.episode)
+                .unwrap_or(1);
+            plex_tv_episode_parents(&mut video, &show, season, episode);
+            if let Some(show_title) = metadata_by_id
+                .get(&media.id)
+                .and_then(|metadata| metadata.get("name"))
+                .and_then(serde_json::Value::as_str)
+            {
+                video["grandparentTitle"] = serde_json::json!(show_title);
+            }
         }
+    }
+    add_plex_technical_metadata(&s, &mut video, media).await;
+    let mut container = plex_library_media_container(
+        &library,
+        section,
+        &plex_library_uuid(&s.machine_identifier, section),
+        1,
+        0,
+        1,
+    );
+    container["Metadata"] = serde_json::json!([video]);
+    plex_json(serde_json::json!({
+        "MediaContainer": container
     }))
 }
 
@@ -6349,10 +6998,194 @@ async fn plex_part(
     State(s): State<AppState>,
     Path((id, _part)): Path<(String, String)>,
 ) -> Response {
-    plex_item(State(s), Path(id)).await
+    plex_item(
+        State(s),
+        Path(id),
+        HeaderMap::new(),
+        Uri::from_static("/library/metadata/item"),
+    )
+    .await
 }
 
-#[derive(Deserialize, Default)]
+fn plex_rating_key_from_source(source: &str) -> Option<String> {
+    let source = source.split('?').next().unwrap_or(source);
+    let id = source
+        .rsplit_once("/library/metadata/")?
+        .1
+        .split('/')
+        .next()?;
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+fn plex_play_queue_response(
+    id: u64,
+    source_uri: &str,
+    items: Vec<serde_json::Value>,
+    selected_index: usize,
+) -> serde_json::Value {
+    let selected = items.get(selected_index);
+    let selected_item_id = selected
+        .and_then(|item| item.get("playQueueItemID"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let selected_metadata_item_id = selected
+        .and_then(|item| item.get("Media"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|media| media.first())
+        .and_then(|media| media.get("id"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    serde_json::json!({
+        "MediaContainer": {
+            "playQueueID": id,
+            "playQueueSelectedItemID": selected_item_id,
+            "playQueueSelectedItemOffset": 0,
+            "playQueueSelectedMetadataItemID": selected_metadata_item_id,
+            "playQueueShuffled": false,
+            "playQueueSourceURI": source_uri,
+            "playQueueTotalCount": items.len(),
+            "playQueueVersion": 1,
+            "size": items.len(),
+            "Metadata": items
+        }
+    })
+}
+
+async fn plex_create_play_queue(
+    State(state): State<AppState>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let Some(source_uri) = query.get("uri") else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if !matches!(query.get("type").map(String::as_str), Some("video")) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let rating_key = query
+        .get("key")
+        .and_then(|key| plex_rating_key_from_source(key))
+        .or_else(|| plex_rating_key_from_source(source_uri));
+    let Some(rating_key) = rating_key else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(media) = find_media(&state, &rating_key) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some((section, library)) = media_library(&state, media) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let metadata = plex_section_metadata(&state, section);
+    let mut item = plex_video_json(media, section, &library, metadata.get(&media.id));
+    add_plex_technical_metadata(&state, &mut item, media).await;
+    let queue_id = state
+        .next_plex_play_queue_id
+        .fetch_add(1, Ordering::Relaxed);
+    let queue_item_id = plex_safe_numeric_id(&format!("play-queue:{queue_id}:{}", media.id));
+    item["playQueueItemID"] = serde_json::json!(queue_item_id);
+    let response = plex_play_queue_response(queue_id, source_uri, vec![item], 0);
+    if let Ok(mut queues) = state.plex_play_queues.lock() {
+        queues.insert(queue_id, response.clone());
+    }
+    plex_json(response)
+}
+
+async fn plex_get_play_queue(State(state): State<AppState>, Path(id): Path<u64>) -> Response {
+    state
+        .plex_play_queues
+        .lock()
+        .ok()
+        .and_then(|queues| queues.get(&id).cloned())
+        .map(plex_json)
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
+}
+
+async fn plex_playback_decision(
+    State(state): State<AppState>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let media_id = query
+        .get("path")
+        .or_else(|| query.get("key"))
+        .and_then(|path| plex_query_media_id(None, Some(path)))
+        .or_else(|| query.get("ratingKey").cloned())
+        .or_else(|| query.get("mediaId").cloned());
+    let Some(media_id) = media_id else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(media) = find_media(&state, &media_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some((section, library)) = media_library(&state, media) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let metadata_by_id = plex_section_metadata(&state, section);
+    let mut video = plex_video_json(media, section, &library, metadata_by_id.get(&media.id));
+    add_plex_technical_metadata(&state, &mut video, media).await;
+    plex_mark_direct_play(&mut video);
+    let library_uuid = plex_library_uuid(&state.machine_identifier, section);
+    plex_json(plex_direct_play_decision_response(
+        video,
+        section,
+        &library,
+        &library_uuid,
+    ))
+}
+
+fn plex_direct_play_decision_response(
+    video: serde_json::Value,
+    section: usize,
+    library: &ConfigLibrary,
+    library_uuid: &str,
+) -> serde_json::Value {
+    let mut container = plex_library_media_container(library, section, library_uuid, 1, 0, 1);
+    container["directPlayDecisionCode"] = serde_json::json!(1000);
+    container["directPlayDecisionText"] = serde_json::json!("Direct play OK.");
+    container["generalDecisionCode"] = serde_json::json!(1000);
+    container["generalDecisionText"] = serde_json::json!("Direct play OK.");
+    container["transcodeDecisionCode"] = serde_json::json!(1000);
+    container["transcodeDecisionText"] = serde_json::json!("Direct play OK.");
+    container["Metadata"] = serde_json::json!([video]);
+    serde_json::json!({"MediaContainer": container})
+}
+
+fn plex_mark_direct_play(video: &mut serde_json::Value) {
+    let Some(media) = video
+        .get_mut("Media")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|media| media.first_mut())
+    else {
+        return;
+    };
+    media["decision"] = serde_json::json!("directplay");
+    media["selected"] = serde_json::json!(true);
+    media["protocol"] = serde_json::json!("http");
+    if let Some(part) = media
+        .get_mut("Part")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|parts| parts.first_mut())
+    {
+        part["decision"] = serde_json::json!("directplay");
+        part["selected"] = serde_json::json!(true);
+        part["protocol"] = serde_json::json!("http");
+        if let Some(streams) = part
+            .get_mut("Stream")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for stream in streams {
+                stream["decision"] = serde_json::json!("directplay");
+                if stream.get("streamType").and_then(serde_json::Value::as_i64) == Some(3) {
+                    continue;
+                }
+                if stream.get("selected").is_none() {
+                    stream["selected"] = serde_json::json!(true);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Default)]
 struct PlexStreamSelection {
     #[serde(rename = "audioStreamID")]
     audio_stream_id: Option<u64>,
@@ -6365,10 +7198,58 @@ async fn plex_set_streams(
     Path(id): Path<String>,
     Query(selection): Query<PlexStreamSelection>,
 ) -> Response {
-    if find_media_part(&state, &id).is_none() {
+    let Some(media) = find_media_part(&state, &id) else {
         return StatusCode::NOT_FOUND.into_response();
+    };
+    if selection.audio_stream_id.is_none() && selection.subtitle_stream_id.is_none() {
+        return plex_json(serde_json::json!({"MediaContainer": {"size": 0}}));
     }
-    let _selection = (selection.audio_stream_id, selection.subtitle_stream_id);
+    let info = state
+        .media_info
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&media.id).cloned());
+    let info = match info {
+        Some(info) => info,
+        None => match inspect_media(&media.path).await {
+            Some(info) => {
+                if let Ok(mut cache) = state.media_info.lock() {
+                    cache.insert(media.id.clone(), info.clone());
+                }
+                info
+            }
+            None => serde_json::json!({"media": {"track": []}}),
+        },
+    };
+    let subtitle_paths = external_subtitle_files(&media.path).await;
+    let audio_valid = selection.audio_stream_id.is_none_or(|selected| {
+        technical_tracks(&info).iter().any(|track| {
+            technical_text(track, "@type") == Some("Audio")
+                && technical_track_id(track).saturating_add(1) == selected
+        })
+    });
+    let subtitle_valid = selection.subtitle_stream_id.is_none_or(|selected| {
+        selected == 0
+            || technical_tracks(&info).iter().any(|track| {
+                technical_text(track, "@type") == Some("Text")
+                    && technical_track_id(track).saturating_add(1) == selected
+            })
+            || subtitle_paths
+                .iter()
+                .any(|path| plex_external_subtitle_id(media, path) == selected)
+    });
+    if !audio_valid || !subtitle_valid {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Ok(mut selections) = state.plex_stream_selections.lock() {
+        let current = selections.entry(plex_part_id(media)).or_default();
+        if selection.audio_stream_id.is_some() {
+            current.audio_stream_id = selection.audio_stream_id;
+        }
+        if selection.subtitle_stream_id.is_some() {
+            current.subtitle_stream_id = selection.subtitle_stream_id;
+        }
+    }
     plex_json(serde_json::json!({"MediaContainer": {"size": 0}}))
 }
 
@@ -6388,14 +7269,18 @@ async fn plex_part_file(
     stream_file(media, method, headers).await
 }
 
-async fn plex_stream(State(state): State<AppState>, Path(stream): Path<String>) -> Response {
+async fn plex_stream(
+    State(state): State<AppState>,
+    Path(stream): Path<String>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
     let Some((stream_id, extension)) = stream.rsplit_once('.') else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Ok(stream_id) = stream_id.parse::<u64>() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if extension != "vtt" {
+    if !matches!(extension, "srt" | "ass" | "vtt") {
         return StatusCode::NOT_FOUND.into_response();
     }
     for media in state.media.iter() {
@@ -6411,16 +7296,87 @@ async fn plex_stream(State(state): State<AppState>, Path(stream): Path<String>) 
                 .and_then(|value| value.to_str())
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            let vtt = match subtitle_extension.as_str() {
-                "vtt" => contents,
-                "srt" => srt_to_vtt(&contents),
-                "ass" => ass_to_vtt(&contents),
-                _ => return StatusCode::NOT_FOUND.into_response(),
+            let requested_format = query
+                .get("format")
+                .map(|format| format.to_ascii_lowercase())
+                .unwrap_or_else(|| extension.to_owned());
+            let Some((content_type, contents)) =
+                external_subtitle_content(&contents, &subtitle_extension, &requested_format)
+            else {
+                return StatusCode::NOT_FOUND.into_response();
             };
-            return ([(header::CONTENT_TYPE, "text/vtt; charset=utf-8")], vtt).into_response();
+            return ([(header::CONTENT_TYPE, content_type)], contents).into_response();
         }
     }
     StatusCode::NOT_FOUND.into_response()
+}
+
+fn external_subtitle_content(
+    contents: &str,
+    source_format: &str,
+    requested_format: &str,
+) -> Option<(&'static str, String)> {
+    match requested_format {
+        "srt" => Some((
+            "text/srt; charset=utf-8",
+            match source_format {
+                "srt" => contents.to_owned(),
+                "vtt" => vtt_to_srt(contents),
+                "ass" => vtt_to_srt(&ass_to_vtt(contents)),
+                _ => return None,
+            },
+        )),
+        "vtt" | "webvtt" => Some((
+            "text/vtt; charset=utf-8",
+            match source_format {
+                "srt" => srt_to_vtt(contents),
+                "ass" => ass_to_vtt(contents),
+                "vtt" => contents.to_owned(),
+                _ => return None,
+            },
+        )),
+        "ass" | "ssa" if source_format == "ass" => {
+            Some(("text/x-ssa; charset=utf-8", contents.to_owned()))
+        }
+        _ => None,
+    }
+}
+
+fn vtt_to_srt(contents: &str) -> String {
+    let mut output = String::new();
+    let mut cue = 0;
+    for block in contents.replace("\r\n", "\n").split("\n\n") {
+        let mut lines = block.lines();
+        let first = lines.next().unwrap_or_default();
+        if first.trim_start().starts_with("WEBVTT") {
+            continue;
+        }
+        let (identifier, timing) = if first.contains(" --> ") {
+            (None, first)
+        } else {
+            let second = lines.next().unwrap_or_default();
+            (Some(first), second)
+        };
+        if !timing.contains(" --> ") {
+            continue;
+        }
+        cue += 1;
+        output.push_str(
+            identifier
+                .map(str::to_owned)
+                .unwrap_or_else(|| cue.to_string())
+                .as_str(),
+        );
+        output.push('\n');
+        output.push_str(&timing.replace('.', ","));
+        output.push('\n');
+        for line in lines {
+            output.push_str(line);
+            output.push('\n');
+        }
+        output.push('\n');
+    }
+    output
 }
 
 async fn plex_thumb(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -6588,12 +7544,16 @@ fn plex_video_json(
     library: &ConfigLibrary,
     metadata: Option<&serde_json::Value>,
 ) -> serde_json::Value {
-    let media_type = plex_kind(&library.kind);
+    let media_type = if library.kind == "tv" {
+        "episode"
+    } else {
+        plex_kind(&library.kind)
+    };
     let playback_duration = metadata
         .and_then(|metadata| metadata.get("mplex_duration"))
         .and_then(serde_json::Value::as_i64)
         .unwrap_or_default();
-    let title = if media_type == "show" {
+    let title = if media_type == "episode" {
         tv_episode_display_name(&media.title)
     } else {
         media.title.clone()
@@ -6607,6 +7567,7 @@ fn plex_video_json(
         "thumb": format!("/library/metadata/{}/thumb", media.id),
         "art": format!("/library/metadata/{}/art", media.id),
         "librarySectionID": section,
+        "librarySectionKey": format!("/library/sections/{section}"),
         "librarySectionTitle": library.name,
         "originalTitle": media.title,
         "titleSort": media.title.to_lowercase(),
@@ -6617,7 +7578,7 @@ fn plex_video_json(
         "viewCount": 0,
         "lastViewedAt": 0,
         "Media": [{
-            "id": plex_part_id(media),
+            "id": plex_media_id(media),
             "duration": playback_duration,
             "container": media.container,
             "protocol": "http",
@@ -6660,12 +7621,12 @@ fn plex_video_json(
         item["year"] = serde_json::json!(year);
     }
     if let Some(metadata) = metadata {
-        let metadata_title = if media_type == "show" {
-            metadata
+        let metadata_title = match media_type {
+            "show" => metadata.get("name").and_then(serde_json::Value::as_str),
+            "episode" => metadata
                 .get("mplex_episode_title")
-                .and_then(serde_json::Value::as_str)
-        } else {
-            metadata.get("title").and_then(serde_json::Value::as_str)
+                .and_then(serde_json::Value::as_str),
+            _ => metadata.get("title").and_then(serde_json::Value::as_str),
         };
         if let Some(title) = metadata_title.filter(|title| !title.is_empty()) {
             item["title"] = serde_json::json!(title);
@@ -6677,10 +7638,10 @@ fn plex_video_json(
         {
             item["summary"] = serde_json::json!(summary);
         }
-        let date = if media_type == "show" {
-            metadata.get("first_air_date")
-        } else {
-            metadata.get("release_date")
+        let date = match media_type {
+            "show" => metadata.get("first_air_date"),
+            "movie" => metadata.get("release_date"),
+            _ => None,
         }
         .and_then(serde_json::Value::as_str)
         .filter(|date| !date.is_empty());
@@ -6718,19 +7679,30 @@ fn plex_video_json(
                     .into_iter()
                     .flatten()
                     .filter_map(serde_json::Value::as_i64)
-                    .filter_map(|id| tmdb_genre_name(media_type, id))
+                    .filter_map(|id| {
+                        tmdb_genre_name(
+                            if media_type == "episode" {
+                                "show"
+                            } else {
+                                media_type
+                            },
+                            id,
+                        )
+                    })
                     .map(|name| serde_json::json!({"tag": name}))
                     .collect()
             });
         if !genre_names.is_empty() {
             item["Genre"] = serde_json::json!(genre_names);
         }
-        if let Some(tmdb_id) = metadata.get("id").and_then(serde_json::Value::as_i64) {
-            item["guid"] = serde_json::json!(format!(
-                "tmdb://{}/{}",
-                if media_type == "show" { "tv" } else { "movie" },
-                tmdb_id
-            ));
+        if media_type != "episode" {
+            if let Some(tmdb_id) = metadata.get("id").and_then(serde_json::Value::as_i64) {
+                item["guid"] = serde_json::json!(format!(
+                    "tmdb://{}/{}",
+                    if media_type == "show" { "tv" } else { "movie" },
+                    tmdb_id
+                ));
+            }
         }
         if media_type == "show" {
             if let Some(show_title) = metadata.get("name").and_then(serde_json::Value::as_str) {
@@ -6994,12 +7966,18 @@ fn html(value: &str) -> String {
 mod tests {
     use super::{
         apply_plex_technical_metadata, ass_to_vtt, clean_relative_path, contains_hidden_component,
-        external_subtitle_language_token, extract_xml_token, html, parse_range,
-        parse_sidecar_metadata, parse_tv_episode_marker, parse_tv_season_directory, plex_codec,
-        plex_connectivity_url, plex_device_announce_query, plex_device_announce_url, plex_language,
-        plex_part_id, plex_photo_source, plex_presence_url, plex_publish_urls, plex_query_media_id,
-        plex_track_label, plex_video_json, plex_video_resolution, sidebar_nav_with_settings,
-        srt_to_vtt, technical_duration_ms, technical_tracks, ConfigLibrary, Media, PathBuf,
+        external_subtitle_content, external_subtitle_language_token, extract_xml_token, html,
+        parse_range, parse_sidecar_metadata, parse_tv_episode_marker, parse_tv_season_directory,
+        plex_children_json, plex_codec, plex_connectivity_url, plex_device_announce_query,
+        plex_device_announce_url, plex_direct_play_decision_response, plex_external_subtitle_id,
+        plex_hub_categories, plex_language, plex_library_media_container, plex_mark_direct_play,
+        plex_media_id, plex_paged_children, plex_part_id, plex_photo_source,
+        plex_play_queue_response, plex_presence_url, plex_publish_urls, plex_query_media_id,
+        plex_rating_key_from_source, plex_safe_numeric_id, plex_stream_id, plex_track_label,
+        plex_tv_season_groups, plex_tv_season_json, plex_tv_show_groups, plex_tv_show_json,
+        plex_video_json, plex_video_resolution, sidebar_nav_with_settings, srt_to_vtt,
+        technical_duration_ms, technical_tracks, tv_show_title, vtt_to_srt, ConfigLibrary,
+        HeaderMap, HeaderValue, Media, PathBuf, PlexStreamSelection, Uri,
     };
     #[test]
     fn plex_playback_ids_resolve_rating_keys_and_metadata_paths() {
@@ -7012,6 +7990,18 @@ mod tests {
             Some("2-42".to_owned())
         );
         assert_eq!(plex_query_media_id(None, None), None);
+    }
+    #[test]
+    fn plex_section_hubs_include_explicit_recently_added_even_without_ratings() {
+        assert_eq!(
+            plex_hub_categories(false, Some("recentlyAdded")),
+            vec!["recentlyAdded"]
+        );
+        assert_eq!(plex_hub_categories(false, None), vec!["recommended"]);
+        assert_eq!(
+            plex_hub_categories(true, None),
+            vec!["recommended", "recentlyAdded"]
+        );
     }
     #[test]
     fn plex_photo_sources_resolve_thumb_and_art_routes() {
@@ -7067,14 +8057,21 @@ mod tests {
         ]}});
         let subtitle = PathBuf::from("/media/Film.rum.srt");
         let mut item = plex_video_json(&media, 1, &library, None);
-        apply_plex_technical_metadata(&mut item, &media, &info, &[subtitle]);
+        apply_plex_technical_metadata(&mut item, &media, &info, &[subtitle], None);
 
         assert_eq!(item["duration"], 120_500);
+        assert!(item.get("id").is_none());
+        assert_eq!(item["ratingKey"], "1-7");
+        assert_eq!(item["librarySectionKey"], "/library/sections/1");
         assert_eq!(item["Media"][0]["videoResolution"], "720");
         assert_eq!(item["Media"][0]["videoCodec"], "h264");
         assert_eq!(item["Media"][0]["audioCodec"], "ac3");
         assert_eq!(item["Media"][0]["audioChannels"], 6);
+        assert_eq!(item["Media"][0]["id"], plex_media_id(&media));
+        assert_ne!(item["Media"][0]["id"], item["Media"][0]["Part"][0]["id"]);
+        assert!(plex_media_id(&media) <= (1_u64 << 53) - 1);
         assert_eq!(item["Media"][0]["Part"][0]["id"], plex_part_id(&media));
+        assert!(plex_part_id(&media) <= (1_u64 << 53) - 1);
         assert!(item["Media"][0]["Part"][0]["key"]
             .as_str()
             .unwrap()
@@ -7086,19 +8083,95 @@ mod tests {
         assert_eq!(streams[1]["selected"], true);
         assert_eq!(streams[2]["language"], "ro");
         assert_eq!(streams[3]["displayTitle"], "Romanian (SRT External)");
+        assert!(streams[3]["id"].as_u64().unwrap() <= (1_u64 << 53) - 1);
         assert!(streams[3]["key"]
             .as_str()
             .unwrap()
             .starts_with("/library/streams/"));
+        assert!(streams[3]["key"].as_str().unwrap().ends_with(".srt"));
+
+        let subtitle_id = plex_external_subtitle_id(&media, &PathBuf::from("/media/Film.rum.srt"));
+        apply_plex_technical_metadata(
+            &mut item,
+            &media,
+            &info,
+            &[PathBuf::from("/media/Film.rum.srt")],
+            Some(PlexStreamSelection {
+                audio_stream_id: Some(2),
+                subtitle_stream_id: Some(subtitle_id),
+            }),
+        );
+        let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
+        assert_eq!(streams[1]["selected"], true);
+        assert_eq!(streams[2]["selected"], false);
+        assert_eq!(streams[3]["selected"], true);
+
+        let container = plex_library_media_container(&library, 1, "library-uuid", 1, 0, 1);
+        assert_eq!(container["identifier"], "com.plexapp.plugins.library");
+        assert_eq!(container["librarySectionUUID"], "library-uuid");
+        assert_eq!(container["viewGroup"], "movie");
+
+        plex_mark_direct_play(&mut item);
+        let decision = plex_direct_play_decision_response(item, 1, &library, "library-uuid");
+        let decision_container = &decision["MediaContainer"];
+        assert_eq!(decision_container["directPlayDecisionCode"], 1000);
+        assert_eq!(decision_container["generalDecisionText"], "Direct play OK.");
+        assert_eq!(
+            decision_container["Metadata"][0]["Media"][0]["Part"][0]["decision"],
+            "directplay"
+        );
+    }
+
+    #[test]
+    fn plex_numeric_stream_ids_are_javascript_safe_stable_and_distinct() {
+        let first = Media {
+            id: "1-7".to_owned(),
+            title: "Film".to_owned(),
+            path: PathBuf::from("/media/Film.mkv"),
+            size: 9_000_000,
+            container: "mkv".to_owned(),
+            mime: "video/x-matroska".to_owned(),
+        };
+        let subtitle = PathBuf::from("/media/Film.en.srt");
+        let id = plex_external_subtitle_id(&first, &subtitle);
+        assert!((1..=(1_u64 << 53) - 1).contains(&id));
+        assert_eq!(id, plex_stream_id(&first, &subtitle));
+        assert_eq!(id, plex_external_subtitle_id(&first, &subtitle));
+        assert_ne!(id, plex_part_id(&first));
+        assert_ne!(id, plex_safe_numeric_id("stream:1-7:/media/Film.fr.srt"));
     }
 
     #[test]
     fn romanian_iso_language_codes_are_friendly_and_normalized() {
         assert_eq!(plex_language("rum"), ("ro", "Romanian"));
         assert_eq!(plex_language("ron"), ("ro", "Romanian"));
+        assert_eq!(plex_language("deu"), ("de", "German"));
+        assert_eq!(plex_language("fry"), ("fy", "Western Frisian"));
+        assert_eq!(plex_language("Northern Sami"), ("se", "Northern Sami"));
+        assert_eq!(plex_language("en-US"), ("en", "English"));
+        assert_eq!(plex_language("vi"), ("vi", "Vietnamese"));
+        assert_eq!(plex_language("vie"), ("vi", "Vietnamese"));
+        assert_eq!(plex_language("se"), ("se", "Northern Sami"));
+        assert_eq!(plex_language("sme"), ("se", "Northern Sami"));
+        assert_eq!(plex_language("sv"), ("sv", "Swedish"));
+        assert_eq!(plex_language("Zaza"), ("zza", "Zaza"));
         assert_eq!(
             external_subtitle_language_token("Film", "Film.RUM.default"),
             "RUM"
+        );
+        assert_eq!(
+            super::external_subtitle_label(
+                std::path::Path::new("Film.mkv"),
+                std::path::Path::new("Film.vi.srt")
+            ),
+            "Vietnamese (SRT External)"
+        );
+        assert_eq!(
+            super::external_subtitle_label(
+                std::path::Path::new("Film.mkv"),
+                std::path::Path::new("Film.se.srt")
+            ),
+            "Northern Sami (SRT External)"
         );
     }
 
@@ -7195,6 +8268,16 @@ mod tests {
         let vtt = srt_to_vtt("1\n00:00:01,250 --> 00:00:03,000\nHello\n");
         assert!(vtt.starts_with("WEBVTT\n\n"));
         assert!(vtt.contains("00:00:01.250 --> 00:00:03.000\nHello"));
+        let (content_type, served) =
+            external_subtitle_content("1\n00:00:01,250 --> 00:00:03,000\nHello\n", "srt", "srt")
+                .unwrap();
+        assert_eq!(content_type, "text/srt; charset=utf-8");
+        assert!(served.starts_with("1\n00:00:01,250"));
+        let (_, served_vtt) =
+            external_subtitle_content("1\n00:00:01,250 --> 00:00:03,000\nHello\n", "srt", "vtt")
+                .unwrap();
+        assert!(served_vtt.starts_with("WEBVTT\n\n"));
+        assert!(vtt_to_srt(&served_vtt).contains("00:00:01,250 --> 00:00:03,000"));
     }
     #[test]
     fn converts_ass_dialogue_to_webvtt_and_removes_tags() {
@@ -7244,5 +8327,110 @@ mod tests {
         assert_eq!(parsed.0, Some(2));
         assert_eq!(parsed.1, (18, Some(19)));
         assert_eq!(&"Show Name - s02e18-e19 - Finale"[parsed.2..], " - Finale");
+    }
+
+    #[test]
+    fn plex_tv_library_groups_episode_files_under_show_and_season_items() {
+        let root = PathBuf::from("/media/tv");
+        let media = vec![
+            Media {
+                id: "3-1".to_owned(),
+                title: "Example Show s01e01 Pilot.mkv".to_owned(),
+                path: root.join("Example Show/Season 01/Example.Show.s01e01.Pilot.mkv"),
+                size: 100,
+                container: "mkv".to_owned(),
+                mime: "video/x-matroska".to_owned(),
+            },
+            Media {
+                id: "3-2".to_owned(),
+                title: "Example Show s01e02 Arrival.mkv".to_owned(),
+                path: root.join("Example Show/Season 01/Example.Show.s01e02.Arrival.mkv"),
+                size: 100,
+                container: "mkv".to_owned(),
+                mime: "video/x-matroska".to_owned(),
+            },
+        ];
+        let roots = vec![root.clone()];
+        assert_eq!(tv_show_title(&root, &media[0].path), "Example Show");
+        let mut shows = plex_tv_show_groups(3, &roots, media.iter());
+        assert_eq!(shows.len(), 1);
+        let show = shows.pop().unwrap();
+        assert_eq!(show.title, "Example Show");
+        assert_eq!(show.episodes.len(), 2);
+        let seasons = plex_tv_season_groups(&show, &roots);
+        assert_eq!(seasons.len(), 1);
+        assert_eq!(seasons[&1].len(), 2);
+
+        let library = ConfigLibrary {
+            name: "TV".to_owned(),
+            kind: "tv".to_owned(),
+            folders: roots,
+            show_recently_added: true,
+            show_continue_watching: true,
+        };
+        let metadata = std::collections::HashMap::new();
+        let show_item = plex_tv_show_json(&show, 3, &library, &metadata);
+        assert_eq!(show_item["type"], "show");
+        assert_eq!(show_item["childCount"], 1);
+        assert_eq!(show_item["leafCount"], 2);
+        assert!(show_item.get("Media").is_none());
+
+        let season_item = plex_tv_season_json(&show, 1, 3, &library, &metadata, 2);
+        assert_eq!(season_item["type"], "season");
+        assert_eq!(season_item["parentRatingKey"], show.rating_key);
+        assert_eq!(season_item["childCount"], 2);
+        let episode_item = plex_video_json(&media[0], 3, &library, None);
+        assert_eq!(episode_item["type"], "episode");
+        assert_eq!(episode_item["title"], "Episode 1 · Pilot");
+    }
+
+    #[test]
+    fn plex_tv_children_include_nested_items_and_default_to_first_page() {
+        let values = (0..25)
+            .map(|index| serde_json::json!({"index": index}))
+            .collect::<Vec<_>>();
+        let uri = Uri::from_static("/library/metadata/show/children");
+        let (offset, page) = plex_paged_children(&values, &HeaderMap::new(), &uri);
+        assert_eq!(offset, 0);
+        assert_eq!(page.len(), 20);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Plex-Container-Start", HeaderValue::from_static("20"));
+        headers.insert("X-Plex-Container-Size", HeaderValue::from_static("10"));
+        let (offset, page) = plex_paged_children(&values, &headers, &uri);
+        assert_eq!(offset, 20);
+        assert_eq!(page.len(), 5);
+        assert_eq!(plex_children_json(page, 25, offset)["totalSize"], 25);
+    }
+
+    #[test]
+    fn plex_play_queue_source_and_response_follow_pms_shape() {
+        assert_eq!(
+            plex_rating_key_from_source("/library/metadata/2-42"),
+            Some("2-42".to_owned())
+        );
+        assert_eq!(
+            plex_rating_key_from_source(
+                "library://library-id/item//library/metadata/2-42?X-Plex-Token=test"
+            ),
+            Some("2-42".to_owned())
+        );
+        let item = serde_json::json!({
+            "ratingKey": "2-42",
+            "playQueueItemID": 73,
+            "Media": [{"id": 51}]
+        });
+        let queue = plex_play_queue_response(
+            9,
+            "library://library-id/item/%2Flibrary%2Fmetadata%2F2-42",
+            vec![item],
+            0,
+        );
+        assert_eq!(queue["MediaContainer"]["playQueueID"], 9);
+        assert_eq!(queue["MediaContainer"]["playQueueSelectedItemID"], 73);
+        assert_eq!(
+            queue["MediaContainer"]["playQueueSelectedMetadataItemID"],
+            51
+        );
+        assert_eq!(queue["MediaContainer"]["playQueueTotalCount"], 1);
     }
 }

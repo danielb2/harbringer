@@ -1,68 +1,84 @@
-# harbringer replacement checklist
+# mplex: Plex Media Server replacement roadmap
 
-This is the working checklist for making harbringer a drop-in Plex Media Server replacement. Items are checked only when implemented and validated against the relevant client behavior.
+The product goal is a full replacement for Plex Media Server that keeps working with Plex clients. Plex compatibility is not complete when a server merely answers a few familiar paths: responses, playback negotiation, streaming, account/discovery behavior, and client-visible controls must work end to end. The public PMS OpenAPI specification at <https://developer.plex.tv/pms/> is the compatibility inventory. JSON is the response format for the Plex API.
 
-## Proven MVP pieces
+An item is complete only after its behavior is implemented and checked against a real client or a reproducible protocol-level test. A route returning HTTP 200, an empty placeholder, or a successful playback decision does not by itself prove the feature works.
 
-- [x] Serve local video files with GET, HEAD, byte ranges, correct lengths, and seeking.
-- [x] Share one media model between Plex and Jellyfin adapters.
-- [x] Expose basic Plex identity, library, metadata, and direct-play routes.
-- [x] Expose basic Jellyfin login, library, playback-info, and direct-play routes.
-- [x] Scan supported local video files and refresh the browser view after filesystem changes.
-- [x] Provide a local browser client for inspecting and directly playing files.
-- [x] Return a Plex `MediaContainer` at `/` to Plex clients while retaining the browser UI for normal requests.
-- [x] Expose each configured library as a separate Plex section and filter section inventory by library.
+## P0: visible Play button and working playback
 
-## Drop-in Plex replacement
+- [ ] Show an enabled Play button for playable library items in the official Plex web and macOS clients.
+- [ ] Press Play and start the actual media file through the advertised Plex part URL.
+- [ ] Verify pause, resume, seeking, playback completion, and saved Resume position in the official clients.
+- [ ] Run the same playback checks in Plezy and record each client's requests and responses.
+- [x] Serve the media part with HTTP range support; an existing media part returned `206 Partial Content` and 1,024 bytes during development verification.
+- [x] Return a direct-play decision from `/video/:/transcode/universal/decision` for an item path.
+- [ ] Confirm that the official client receives and displays the Play control after refreshing Harbringer's item metadata. Keep this open until observed in the client.
 
-- [x] Persist a stable harbringer server identity and initial server configuration.
-- [x] Add Plex.tv account sign-in/PIN authentication in the web UI.
-- [x] Exchange a Plex claim token and persist the resulting server account credentials.
-- [x] Register/claim harbringer with Plex.tv and publish its local connection in the account resource list.
-- [ ] Support the connection details Plex clients need for local and remote discovery.
-- [ ] Validate connection and library browsing with an actual Plezy build.
-- [ ] Validate connection and playback with official Plex clients.
+The decision endpoint and ranged file route are necessary pieces, not proof that the Play button issue is resolved. Do not move this gate to complete based only on server-side curl checks.
 
-## Local library
+## Compatibility completion gates
 
-- [x] Create a persistent database and record the currently scanned media files.
-- [x] Store user-editable server and library configuration in a portable TOML file.
-- [x] Support multiple configured libraries with live filesystem updates and per-library browsing.
-- [x] Recursively scan library paths without blocking direct playback.
-- [ ] Assign stable media identities independent of sorted scan order.
-- [ ] Detect additions, removals, and renames reliably.
-- [x] Match local files to movies, shows, seasons, and episodes.
-- [x] Scrape and cache metadata for matched media, including TV season and episode metadata.
-- [x] Download/cache movie, show, and TV-season artwork and expose it through the web client.
+### 1. PMS API coverage inventory
 
-## Users and playback state
+- [ ] Build a path-and-method coverage matrix from the current official PMS OpenAPI specification.
+- [ ] For every documented operation, record its request parameters, authentication requirements, response schema, current implementation, and client validation status.
+- [ ] Implement every operation needed for full PMS replacement with its documented behavior; do not count empty response placeholders as implemented features.
+- [ ] Make every advertised server capability consistent with actual behavior. Unsupported calls must not be silently represented as successful functionality.
+- [ ] Add regression coverage for each implemented API operation and each client-discovered undocumented call that is required for compatibility.
 
-- [ ] Persist Plex users and server/account identity.
-- [x] Store watch position and watched state in SQLite for the current web user.
-- [x] Implement web playback start, progress, stop, and resume behavior.
-- [ ] Persist playback sessions without making direct streaming depend on them.
+### 2. Discovery, account, and connections
 
-## Plex compatibility depth
+- [x] Persist a stable server identity and server configuration.
+- [x] Link a Plex.tv account, claim/register the server, and publish local connections.
+- [x] Advertise LAN connections and load a Plex-trusted `plex.direct` certificate when available.
+- [ ] Validate local discovery, secure connection, reconnection, and server selection in official Plex clients on macOS and web.
+- [ ] Validate remote connection behavior through Plex.tv, including failure and recovery cases.
 
-- [ ] Add library search, hubs, filtering, and sorting expected by clients.
-- [ ] Return accurate duration, codecs, streams, audio, and subtitle information.
-- [ ] Support Plex artwork, thumbnails, and background image requests across all client routes.
-- [ ] Implement playback negotiation and capability responses.
-- [ ] Verify direct play, seeking, resume, and multi-client behavior.
+### 3. Library and metadata behavior
 
-## Future media sources
+- [x] Expose configured libraries as Plex sections and return media metadata with technical tracks and matched metadata.
+- [x] Support current title/date/rating sorts, basic recommendations, Plex artwork URLs, external subtitles, and section pagination.
+- [ ] Implement and validate search, all client-used hubs, filters, sorting options, collections, playlists, and library navigation.
+- [ ] Replace scan-order IDs with stable media and part IDs; handle moves, renames, removals, rescans, and library updates reliably.
+- [ ] Complete artwork behavior, including missing-art fallback frames and requested image sizes/formats, using portable in-process Rust libraries.
+- [ ] Verify movie and TV show/season/episode hierarchies and metadata in each official client.
 
-- [ ] Define a seekable media-source interface separate from local files.
-- [ ] Allow Weaver/Scryer-provided sources to drive buffering and seeking.
-- [ ] Add an embeddable Rust library API.
-- [ ] Keep acquisition, Usenet, repair, and discovery outside the harbringer core.
+### 4. Playback negotiation and media delivery
 
-## Later client compatibility
+- [ ] Complete the P0 Play-button and playback gate before expanding to lower-priority endpoints.
+- [ ] Inventory and implement decision, direct-play, direct-stream, subtitle, session, and playback-control operations from the PMS specification.
+- [ ] Support the media formats and client profiles required for replacement parity, with cross-platform Rust libraries; do not depend on installed `ffmpeg` or `ffprobe` commands.
+- [ ] Implement transcoding, remuxing, and subtitle conversion as required by those profiles, or make an explicit product decision if a feature cannot be supported.
+- [ ] Verify multiple simultaneous clients, bandwidth/network modes, alternate audio and subtitle selection, seeking, and interruption recovery.
 
-- [ ] Add Audiobookshelf-compatible APIs so Audiobookshelf clients can browse, play, and track audiobooks served by harbringer.
-- [ ] Study BookOrbit’s book-library and metadata-provider implementation as a reference for audiobook matching and cover-art retrieval; evaluate reuse or interoperability before adding a dependency.
+### 5. Users, sessions, events, and administration
+
+- [ ] Implement persistent Plex users, permissions, server preferences, and account responses with documented semantics.
+- [x] Persist watch progress for the current local user from Plex timeline/scrobble and browser playback requests.
+- [ ] Return actual active playback sessions and activities rather than empty containers.
+- [ ] Publish library and playback events over Plex notification connections, and validate reconnect behavior.
+- [ ] Audit and implement server management, library management, device, diagnostics, and other client-used operations in the official API inventory.
+
+### 6. Release validation
+
+- [ ] Maintain a client matrix for Plex Web, Plex for macOS, Plezy, and the other supported official Plex clients, with browse, detail, Play, seek, resume, subtitles, audio selection, artwork, and connection checks.
+- [ ] Run the protocol/API suite and client smoke checks on every release candidate.
+- [ ] Publish a compatibility report that lists verified behavior and remaining gaps; do not describe the product as a Plex replacement while a P0 gate is open.
+
+## Shared media engine and additional adapters
+
+- [ ] Keep Plex and Jellyfin protocol adapters separate from shared media and file serving.
+- [ ] Define a seekable media-source interface for local files and future Weaver/Scryer sources.
+- [ ] Add an embeddable Rust library API after the server compatibility gates are met.
+- [ ] Add Audiobookshelf-compatible APIs and assess BookOrbit references after the Plex replacement path is on track.
 
 ## Gap log
+
+### 2026-11-01
+
+- The direct-play decision endpoint returned JSON HTTP 200 with a successful decision, and its advertised file part returned HTTP 206 for a byte-range request on the existing port 32400 dev server. The official Plex client still shows no Play button; that remains the P0 blocker and has not been verified away.
+- Live item metadata exposed part and external subtitle stream IDs above JavaScript's exact integer limit (2^53−1). These IDs now use deterministic safe-range numbers; on the reloaded `just dev` server, the revised part URL returned HTTP 206 and an advertised external subtitle URL returned HTTP 200 as WebVTT. The official client still needs a metadata refresh and Play-button check.
+- Replaced the sparse “drop-in” checklist with an operation-by-operation PMS API inventory, implementation gates, and an official-client compatibility matrix. JSON remains the Plex API response format.
 
 ### 2026-10-31
 

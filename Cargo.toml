@@ -11,6 +11,7 @@ clap = { version = "4.5", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 get_if_addrs = "0.5"
+isolang = { version = "2.4", features = ["lowercase_names"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
 rcgen = { version = "0.13", features = ["aws_lc_rs"] }
