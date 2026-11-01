@@ -1,4 +1,4 @@
-dev token="development-token" bind="0.0.0.0:8096":
+dev token="development-token" bind="0.0.0.0:32400":
     @mkdir -p config
     @touch config/mplex.toml
     @cargo watch --version >/dev/null 2>&1 || cargo install cargo-watch

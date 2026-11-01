@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- Implement `/library/sections/{id}/collections` as a valid JSON empty-list response for configured libraries, eliminating the Plezy 404 while collections remain unsupported data. Add documented `X-Plex-Container-Start` / `X-Plex-Container-Size` paging to section inventory, including response headers and total count.
+- Remove provider pivots and feature claims for unsupported hubs, playlists, search, transcoding, and other missing routes; align server capability flags with direct-play-only and single-user behavior.
+- Add Plezy's section sort and filter discovery endpoints. Advertise title sorting and apply it to section inventory; return an empty filter directory because Harbringer does not yet provide filterable metadata.
+- Restore the default Home and per-library recommendation hubs. Build Recommended and Recently Added shelves from configured media, rank matched items using TMDB ratings, and include persisted TMDB title, overview, release date, rating, genres, and GUID fields in Plex metadata.
+- Read Plex metadata from existing `.mplex/info.toml` sidecars when the database has no per-item metadata record, and include filename-derived title/year/timestamps for unmatched media.
+- Accept Plex notification WebSocket handshakes at the observed notifications path, keep the connection open, and answer ping frames.
+- Reflection: Plezy's default view needs promoted/global and per-section hubs, and sidecar metadata existed even though the SQLite metadata columns were empty. The Plex responses now reuse that stored TMDB payload instead of dropping it; unmatched files still carry useful filename and date fields. The notification path was being treated as a literal route parameter by Axum, so it is now handled by the fallback's exact-path WebSocket upgrade. `cargo fmt`, `cargo check`, and `git diff --check` passed. Live checks returned metadata-rich recommendations and `/library/metadata` details, and the notification request upgraded with HTTP 101.
+- Reflection: Plezy's requests exposed missing handlers for collections, sorts, and filters. The API docs define the collection and discovery response shapes plus the container pagination contract; implementing each read endpoint prevents 404s, while only advertising behavior the server can perform avoids misleading clients. `cargo fmt`, `cargo check`, and `git diff --check` passed. Live requests returned JSON 200 for collections, sorts, and filters; a paged descending-title `/all` request returned the expected items, total size, and Plex pagination headers.
+- Return JSON from all Plex HTTP API endpoints regardless of the client's `Accept` header, following Plex's recommendation for new clients.
+- Use the same stable library UUID in section listings and media inventory responses.
+- Reflection: Plezy requests JSON and only parses JSON responses, so returning JSON throughout the Plex HTTP API addresses its library-content failure and a likely official-client compatibility issue. `cargo fmt`, `cargo check`, and live HTTP checks with both JSON and XML `Accept` headers passed; official-client behavior still needs confirmation.
+- Changed the default harbringer HTTP port to Plex's standard TCP `32400`, including the `just dev` target, startup callback fallback, and setup documentation.
+- Refresh the published Plex connection URLs at startup using the stored server token, so port or LAN-address changes do not leave Plex clients pointed at a stale endpoint.
+- Expanded Plex GDM discovery responses from UDP `32414` to the documented server discovery ports `32410`, `32412`, `32413`, and `32414`, allowing stricter Plex clients to discover harbringer on the LAN.
+- Moved the runtime SQLite cache from hidden `config/.mplex/state.sqlite` to explicit `config/state.sqlite`; `.mplex` remains reserved for portable media-folder sidecars.
+- Match Rex's captured Plex Media Server announce request: use `PUT https://servers.plex.tv/devices/{machineIdentifier}`, send the server token as the `X-Plex-Token` query parameter, publish LAN HTTP URIs, and run the device announce after `servers.xml` registration.
+- Treat Plex's observed HTTP 422 response from `servers.xml` as a completed registration attempt and continue with the device announce.
+- Verified Plex.tv now lists Harbringer's LAN `plex.direct` HTTPS connection as `local=true` alongside its public connection (`local=false`); the LAN TLS `/identity` request returned HTTP 200 with the expected machine identifier.
+- Keep Rex's measured Plex pubsub event stream open and issue a connectivity check after subscription, so Plex.tv reports the running server as present; the live resource now reports `presence=true`.
+- Use a stable 40-character hexadecimal Plex machine identifier, migrating the earlier `mplex-*` identifier format to the identifier shape used by Plex Media Server and Ether.
+- Corrected `/media/providers` to return a Plex `MediaProvider` and `Feature` hierarchy instead of incorrectly returning the legacy `/library/sections` response; the official Plex client guide identifies `/media/providers` as the library discovery entry point.
+- Added Plex `Accept` negotiation for the identity, root, and media-provider handshake responses: JSON is returned when requested, while XML remains available for legacy clients.
+- Added request-level Plex diagnostics so the exact client handshake path, requested format, and product are visible during compatibility testing.
+- Matched Plex provider directory metadata more closely by emitting stable UUID-shaped library identifiers, language, scanner, agent, and refreshing fields.
+- Matched the provider JSON container's PMS capability metadata more closely to Ether's working response, including library/server capability flags.
+- Matched Ether's provider feature set and directory ordering by adding the Home directory, pivots/features for matching, playlists, play queues, collections, timelines, and search, plus the remaining capability fields.
+- Added Ether's `X-Plex-Protocol: 1.0` response header and aligned provider capability flags, scan timestamps, and playlist/collection pivots with its working JSON fixture.
+- Redacted query strings from Plex request logs and logged HTTP response status and latency so failed authentication can be distinguished from a rejected provider payload without exposing credentials.
+- Detect Plex root requests identified by `X-Plex-*` query parameters as Plex requests; Plex for Mac places these values in the URL query, and was receiving the built-in browser UI from `/` instead of Plex server metadata.
+- Allow Plex root and `/media/providers` requests through without a token during compatibility bring-up, so Plex clients can receive server and library data while token validation is unfinished.
+- Matched the Plex `/` response shape to Ether's fixture: 23 API route directories appear at the root, while media libraries remain under `/media/providers`.
+- Marked Plex device connection publications with `X-Plex-Provides: server`, matching Ether's server identity headers so Plex.tv can publish the device as a server and provide its access credentials to clients.
+- Reflection: using Plex's conventional port removes an avoidable connection variable for clients such as Plezy while preserving `--bind` for alternate ports; `cargo test`, formatting, and diff checks were run.
+- Reflection: the earlier `/api/v2/devices` call to `plex.tv` was not the PMS announce captured by Rex, so Plex retained only the public address from `servers.xml`; Harbringer also omitted Rex's pubsub stream, leaving `presence=false`. The announce now publishes the LAN URI, and the account lookup, long-lived event stream, and connectivity check produce `local=true` and `presence=true` in Plex.tv. The trusted LAN TLS identity endpoint answers successfully; `cargo test` (17 tests) and `git diff --check` passed. Full Plex client playback remains unverified.
+
 - Adopted `harbringer` as the working product name and updated the startup splash accordingly.
 - Embedded the `harbringer` thin ASCII startup banner directly so startup does not depend on external `figlet` or `lolcat` installations.
 - Added Plex `thumb` and `art` metadata routes backed by cached `.mplex/cover.jpg` and `.mplex/banner.jpg` artwork, and advertised those routes in Plex media entries.
@@ -17,6 +52,8 @@
 - Added the remaining server identity field Ether sends (`X-Plex-Device: MacOSX`) during Plex claim, publication, and registration.
 - Consolidated Plex PIN creation and polling onto harbringer’s server client identifier so the authorization record is not created as a separate `harbringer-auth` client.
 - Replaced legacy Plex claim PIN authentication with the documented Ed25519 JWK/device-JWT flow: harbringer persists a device keypair, creates a JWK-backed strong PIN, and polls with a signed device JWT.
+- Published every detected non-loopback IPv4 LAN address to Plex instead of selecting one default-route address, and logged the exact advertised URLs for connection diagnosis.
+- Added Plex GDM LAN discovery on UDP 32414 with multicast HELLO announcements on 239.0.0.250:32413, matching Ether’s discovery behavior while advertising harbringer’s configured HTTP port.
 - Added a persistent `Reconnect to Plex.tv` button alongside disconnect/revoke in Settings.
 - Added Plex.tv PIN linking from Settings. harbringer can open the Plex linking page, poll authorization, and persist the returned account token; it does not mark the server claimed until claim exchange is implemented.
 - Reordered the Plex replacement checklist so Plex.tv sign-in, claim exchange, and resource publication precede Plezy and official-client validation.

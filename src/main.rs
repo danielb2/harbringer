@@ -1,7 +1,14 @@
+#![recursion_limit = "256"]
+
+mod plex_tls;
+
 use axum::{
     body::Body,
-    extract::{Form, Path, Query, RawForm, State},
-    http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode},
+    extract::{
+        ws::{Message, WebSocketUpgrade},
+        Form, FromRequestParts, Path, Query, RawForm, State,
+    },
+    http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{any, get, post},
     Json, Router,
@@ -9,15 +16,17 @@ use axum::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::Parser;
 use ed25519_dalek::{Signer, SigningKey};
-use rand_core::OsRng;
+use plex_tls::PlexTls;
+use rand_core::{OsRng, RngCore};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     net::SocketAddr,
     path::{Component, PathBuf},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     fs::File,
@@ -25,7 +34,7 @@ use tokio::{
 };
 use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{info, warn, Span};
 
 const USER_ID: &str = "mplex-user";
 const POSTER_CARD_MIN_WIDTH: usize = 140;
@@ -69,7 +78,7 @@ struct ConfigLibrary {
 }
 
 fn default_bind() -> String {
-    "0.0.0.0:8096".to_owned()
+    "0.0.0.0:32400".to_owned()
 }
 fn default_token() -> String {
     "development-token".to_owned()
@@ -81,6 +90,37 @@ fn default_true() -> bool {
     true
 }
 
+fn plex_machine_identifier(seed: &str) -> String {
+    let digest = Sha256::digest(seed.as_bytes());
+    digest[..20]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn plex_library_uuid(machine_identifier: &str, section: usize) -> String {
+    let digest = Sha256::digest(format!("{machine_identifier}:library:{section}").as_bytes());
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        digest[0],
+        digest[1],
+        digest[2],
+        digest[3],
+        digest[4],
+        digest[5],
+        digest[6],
+        digest[7],
+        digest[8],
+        digest[9],
+        digest[10],
+        digest[11],
+        digest[12],
+        digest[13],
+        digest[14],
+        digest[15]
+    )
+}
+
 #[derive(Clone)]
 struct AppState {
     config: Arc<Mutex<Config>>,
@@ -90,6 +130,7 @@ struct AppState {
     root: Arc<PathBuf>,
     media: Arc<Vec<Media>>,
     token: Arc<str>,
+    plex_tls: PlexTls,
 }
 
 struct Media {
@@ -163,6 +204,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!(id = %item.id, file = %item.path.display(), size = item.size, "serving media");
     }
 
+    let gdm_machine_identifier = machine_identifier.clone();
+    let cert_dir = config_path
+        .parent()
+        .unwrap_or(std::path::Path::new("config"))
+        .join("certs");
+    let plex_tls = PlexTls::load(cert_dir).map_err(std::io::Error::other)?;
     let state = AppState {
         config: Arc::new(Mutex::new(config.clone())),
         config_path: Arc::new(config_path),
@@ -171,7 +218,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         root: Arc::new(root),
         media: Arc::new(media),
         token: Arc::from(config.token),
+        plex_tls,
     };
+    let server_tls = state.plex_tls.clone();
+    let publication_state = state.clone();
+    tokio::spawn(async move {
+        let server_token = publication_state.db.lock().ok().and_then(|connection| {
+            connection
+                .query_row(
+                    "SELECT plex_account_token FROM server_identity WHERE id = 1 AND claimed = 1",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten()
+        });
+        if let Some(server_token) = server_token {
+            let client = reqwest::Client::new();
+            if let Err(error) = publication_state
+                .plex_tls
+                .ensure_certificate(
+                    &client,
+                    &publication_state.machine_identifier,
+                    &server_token,
+                )
+                .await
+            {
+                warn!(error = %error, "could not ensure Plex TLS certificate at startup");
+            }
+            if let Err(error) =
+                publish_plex_connections(&client, &publication_state, &server_token).await
+            {
+                warn!(error = %error, "could not refresh Plex connection URLs at startup");
+            } else {
+                run_plex_presence(&client, &publication_state, &server_token).await;
+            }
+        }
+    });
     let app = Router::new()
         .route("/", get(root_handler))
         .route("/library", get(web_client))
@@ -194,8 +277,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/settings/media/scan", post(scan_media_metadata))
         .route("/settings/browse", get(settings_browse))
         .route("/identity", get(plex_identity))
+        .route("/myplex/account", get(plex_myplex_account))
+        .route("/servers", get(plex_servers))
+        .route("/media/providers", get(plex_media_providers))
+        .route("/security/resources", get(plex_security_resources))
+        .route("/hubs", get(plex_global_hubs))
+        .route("/hubs/promoted", get(plex_global_hubs))
+        .route("/hubs/sections/:section", get(plex_section_hubs))
         .route("/library/sections", get(plex_sections))
         .route("/library/sections/:section", get(plex_section))
+        .route(
+            "/library/sections/:section/collections",
+            get(plex_section_collections),
+        )
+        .route("/library/sections/:section/sorts", get(plex_section_sorts))
+        .route("/library/sections/:section/filters", get(plex_section_filters))
         .route("/library/sections/:section/all", get(plex_all))
         .route("/library/metadata/:id", get(plex_item))
         .route("/library/metadata/:id/children", get(plex_item))
@@ -213,10 +309,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/Videos/:id/stream", any(jellyfin_stream))
         .route("/Videos/:id/stream.mp4", any(jellyfin_stream))
         .fallback(log_not_found)
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .on_request(|request: &Request<Body>, _span: &Span| {
+                    let timestamp = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|duration| duration.as_millis())
+                        .unwrap_or_default();
+                    eprintln!(
+                        "Plex client request: t={}ms {} {} accept={:?} product_header={:?} token_present={}",
+                        timestamp,
+                        request.method(),
+                        request.uri().path(),
+                        request.headers().get(header::ACCEPT),
+                        request.headers().get("X-Plex-Product"),
+                        plex_request_token(request.headers(), request.uri()).is_some()
+                    );
+                    info!(
+                        method = %request.method(),
+                        path = %request.uri().path(),
+                        accept = ?request.headers().get(header::ACCEPT),
+                        plex_product = ?request.headers().get("X-Plex-Product"),
+                        "Plex client request"
+                    );
+                })
+                .on_response(|response: &Response, latency: Duration, _span: &Span| {
+                    let timestamp = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|duration| duration.as_millis())
+                        .unwrap_or_default();
+                    eprintln!(
+                        "Plex client response: t={}ms status={} latency={}ms",
+                        timestamp,
+                        response.status(),
+                        latency.as_millis()
+                    );
+                }),
+        )
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(config.bind.parse::<SocketAddr>()?).await?;
     let address = listener.local_addr()?;
+    tokio::spawn(run_gdm_responder(gdm_machine_identifier, address.port()));
     let host = if address.ip().is_unspecified() {
         "127.0.0.1".to_owned()
     } else {
@@ -230,8 +363,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         host,
         address.port()
     );
-    axum::serve(listener, app).await?;
+    server_tls.serve(listener, app).await?;
     Ok(())
+}
+
+async fn run_gdm_responder(machine_identifier: String, port: u16) {
+    let multicast = std::net::Ipv4Addr::new(239, 0, 0, 250);
+    let response = gdm_message("HTTP/1.0 200 OK", &machine_identifier, port);
+    for gdm_port in [32410, 32412, 32413, 32414] {
+        let socket = match std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, gdm_port)) {
+            Ok(socket) => socket,
+            Err(error) => {
+                warn!(%error, gdm_port, "Plex GDM discovery port unavailable");
+                continue;
+            }
+        };
+        if let Err(error) = socket.join_multicast_v4(&multicast, &std::net::Ipv4Addr::UNSPECIFIED) {
+            warn!(%error, gdm_port, "could not join Plex GDM multicast group");
+        }
+        if let Err(error) = socket.set_nonblocking(true) {
+            warn!(%error, gdm_port, "could not configure Plex GDM socket");
+            continue;
+        }
+        let Ok(socket) = tokio::net::UdpSocket::from_std(socket) else {
+            warn!(gdm_port, "could not hand Plex GDM socket to Tokio");
+            continue;
+        };
+        let response = response.clone();
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 2048];
+            loop {
+                let Ok((size, peer)) = socket.recv_from(&mut buffer).await else {
+                    return;
+                };
+                if buffer[..size].starts_with(b"M-SEARCH * HTTP/1.") {
+                    let _ = socket.send_to(response.as_bytes(), peer).await;
+                }
+            }
+        });
+    }
+
+    let announcement = gdm_message("HELLO", &machine_identifier, port);
+    let announcement_socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0));
+    if let Ok(announcement_socket) = announcement_socket {
+        let _ = announcement_socket.send_to(announcement.as_bytes(), (multicast, 32413));
+    }
+}
+
+fn gdm_message(prefix: &str, machine_identifier: &str, port: u16) -> String {
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    format!(
+        "{prefix}\r\nContent-Type: plex/media-server\r\nResource-Identifier: {machine_identifier}\r\nName: harbringer\r\nPort: {port}\r\nUpdated-At: {updated_at}\r\nVersion: 1.43.4.10903-e5521bd8c\r\n\r\n"
+    )
 }
 
 fn print_startup_banner() {
@@ -389,7 +575,7 @@ fn open_database(
     let state_dir = config_path
         .parent()
         .unwrap_or(std::path::Path::new("."))
-        .join(".mplex");
+        .to_path_buf();
     std::fs::create_dir_all(&state_dir)?;
     let connection = Connection::open(state_dir.join("state.sqlite"))?;
     connection.execute_batch(
@@ -488,6 +674,20 @@ fn open_database(
             )?;
             Ok(generated)
         })?;
+    let machine_identifier = if machine_identifier.len() == 40
+        && machine_identifier
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        machine_identifier
+    } else {
+        let migrated = plex_machine_identifier(&machine_identifier);
+        connection.execute(
+            "UPDATE server_identity SET machine_identifier = ?1 WHERE id = 1",
+            [&migrated],
+        )?;
+        migrated
+    };
     let _ = connection.execute(
         "UPDATE server_identity SET server_name = 'harbringer' WHERE id = 1",
         [],
@@ -755,7 +955,7 @@ async fn start_plex_auth(State(state): State<AppState>, headers: HeaderMap) -> R
     let host = headers
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
-        .unwrap_or("127.0.0.1:8096");
+        .unwrap_or("127.0.0.1:32400");
     let proto = headers
         .get("x-forwarded-proto")
         .and_then(|value| value.to_str().ok())
@@ -813,7 +1013,7 @@ async fn plex_auth_status(State(state): State<AppState>) -> Response {
     };
     let claim_result = claim_and_publish_plex_server(&state, &token).await;
     let (server_token, claimed, claim_error) = match claim_result {
-        Ok(server_token) => (server_token, true, None),
+        Ok((server_token, claimed, error)) => (server_token, claimed, error),
         Err(error) => {
             warn!(error = %error, "Plex server claim or resource publication failed");
             (token.clone(), false, Some(error))
@@ -832,6 +1032,14 @@ async fn plex_auth_status(State(state): State<AppState>) -> Response {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     let _ = connection.execute("DELETE FROM plex_auth", []);
+    drop(connection);
+    if claimed {
+        let presence_state = state.clone();
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            run_plex_presence(&client, &presence_state, &server_token).await;
+        });
+    }
     Json(serde_json::json!({
         "authorized": true,
         "claimed": claimed,
@@ -924,7 +1132,7 @@ fn xml_attribute(value: &str, name: &str) -> Option<String> {
 async fn claim_and_publish_plex_server(
     state: &AppState,
     account_token: &str,
-) -> Result<String, String> {
+) -> Result<(String, bool, Option<String>), String> {
     let client = reqwest::Client::new();
     let claim_response = client
         .get("https://plex.tv/api/claim/token.json")
@@ -935,6 +1143,7 @@ async fn claim_and_publish_plex_server(
         .header("X-Plex-Platform-Version", std::env::consts::ARCH)
         .header("X-Plex-Device-Name", "harbringer")
         .header("X-Plex-Device", "MacOSX")
+        .header("X-Plex-Provides", "server")
         .header(
             "X-Plex-Client-Identifier",
             state.machine_identifier.as_ref(),
@@ -980,68 +1189,93 @@ async fn claim_and_publish_plex_server(
     let server_token = extract_xml_token(&exchange_body)
         .ok_or_else(|| "Plex claim response did not contain a server token".to_owned())?;
 
-    let urls = plex_connection_urls(state);
-    if urls.is_empty() {
-        return Err("could not determine a local connection address".to_owned());
+    let tls_error = state
+        .plex_tls
+        .ensure_certificate(&client, &state.machine_identifier, &server_token)
+        .await
+        .err();
+    if let Some(error) = &tls_error {
+        warn!(error = %error, "Plex TLS certificate unavailable; publishing the HTTP connection fallback");
     }
-    let query = urls
-        .iter()
-        .map(|url| ("Connection[][uri]", url.as_str()))
-        .collect::<Vec<_>>();
-    client
-        .put(format!(
-            "https://plex.tv/api/v2/devices/{}",
-            url_encode(&state.machine_identifier)
-        ))
-        .query(&query)
-        .header("Accept", "application/xml")
+    if let Err(error) = publish_plex_connections(&client, state, &server_token).await {
+        return Ok((server_token, false, Some(error)));
+    }
+
+    if let Err(error) = verify_plex_resource(&client, state, &server_token).await {
+        return Ok((server_token, false, Some(error)));
+    }
+    Ok((server_token, true, tls_error))
+}
+
+async fn publish_plex_connections(
+    client: &reqwest::Client,
+    state: &AppState,
+    server_token: &str,
+) -> Result<(), String> {
+    let registration = plex_server_registration_xml(state)?;
+    let registration_response = client
+        .post("https://servers.plex.tv/servers.xml")
+        .query(&[("auth_token", server_token)])
+        .header("User-Agent", "PlexMediaServer/1.43.4.10903-e5521bd8c")
+        .header("Accept", "*/*")
+        .header("Accept-Encoding", "gzip")
+        .header("Content-Type", "application/xml")
         .header("X-Plex-Product", "Plex Media Server")
         .header("X-Plex-Version", "1.43.4.10903-e5521bd8c")
         .header("X-Plex-Platform", "MacOSX")
         .header("X-Plex-Platform-Version", std::env::consts::ARCH)
         .header("X-Plex-Device-Name", "harbringer")
         .header("X-Plex-Device", "MacOSX")
-        .header(
-            "X-Plex-Client-Identifier",
-            state.machine_identifier.as_ref(),
-        )
-        .header("X-Plex-Token", &server_token)
-        .send()
-        .await
-        .map_err(|error| format!("could not publish harbringer to Plex: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("Plex rejected harbringer publication: {error}"))?;
-
-    let registration = plex_server_registration_xml(state)?;
-    client
-        .post("https://servers.plex.tv/servers.xml")
-        .query(&[("auth_token", server_token.as_str())])
-        .header("Content-Type", "application/xml")
-        .header("Accept", "application/xml")
-        .header("X-Plex-Product", "Plex Media Server")
-        .header("X-Plex-Device", "MacOSX")
+        .header("X-Plex-Model", std::env::consts::ARCH)
         .header(
             "X-Plex-Client-Identifier",
             state.machine_identifier.as_ref(),
         )
         .header("X-Plex-Provides", "server")
+        .header("X-Plex-Device-Vendor", "Apple")
         .body(registration)
         .send()
         .await
-        .map_err(|error| format!("could not register harbringer libraries with Plex: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("Plex rejected harbringer library registration: {error}"))?;
+        .map_err(|error| format!("could not register harbringer libraries with Plex: {error}"))?;
+    // Plex Media Server's measured servers.xml registration can answer 422
+    // after creating/updating the server record. Continue with the device
+    // announce, which is the request that publishes client connection URIs.
+    if !registration_response.status().is_success()
+        && registration_response.status() != reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    {
+        return Err(format!(
+            "Plex rejected harbringer library registration: HTTP {}",
+            registration_response.status()
+        ));
+    }
+    info!(
+        status = %registration_response.status(),
+        "Plex server registration response"
+    );
+    publish_plex_device(client, state, server_token).await?;
+    verify_plex_resource(client, state, server_token).await?;
+    Ok(())
+}
 
+async fn verify_plex_resource(
+    client: &reqwest::Client,
+    state: &AppState,
+    server_token: &str,
+) -> Result<(), String> {
     let resources = client
         .get("https://clients.plex.tv/api/v2/resources")
-        .query(&[("includeHttps", "1"), ("includeRelay", "1")])
+        .query(&[
+            ("includeHttps", "1"),
+            ("includeRelay", "1"),
+            ("includeIPv6", "1"),
+        ])
         .header("Accept", "application/json")
         .header("X-Plex-Product", "harbringer")
         .header(
             "X-Plex-Client-Identifier",
             state.machine_identifier.as_ref(),
         )
-        .header("X-Plex-Token", account_token)
+        .header("X-Plex-Token", server_token)
         .send()
         .await
         .map_err(|error| format!("could not verify harbringer in Plex resources: {error}"))?
@@ -1051,12 +1285,252 @@ async fn claim_and_publish_plex_server(
         .await
         .map_err(|error| format!("Plex returned invalid resource data: {error}"))?;
     if !plex_resources_contain(&resources, state.machine_identifier.as_ref()) {
+        return Err("Plex.tv did not publish a usable Harbringer server resource".to_owned());
+    }
+    if state.plex_tls.hash().is_some()
+        && !plex_resources_contain_local_https(&resources, state.machine_identifier.as_ref())
+    {
         return Err(
-            "Plex accepted publication but does not list harbringer in this account's resources"
-                .to_owned(),
+            "Plex.tv did not publish Harbringer's local HTTPS plex.direct connection".to_owned(),
         );
     }
-    Ok(server_token)
+    Ok(())
+}
+
+async fn plex_account_id(
+    client: &reqwest::Client,
+    state: &AppState,
+    server_token: &str,
+) -> Result<String, String> {
+    let response = client
+        .get("https://servers.plex.tv/api/v2/user")
+        .query(&[("includeSubscriptions", "1"), ("includeProviders", "1")])
+        .header("User-Agent", "PlexMediaServer/1.43.4.10903-e5521bd8c")
+        .header("Accept", "*/*")
+        .header("Accept-Encoding", "gzip")
+        .header(
+            "X-Plex-Client-Identifier",
+            state.machine_identifier.as_ref(),
+        )
+        .header("X-Plex-Version", "1.43.4.10903-e5521bd8c")
+        .header("X-Plex-Provides", "server")
+        .header("X-Plex-Platform", "MacOSX")
+        .header("X-Plex-Product", "Plex Media Server")
+        .header("X-Plex-Platform-Version", std::env::consts::ARCH)
+        .header("X-Plex-Device-Name", "harbringer")
+        .header("X-Plex-Device", "MacOSX")
+        .header("X-Plex-Model", std::env::consts::ARCH)
+        .header("X-Plex-Device-Vendor", "Apple")
+        .header("X-Plex-Token", server_token)
+        .send()
+        .await
+        .map_err(|error| format!("could not read the Plex account for presence: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Plex account lookup for presence failed: {error}"))?;
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("could not read the Plex account response: {error}"))?;
+    let id = xml_attribute(&body, "id")
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| "Plex account response did not include a numeric id".to_owned())?;
+    Ok(id)
+}
+
+async fn run_plex_presence(client: &reqwest::Client, state: &AppState, server_token: &str) {
+    let account_id = loop {
+        match plex_account_id(client, state, server_token).await {
+            Ok(id) => break id,
+            Err(error) => {
+                warn!(error = %error, "Plex presence account lookup failed; retrying in 15 seconds");
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            }
+        }
+    };
+
+    loop {
+        let stream = client
+            .get(plex_presence_url(&account_id, &state.machine_identifier))
+            .query(&[("X-Plex-Token", server_token)])
+            .header(
+                "User-Agent",
+                "PlexMediaServer-EventSourceClient/1.43.4.10903-e5521bd8c",
+            )
+            .header("Accept", "*/*")
+            .header(
+                "X-Plex-Client-Identifier",
+                state.machine_identifier.as_ref(),
+            )
+            .header("X-Plex-Version", "1.43.4.10903-e5521bd8c")
+            .header("X-Plex-Provides", "server")
+            .header("X-Plex-Platform", "MacOSX")
+            .header("X-Plex-Product", "Plex Media Server")
+            .header("X-Plex-Platform-Version", std::env::consts::ARCH)
+            .header("X-Plex-Device-Name", "harbringer")
+            .header("X-Plex-Device", "MacOSX")
+            .header("X-Plex-Model", std::env::consts::ARCH)
+            .header("X-Plex-Device-Vendor", "Apple")
+            .send()
+            .await;
+
+        match stream {
+            Ok(mut response) if response.status().is_success() => {
+                info!("Plex presence stream connected");
+                if let Err(error) = plex_connectivity_check(client, state, server_token).await {
+                    warn!(error = %error, "Plex connectivity check failed");
+                }
+                loop {
+                    match response.chunk().await {
+                        Ok(Some(_event)) => {}
+                        Ok(None) => {
+                            warn!("Plex presence stream closed; reconnecting in 15 seconds");
+                            break;
+                        }
+                        Err(error) => {
+                            warn!(error = %error, "Plex presence stream failed; reconnecting in 15 seconds");
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(response) => {
+                warn!(status = %response.status(), "Plex presence stream rejected; reconnecting in 15 seconds");
+            }
+            Err(error) => {
+                warn!(error = %error, "Plex presence stream could not connect; reconnecting in 15 seconds");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    }
+}
+
+async fn plex_connectivity_check(
+    client: &reqwest::Client,
+    state: &AppState,
+    server_token: &str,
+) -> Result<(), String> {
+    let async_identifier = plex_async_identifier();
+    let response = client
+        .put(plex_connectivity_url(&state.machine_identifier))
+        .query(&[
+            ("X-Plex-Token", server_token),
+            ("asyncIdentifier", async_identifier.as_str()),
+        ])
+        .header("User-Agent", "PlexMediaServer/1.43.4.10903-e5521bd8c")
+        .header("Accept", "*/*")
+        .header("Accept-Encoding", "gzip")
+        .header(
+            "X-Plex-Client-Identifier",
+            state.machine_identifier.as_ref(),
+        )
+        .header("X-Plex-Version", "1.43.4.10903-e5521bd8c")
+        .header("X-Plex-Provides", "server")
+        .header("X-Plex-Platform", "MacOSX")
+        .header("X-Plex-Product", "Plex Media Server")
+        .header("X-Plex-Platform-Version", std::env::consts::ARCH)
+        .header("X-Plex-Device-Name", "harbringer")
+        .header("X-Plex-Device", "MacOSX")
+        .header("X-Plex-Model", std::env::consts::ARCH)
+        .header("X-Plex-Device-Vendor", "Apple")
+        .body(Vec::new())
+        .send()
+        .await
+        .map_err(|error| format!("could not request Plex connectivity check: {error}"))?;
+    info!(status = %response.status(), "Plex connectivity check response");
+    Ok(())
+}
+
+fn plex_presence_url(account_id: &str, machine_identifier: &str) -> String {
+    format!("https://pubsub.plex.tv/sub/eventsource/{account_id}/{machine_identifier}")
+}
+
+fn plex_connectivity_url(machine_identifier: &str) -> String {
+    format!("https://plex.tv/api/servers/{machine_identifier}/connectivity")
+}
+
+fn plex_async_identifier() -> String {
+    let mut bytes = [0_u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
+async fn publish_plex_device(
+    client: &reqwest::Client,
+    state: &AppState,
+    server_token: &str,
+) -> Result<(), String> {
+    let urls = plex_connection_urls(state);
+    if urls.is_empty() {
+        return Err("could not determine a local connection address".to_owned());
+    }
+    info!(urls = ?urls, "publishing Plex connection URLs");
+    let https_enabled = state.plex_tls.hash().is_some();
+    let query = plex_device_announce_query(&urls, https_enabled, server_token);
+    let version = "1.43.4.10903-e5521bd8c";
+    client
+        .put(plex_device_announce_url(&state.machine_identifier))
+        .query(&query)
+        .header("User-Agent", format!("PlexMediaServer/{version}"))
+        .header("Accept", "*/*")
+        .header("Accept-Encoding", "gzip")
+        .header("Content-Length", "0")
+        .header("X-Plex-Product", "Plex Media Server")
+        .header("X-Plex-Version", version)
+        .header("X-Plex-Platform", "MacOSX")
+        .header("X-Plex-Platform-Version", std::env::consts::ARCH)
+        .header("X-Plex-Device-Name", "harbringer")
+        .header("X-Plex-Device", "MacOSX")
+        .header("X-Plex-Model", std::env::consts::ARCH)
+        .header("X-Plex-Device-Vendor", "Apple")
+        .header("X-Plex-Provides", "server")
+        .header(
+            "X-Plex-Client-Identifier",
+            state.machine_identifier.as_ref(),
+        )
+        .body(Vec::new())
+        .send()
+        .await
+        .map_err(|error| format!("could not publish harbringer to Plex: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Plex rejected harbringer publication: {error}"))?;
+    info!("Plex device announce accepted");
+    Ok(())
+}
+
+fn plex_device_announce_url(machine_identifier: &str) -> String {
+    format!(
+        "https://servers.plex.tv/devices/{}",
+        url_encode(machine_identifier)
+    )
+}
+
+fn plex_device_announce_query<'a>(
+    urls: &'a [String],
+    https_enabled: bool,
+    server_token: &'a str,
+) -> Vec<(&'static str, &'a str)> {
+    urls.iter()
+        .map(|url| ("Connection[][uri]", url.as_str()))
+        .chain([
+            ("httpsEnabled", if https_enabled { "1" } else { "0" }),
+            ("httpsRequired", "0"),
+            ("dnsRebindingProtection", "0"),
+            ("X-Plex-Token", server_token),
+        ])
+        .collect()
 }
 
 fn plex_server_registration_xml(state: &AppState) -> Result<String, String> {
@@ -1067,13 +1541,12 @@ fn plex_server_registration_xml(state: &AppState) -> Result<String, String> {
         .bind
         .parse::<SocketAddr>()
         .map_err(|_| "harbringer has an invalid bind address".to_owned())?;
-    let urls = plex_connection_urls(state);
-    let local_address = urls
-        .first()
-        .and_then(|url| url.strip_prefix("http://"))
-        .and_then(|url| url.rsplit_once(':'))
-        .map(|(host, _)| host)
-        .unwrap_or("127.0.0.1");
+    let local_addresses = plex_local_addresses(state);
+    let local_addresses = local_addresses
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     let libraries = state
         .config
         .lock()
@@ -1099,7 +1572,7 @@ fn plex_server_registration_xml(state: &AppState) -> Result<String, String> {
     Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><MediaContainer size=\"{}\"><Server name=\"harbringer\" localAddresses=\"{}\" port=\"{}\" machineIdentifier=\"{}\" version=\"1.43.4.10903-e5521bd8c\" date=\"{}\" relay=\"0\" />{directories}</MediaContainer>",
         libraries.len() + 1,
-        xml_escape(local_address),
+        xml_escape(&local_addresses),
         bind.port(),
         xml_escape(&state.machine_identifier),
         registration_date,
@@ -1108,11 +1581,77 @@ fn plex_server_registration_xml(state: &AppState) -> Result<String, String> {
 
 fn plex_resources_contain(resources: &serde_json::Value, machine_identifier: &str) -> bool {
     resources.as_array().into_iter().flatten().any(|resource| {
-        resource
+        let identifier_matches = resource
             .get("clientIdentifier")
             .or_else(|| resource.get("machineIdentifier"))
             .and_then(serde_json::Value::as_str)
+            == Some(machine_identifier);
+        let provides_server = resource
+            .get("provides")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|provides| {
+                provides
+                    .split(',')
+                    .any(|capability| capability.trim() == "server")
+            });
+        let has_access_token = resource
+            .get("accessToken")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|token| !token.is_empty());
+        let has_connection = resource
+            .get("connections")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|connections| {
+                connections.iter().any(|connection| {
+                    connection
+                        .get("uri")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|uri| !uri.is_empty())
+                        && connection
+                            .get("address")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|address| !address.is_empty())
+                        && connection
+                            .get("protocol")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|protocol| !protocol.is_empty())
+                        && connection
+                            .get("port")
+                            .and_then(serde_json::Value::as_u64)
+                            .is_some_and(|port| port > 0)
+                })
+            });
+        identifier_matches && provides_server && has_access_token && has_connection
+    })
+}
+
+fn plex_resources_contain_local_https(
+    resources: &serde_json::Value,
+    machine_identifier: &str,
+) -> bool {
+    resources.as_array().into_iter().flatten().any(|resource| {
+        resource
+            .get("clientIdentifier")
+            .and_then(serde_json::Value::as_str)
             == Some(machine_identifier)
+            && resource
+                .get("connections")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|connections| {
+                    connections.iter().any(|connection| {
+                        connection.get("local").and_then(serde_json::Value::as_bool) == Some(true)
+                            && connection
+                                .get("protocol")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("https")
+                            && connection
+                                .get("uri")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|uri| {
+                                    uri.starts_with("https://") && uri.contains(".plex.direct:")
+                                })
+                    })
+                })
     })
 }
 
@@ -1136,18 +1675,54 @@ fn plex_connection_urls(state: &AppState) -> Vec<String> {
     let Some(bind) = bind else {
         return Vec::new();
     };
-    let host = if bind.ip().is_unspecified() {
-        std::net::UdpSocket::bind("0.0.0.0:0")
+    plex_publish_urls(&plex_local_addresses(state), bind.port())
+}
+
+fn plex_publish_urls(addresses: &[std::net::IpAddr], port: u16) -> Vec<String> {
+    // Match Plex Media Server and Ether: publish the local HTTP endpoint and
+    // set httpsEnabled on the device record. Plex.tv then derives the trusted
+    // plex.direct HTTPS URI from the LAN address and the issued certificate.
+    addresses
+        .iter()
+        .map(|host| format!("http://{host}:{port}"))
+        .collect()
+}
+
+fn plex_local_addresses(state: &AppState) -> Vec<std::net::IpAddr> {
+    let bind = state
+        .config
+        .lock()
+        .ok()
+        .and_then(|config| config.bind.parse::<SocketAddr>().ok());
+    let Some(bind) = bind else {
+        return Vec::new();
+    };
+    if !bind.ip().is_unspecified() {
+        return vec![bind.ip()];
+    }
+    let mut addresses = get_if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|interface| match interface.addr {
+            get_if_addrs::IfAddr::V4(address)
+                if !address.ip.is_loopback() && !address.ip.is_unspecified() =>
+            {
+                Some(std::net::IpAddr::V4(address.ip))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        let fallback = std::net::UdpSocket::bind("0.0.0.0:0")
             .ok()
             .and_then(|socket| {
                 socket.connect("8.8.8.8:80").ok()?;
                 socket.local_addr().ok().map(|address| address.ip())
             })
-            .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
-    } else {
-        bind.ip()
-    };
-    vec![format!("http://{host}:{}", bind.port())]
+            .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        addresses.push(fallback);
+    }
+    addresses
 }
 
 async fn settings_page(
@@ -1240,7 +1815,14 @@ async fn settings_page(
         })
         .unwrap_or((false, false, None));
     let plex_auth = if plex_status.1 {
-        r#"<h2>Plex.tv <span style="color:#4ade80" title="Connected and published" aria-label="Connected and published">✓</span></h2><p class="note">Connected to Plex.tv and published for Plex clients.</p><form method="get" action="/settings/plex/start"><button type="submit">Reconnect to Plex.tv</button></form><form method="post" action="/settings/plex/disconnect" onsubmit="return confirm('Disconnect and revoke harbringer from Plex.tv?')"><button type="submit">Disconnect and revoke</button></form>"#.to_owned()
+        if let Some(error) = plex_status.2.as_deref() {
+            format!(
+                "<h2>Plex.tv</h2><p class=\"flash-error\" role=\"status\">Signed in, but secure Plex client publication failed: {}. HTTP access remains published.</p><form method=\"get\" action=\"/settings/plex/start\"><button type=\"submit\">Reconnect to Plex.tv</button></form><form method=\"post\" action=\"/settings/plex/disconnect\"><button type=\"submit\">Disconnect and revoke</button></form>",
+                html(error)
+            )
+        } else {
+            r#"<h2>Plex.tv <span style="color:#4ade80" title="Connected and published" aria-label="Connected and published">✓</span></h2><p class="note">Connected to Plex.tv and published for Plex clients.</p><form method="get" action="/settings/plex/start"><button type="submit">Reconnect to Plex.tv</button></form><form method="post" action="/settings/plex/disconnect" onsubmit="return confirm('Disconnect and revoke harbringer from Plex.tv?')"><button type="submit">Disconnect and revoke</button></form>"#.to_owned()
+        }
     } else if plex_status.0 {
         match plex_status.2.as_deref() {
             Some(error) => format!(
@@ -3895,16 +4477,29 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-async fn log_not_found(req: Request<Body>) -> StatusCode {
+async fn log_not_found(req: Request<Body>) -> Response {
+    if matches!(
+        req.uri().path(),
+        "/:/websockets/notifications" | "/:/websocket/notifications"
+    ) {
+        let (mut parts, _) = req.into_parts();
+        return match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+            Ok(upgrade) => plex_notification_response(upgrade),
+            Err(rejection) => rejection.into_response(),
+        };
+    }
     warn!(method = %req.method(), path = %req.uri().path(), "unsupported route");
-    StatusCode::NOT_FOUND
+    StatusCode::NOT_FOUND.into_response()
 }
 
-async fn root_handler(State(s): State<AppState>, headers: HeaderMap) -> Response {
+async fn root_handler(State(s): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
     let is_plex_client = headers.contains_key("X-Plex-Product")
         || headers.contains_key("X-Plex-Client-Identifier")
         || headers.contains_key("X-Plex-Token");
-    if is_plex_client {
+    let is_plex_query = plex_query_value(&uri, "X-Plex-Product").is_some()
+        || plex_query_value(&uri, "X-Plex-Client-Identifier").is_some()
+        || plex_query_value(&uri, "X-Plex-Token").is_some();
+    if is_plex_client || is_plex_query {
         plex_root(&s).await
     } else {
         home_client(State(s)).await
@@ -3912,21 +4507,119 @@ async fn root_handler(State(s): State<AppState>, headers: HeaderMap) -> Response
 }
 
 async fn plex_root(state: &AppState) -> Response {
-    let sections = plex_section_directories(state);
-    plex_xml(format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="{}" machineIdentifier="{}" title1="Home" friendlyName="harbringer">{}</MediaContainer>"#,
-        sections.0,
-        xml_escape(&state.machine_identifier),
-        sections.1
-    ))
+    const ROOT_DIRECTORIES: &[&str] = &[
+        "actions",
+        "activities",
+        "butler",
+        "channels",
+        "clients",
+        "devices",
+        "diagnostics",
+        "hubs",
+        "library",
+        "livetv",
+        "media",
+        "neighborhood",
+        "playQueues",
+        "playlists",
+        "resources",
+        "search",
+        "server",
+        "servers",
+        "statistics",
+        "system",
+        "transcode",
+        "updater",
+        "user",
+    ];
+    let root_directories_json = ROOT_DIRECTORIES
+        .iter()
+        .map(|name| serde_json::json!({"count": 1, "key": name, "title": name}))
+        .collect::<Vec<_>>();
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": ROOT_DIRECTORIES.len(),
+            "allowCameraUpload": false,
+            "allowChannelAccess": false,
+            "allowMediaDeletion": false,
+            "allowSharing": false,
+            "allowSync": false,
+            "allowTuners": false,
+            "apiVersion": "1.2.3",
+            "backgroundProcessing": false,
+            "certificate": false,
+            "companionProxy": false,
+            "countryCode": "usa",
+            "diagnostics": "",
+            "eventStream": false,
+            "friendlyName": "harbringer",
+            "hubSearch": false,
+            "itemClusters": false,
+            "livetv": 0,
+            "machineIdentifier": state.machine_identifier.as_ref(),
+            "mediaProviders": true,
+            "multiuser": false,
+            "musicAnalysis": 0,
+            "myPlex": true,
+            "myPlexMappingState": "mapped",
+            "myPlexSigninState": "ok",
+            "myPlexSubscription": false,
+            "myPlexUsername": "",
+            "offlineTranscode": 0,
+            "ownerFeatures": "",
+            "platform": "MacOSX",
+            "platformVersion": std::env::consts::ARCH,
+            "pluginHost": false,
+            "pushNotifications": false,
+            "readOnlyLibraries": false,
+            "streamingBrainABRVersion": 3,
+            "streamingBrainVersion": 2,
+            "sync": false,
+            "transcoderActiveVideoSessions": 0,
+            "transcoderAudio": false,
+            "transcoderLyrics": false,
+            "transcoderPhoto": false,
+            "transcoderSubtitles": false,
+            "transcoderVideo": false,
+            "transcoderVideoBitrates": "64,96,208,320,720,1500,2000,3000,4000,8000,10000,12000,20000",
+            "transcoderVideoQualities": "0,1,2,3,4,5,6,7,8,9,10,11,12",
+            "transcoderVideoResolutions": "128,128,160,240,320,480,768,720,720,1080,1080,1080,1080",
+            "updatedAt": updated_at,
+            "updater": false,
+            "version": "1.43.4.10903-e5521bd8c",
+            "voiceSearch": false,
+            "Directory": root_directories_json
+        }
+    }))
 }
 
-fn plex_xml(body: String) -> Response {
-    (
-        [(header::CONTENT_TYPE, "application/xml; charset=utf-8")],
-        body,
-    )
-        .into_response()
+fn plex_json(body: serde_json::Value) -> Response {
+    plex_protocol_response(Json(body).into_response())
+}
+
+fn plex_protocol_response(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert("X-Plex-Protocol", HeaderValue::from_static("1.0"));
+    response
+}
+
+fn plex_request_token<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Option<&'a str> {
+    headers
+        .get("X-Plex-Token")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| plex_query_value(uri, "X-Plex-Token"))
+}
+
+fn plex_query_value<'a>(uri: &'a Uri, name: &str) -> Option<&'a str> {
+    uri.query()?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        key.eq_ignore_ascii_case(name).then_some(value)
+    })
 }
 
 async fn plex_identity(State(state): State<AppState>) -> Response {
@@ -3944,19 +4637,454 @@ async fn plex_identity(State(state): State<AppState>) -> Response {
                 .ok()
         })
         .unwrap_or(false);
-    plex_xml(format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="0" claimed="{}" machineIdentifier="{}" version="1.0"/>"#,
-        if claimed { 1 } else { 0 },
-        xml_escape(&state.machine_identifier)
-    ))
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": 0,
+            "apiVersion": "1.2.3",
+            "claimed": claimed,
+            "machineIdentifier": state.machine_identifier.as_ref(),
+            "version": "1.43.4.10903-e5521bd8c"
+        }
+    }))
 }
 
 async fn plex_sections(State(state): State<AppState>) -> Response {
     let sections = plex_section_directories(&state);
-    plex_xml(format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="{}">{}</MediaContainer>"#,
-        sections.0, sections.1
-    ))
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": sections.0,
+            "Directory": sections.1
+        }
+    }))
+}
+
+async fn plex_myplex_account() -> Response {
+    plex_json(serde_json::json!({
+        "MyPlexAccount": {
+            "mappingState": "mapped",
+            "signInState": "ok",
+            "subscriptionState": "Unknown"
+        }
+    }))
+}
+
+async fn plex_servers(State(state): State<AppState>) -> Response {
+    let bind = state
+        .config
+        .lock()
+        .ok()
+        .and_then(|config| config.bind.parse::<SocketAddr>().ok())
+        .map(|address| address.port())
+        .unwrap_or(32400);
+    let host = plex_connection_urls(&state)
+        .first()
+        .and_then(|url| url.strip_prefix("http://"))
+        .and_then(|url| url.rsplit_once(':'))
+        .map(|(host, _)| host.to_owned())
+        .unwrap_or_else(|| "127.0.0.1".to_owned());
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": 1,
+            "Server": [{
+                "name": "harbringer",
+                "address": host,
+                "port": bind,
+                "machineIdentifier": state.machine_identifier.as_ref(),
+                "version": "1.43.4.10903-e5521bd8c"
+            }]
+        }
+    }))
+}
+
+async fn plex_media_providers(State(state): State<AppState>) -> Response {
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let mut directories = state
+        .config
+        .lock()
+        .ok()
+        .map(|config| {
+            config
+                .libraries
+                .iter()
+                .enumerate()
+                .map(|(index, library)| {
+                    let section = index + 1;
+                    serde_json::json!({
+                        "agent": if library.kind == "tv" { "tv.plex.agents.series" } else { "tv.plex.agents.movie" },
+                        "scanner": if library.kind == "tv" { "Plex TV Series" } else { "Plex Movie" },
+                        "language": "en-US",
+                        "uuid": plex_library_uuid(&state.machine_identifier, section),
+                        "id": section.to_string(),
+                        "key": format!("/library/sections/{section}"),
+                        "hubKey": format!("/hubs/sections/{section}"),
+                        "type": plex_kind(&library.kind),
+                        "title": library.name,
+                        "refreshing": false,
+                        "scannedAt": updated_at,
+                        "updatedAt": updated_at,
+                        "Pivot": [
+                            {"id": "recommended", "key": format!("/hubs/sections/{section}"), "type": "hub", "title": "Recommended", "context": "content.discover", "symbol": "star"},
+                            {"id": "library", "key": format!("/library/sections/{section}/all?type={}", if library.kind == "tv" { 2 } else { 1 }), "type": "list", "title": "Library", "context": "content.library", "symbol": "library"},
+                            {"id": "collections", "key": format!("/library/sections/{section}/collections"), "type": "list", "title": "Collections", "context": "content.collections", "symbol": "stack"}
+                        ]
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    directories.insert(0, serde_json::json!({"title": "Home", "hubKey": "/hubs"}));
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": 1,
+            "allowCameraUpload": false,
+            "allowChannelAccess": false,
+            "allowMediaDeletion": false,
+            "allowSharing": false,
+            "allowSync": false,
+            "allowTuners": false,
+            "apiVersion": "1.2.3",
+            "backgroundProcessing": false,
+            "certificate": false,
+            "companionProxy": false,
+            "countryCode": "usa",
+            "diagnostics": "",
+            "eventStream": false,
+            "friendlyName": "harbringer",
+            "hubSearch": false,
+            "itemClusters": false,
+            "livetv": 0,
+            "machineIdentifier": state.machine_identifier.as_ref(),
+            "mediaProviders": true,
+            "multiuser": false,
+            "musicAnalysis": 0,
+            "myPlex": true,
+            "myPlexMappingState": "mapped",
+            "myPlexSigninState": "ok",
+            "myPlexSubscription": false,
+            "myPlexUsername": "",
+            "offlineTranscode": 0,
+            "ownerFeatures": "",
+            "platform": "MacOSX",
+            "platformVersion": std::env::consts::ARCH,
+            "pluginHost": false,
+            "pushNotifications": false,
+            "readOnlyLibraries": false,
+            "streamingBrainABRVersion": 3,
+            "streamingBrainVersion": 2,
+            "sync": false,
+            "transcoderActiveVideoSessions": 0,
+            "transcoderAudio": false,
+            "transcoderLyrics": false,
+            "transcoderSubtitles": false,
+            "transcoderVideo": false,
+            "transcoderVideoBitrates": "64,96,208,320,720,1500,2000,3000,4000,8000,10000,12000,20000",
+            "transcoderVideoQualities": "0,1,2,3,4,5,6,7,8,9,10,11,12",
+            "transcoderVideoResolutions": "128,128,160,240,320,480,768,720,720,1080,1080,1080,1080",
+            "updatedAt": updated_at,
+            "updater": false,
+            "version": "1.43.4.10903-e5521bd8c",
+            "voiceSearch": false,
+            "MediaProvider": [{
+                "identifier": "com.plexapp.plugins.library",
+                "title": "Library",
+                "types": "video",
+                "protocols": "stream,download",
+                "Feature": [{"key": "/library/sections", "type": "content", "Directory": directories},
+                             {"key": "/library/metadata", "type": "metadata"},
+                             {"key": "/hubs/promoted", "type": "promoted"}]
+            }]
+        }
+    }))
+}
+
+async fn plex_security_resources() -> Response {
+    plex_json(serde_json::json!({"MediaContainer": {"size": 0}}))
+}
+
+async fn plex_global_hubs(
+    State(state): State<AppState>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    plex_hubs_response(&state, None, query.get("count"))
+}
+
+fn plex_notification_response(upgrade: WebSocketUpgrade) -> Response {
+    upgrade
+        .on_upgrade(|mut socket| async move {
+            while let Some(Ok(message)) = socket.recv().await {
+                match message {
+                    Message::Ping(payload) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Message::Close(_) => break,
+                    Message::Text(_) | Message::Binary(_) | Message::Pong(_) => {}
+                }
+            }
+        })
+        .into_response()
+}
+
+async fn plex_section_hubs(
+    State(state): State<AppState>,
+    Path(section): Path<usize>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    plex_hubs_response(&state, Some(section), query.get("count"))
+}
+
+fn plex_hubs_response(
+    state: &AppState,
+    only_section: Option<usize>,
+    count: Option<&String>,
+) -> Response {
+    let count = count
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(10)
+        .clamp(1, 50);
+    let libraries = state
+        .config
+        .lock()
+        .map(|config| config.libraries.clone())
+        .unwrap_or_default();
+    if only_section.is_some_and(|section| section == 0 || section > libraries.len()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let mut hubs = Vec::new();
+    for (index, library) in libraries.iter().enumerate() {
+        let section = index + 1;
+        if only_section.is_some_and(|requested| requested != section) {
+            continue;
+        }
+        let mut media = state
+            .media
+            .iter()
+            .filter(|media| media_in_library(media, library))
+            .collect::<Vec<_>>();
+        if media.is_empty() {
+            continue;
+        }
+        let metadata = plex_section_metadata(state, section);
+        let mut recently_added = media.clone();
+        recently_added.sort_by_key(|item| std::cmp::Reverse(media_modified_at(item)));
+
+        let rated_count = media
+            .iter()
+            .filter(|item| metadata.get(&item.id).and_then(plex_rating).is_some())
+            .count();
+        if rated_count > 0 {
+            media.sort_by(|left, right| {
+                let left_rating = metadata
+                    .get(&left.id)
+                    .and_then(plex_rating)
+                    .unwrap_or_default();
+                let right_rating = metadata
+                    .get(&right.id)
+                    .and_then(plex_rating)
+                    .unwrap_or_default();
+                right_rating
+                    .partial_cmp(&left_rating)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| media_modified_at(right).cmp(&media_modified_at(left)))
+            });
+        } else {
+            media.clone_from(&recently_added);
+        }
+
+        let recommendation = if rated_count > 0 {
+            &media
+        } else {
+            &recently_added
+        };
+        hubs.push(plex_recommendation_hub(
+            section,
+            library,
+            recommendation,
+            &metadata,
+            count,
+            rated_count > 0,
+            true,
+        ));
+        if rated_count > 0 {
+            hubs.push(plex_recommendation_hub(
+                section,
+                library,
+                &recently_added,
+                &metadata,
+                count,
+                false,
+                false,
+            ));
+        }
+    }
+
+    let mut container = serde_json::json!({"size": hubs.len(), "Hub": hubs});
+    if let Some(section) = only_section {
+        let library = &libraries[section - 1];
+        container["librarySectionID"] = serde_json::json!(section);
+        container["librarySectionTitle"] = serde_json::json!(library.name);
+        container["librarySectionUUID"] =
+            serde_json::json!(plex_library_uuid(&state.machine_identifier, section));
+    } else {
+        container["identifier"] = serde_json::json!("com.plexapp.plugins.library");
+    }
+    plex_json(serde_json::json!({"MediaContainer": container}))
+}
+
+fn plex_recommendation_hub(
+    section: usize,
+    library: &ConfigLibrary,
+    media: &[&Media],
+    metadata: &HashMap<String, serde_json::Value>,
+    count: usize,
+    rank_by_rating: bool,
+    recommended: bool,
+) -> serde_json::Value {
+    let kind = plex_kind(&library.kind);
+    let (title, identifier, category, sort_key) = match (recommended, rank_by_rating) {
+        (true, true) => (
+            format!("Recommended in {}", library.name),
+            format!("{}.recommended.{section}", kind),
+            "recommended",
+            "audienceRating:desc",
+        ),
+        (true, false) => (
+            format!("Recommended in {}", library.name),
+            format!("{}.recommended.{section}", kind),
+            "recommended",
+            "addedAt:desc",
+        ),
+        (false, _) => (
+            format!("Recently Added in {}", library.name),
+            format!("{}.recentlyadded.{section}", kind),
+            "recentlyAdded",
+            "addedAt:desc",
+        ),
+    };
+    let items = media
+        .iter()
+        .take(count)
+        .map(|item| plex_video_json(item, section, library, metadata.get(&item.id)))
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "hubKey": format!("/library/sections/{section}/all?sort={sort_key}"),
+        "key": format!("/hubs/sections/{section}/{category}"),
+        "title": title,
+        "type": kind,
+        "hubIdentifier": identifier,
+        "context": format!("hub.{kind}.{category}"),
+        "size": media.len(),
+        "more": media.len() > count,
+        "style": "shelf",
+        "promoted": true,
+        "Metadata": items
+    })
+}
+
+fn media_modified_at(media: &Media) -> u64 {
+    std::fs::metadata(&media.path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn plex_rating(metadata: &serde_json::Value) -> Option<f64> {
+    metadata
+        .get("vote_average")
+        .and_then(serde_json::Value::as_f64)
+}
+
+fn plex_section_metadata(state: &AppState, section: usize) -> HashMap<String, serde_json::Value> {
+    let mut metadata = HashMap::new();
+    if let Ok(connection) = state.db.lock() {
+        if let Ok(mut statement) = connection.prepare(
+            "SELECT media_key, metadata_json FROM media WHERE media_key LIKE ?1 AND metadata_json IS NOT NULL",
+        ) {
+            if let Ok(rows) = statement.query_map([format!("{section}-%")], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            }) {
+                for row in rows.flatten() {
+                    let (key, value) = row;
+                    if let (Some(id), Ok(item)) = (
+                        key.strip_prefix(&format!("{section}-")),
+                        serde_json::from_str(&value),
+                    ) {
+                        metadata.insert(id.to_owned(), item);
+                    }
+                }
+            }
+        }
+    }
+
+    let library = state
+        .config
+        .lock()
+        .ok()
+        .and_then(|config| config.libraries.get(section.saturating_sub(1)).cloned());
+    let Some(library) = library else {
+        return metadata;
+    };
+    for media in state
+        .media
+        .iter()
+        .filter(|media| media_in_library(media, &library))
+    {
+        if metadata.contains_key(&media.id) {
+            continue;
+        }
+        let Some(root) = library
+            .folders
+            .iter()
+            .find(|folder| media.path.starts_with(folder))
+        else {
+            continue;
+        };
+        let group_path = metadata_group_path(root, &media.path, &library.kind);
+        let info_path = if group_path.is_file() {
+            group_path.parent().unwrap_or(root).join(".mplex/info.toml")
+        } else {
+            group_path.join(".mplex/info.toml")
+        };
+        let Ok(contents) = std::fs::read_to_string(info_path) else {
+            continue;
+        };
+        let Ok(info) = toml::from_str::<toml::Value>(&contents) else {
+            continue;
+        };
+        let Some(mut item) = info
+            .get("metadata_json")
+            .and_then(toml::Value::as_str)
+            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        else {
+            continue;
+        };
+        if library.kind == "tv" {
+            if let Some(episode) = tv_episode_info(root, &media.path) {
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("mplex_season".to_owned(), serde_json::json!(episode.season));
+                    object.insert(
+                        "mplex_episode".to_owned(),
+                        serde_json::json!(episode.episode),
+                    );
+                    if let Some(end) = episode.episode_end {
+                        object.insert("mplex_episode_end".to_owned(), serde_json::json!(end));
+                    }
+                    if let Some(title) = episode.episode_title {
+                        object.insert("mplex_episode_title".to_owned(), serde_json::json!(title));
+                    }
+                }
+            }
+        }
+        metadata.insert(media.id.clone(), item);
+    }
+    metadata
 }
 
 async fn plex_section(State(state): State<AppState>, Path(section): Path<usize>) -> Response {
@@ -3968,17 +5096,112 @@ async fn plex_section(State(state): State<AppState>, Path(section): Path<usize>)
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    plex_xml(format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="1" librarySectionID="{}" librarySectionTitle="{}"><Directory key="/library/sections/{}/all" type="{}" title="{}" /></MediaContainer>"#,
-        section,
-        xml_escape(&library.name),
-        section,
-        plex_kind(&library.kind),
-        xml_escape(&library.name)
-    ))
+    let uuid = plex_library_uuid(&state.machine_identifier, section);
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": 1,
+            "librarySectionID": section,
+            "librarySectionTitle": library.name,
+            "Directory": [{
+                "key": format!("/library/sections/{section}/all"),
+                "type": plex_kind(&library.kind),
+                "title": library.name,
+                "uuid": uuid
+            }]
+        }
+    }))
 }
 
-async fn plex_all(State(s): State<AppState>, Path(section): Path<usize>) -> Response {
+async fn plex_section_collections(
+    State(state): State<AppState>,
+    Path(section): Path<usize>,
+) -> Response {
+    let Some(library) = state
+        .config
+        .lock()
+        .ok()
+        .and_then(|config| config.libraries.get(section.saturating_sub(1)).cloned())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": 0,
+            "totalSize": 0,
+            "offset": 0,
+            "identifier": "com.plexapp.plugins.library",
+            "librarySectionID": section,
+            "librarySectionTitle": library.name,
+            "librarySectionUUID": plex_library_uuid(&state.machine_identifier, section),
+            "title1": library.name,
+            "title2": "Collections",
+            "viewGroup": plex_kind(&library.kind),
+            "Metadata": []
+        }
+    }))
+}
+
+async fn plex_section_sorts(State(state): State<AppState>, Path(section): Path<usize>) -> Response {
+    let Some(library) = state
+        .config
+        .lock()
+        .ok()
+        .and_then(|config| config.libraries.get(section.saturating_sub(1)).cloned())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": 1,
+            "identifier": "com.plexapp.plugins.library",
+            "librarySectionID": section,
+            "librarySectionTitle": library.name,
+            "librarySectionUUID": plex_library_uuid(&state.machine_identifier, section),
+            "title1": library.name,
+            "Directory": [{
+                "key": "titleSort",
+                "descKey": "titleSort:desc",
+                "default": "asc",
+                "defaultDirection": "asc",
+                "title": "Title"
+            }]
+        }
+    }))
+}
+
+async fn plex_section_filters(
+    State(state): State<AppState>,
+    Path(section): Path<usize>,
+) -> Response {
+    let Some(library) = state
+        .config
+        .lock()
+        .ok()
+        .and_then(|config| config.libraries.get(section.saturating_sub(1)).cloned())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": 0,
+            "identifier": "com.plexapp.plugins.library",
+            "librarySectionID": section,
+            "librarySectionTitle": library.name,
+            "librarySectionUUID": plex_library_uuid(&state.machine_identifier, section),
+            "title1": library.name,
+            "viewGroup": "secondary",
+            "Directory": []
+        }
+    }))
+}
+
+async fn plex_all(
+    State(s): State<AppState>,
+    Path(section): Path<usize>,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+    uri: Uri,
+) -> Response {
     let Some(library) = s
         .config
         .lock()
@@ -3987,20 +5210,111 @@ async fn plex_all(State(s): State<AppState>, Path(section): Path<usize>) -> Resp
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let videos = s
+    let mut media = s
         .media
         .iter()
         .filter(|media| media_in_library(media, &library))
-        .map(|media| plex_video(media, section, &library))
-        .collect::<String>();
-    let count = videos.matches("<Video ").count();
-    plex_xml(format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="{}" librarySectionID="{}" librarySectionTitle="{}" librarySectionUUID="mplex-{}">{}</MediaContainer>"#,
-        count,
-        section,
-        xml_escape(&library.name),
-        section,
-        videos
+        .collect::<Vec<_>>();
+    let metadata_by_id = plex_section_metadata(&s, section);
+    let requested_sort = query.get("sort").map(String::as_str).unwrap_or_default();
+    let sort_key = requested_sort
+        .split(',')
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default();
+    let descending = requested_sort
+        .split(',')
+        .next()
+        .is_some_and(|sort| sort.ends_with(":desc"));
+    if requested_sort.is_empty() || sort_key == "titleSort" {
+        media.sort_by(|left, right| {
+            let ordering = left.title.to_lowercase().cmp(&right.title.to_lowercase());
+            if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+    } else if sort_key == "addedAt" {
+        media.sort_by_key(|item| {
+            let time = media_modified_at(item);
+            if descending {
+                std::cmp::Reverse(time)
+            } else {
+                std::cmp::Reverse(u64::MAX - time)
+            }
+        });
+    } else if sort_key == "audienceRating" || sort_key == "rating" {
+        media.sort_by(|left, right| {
+            let left_rating = metadata_by_id
+                .get(&left.id)
+                .and_then(plex_rating)
+                .unwrap_or_default();
+            let right_rating = metadata_by_id
+                .get(&right.id)
+                .and_then(plex_rating)
+                .unwrap_or_default();
+            let ordering = left_rating
+                .partial_cmp(&right_rating)
+                .unwrap_or(std::cmp::Ordering::Equal);
+            if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+    }
+    let total = media.len();
+    let uuid = plex_library_uuid(&s.machine_identifier, section);
+    let metadata = media
+        .iter()
+        .map(|media| plex_video_json(media, section, &library, metadata_by_id.get(&media.id)))
+        .collect::<Vec<_>>();
+    let (offset, metadata) = match plex_container_page(&headers, &uri) {
+        Some((requested_offset, requested_size)) => {
+            let offset = requested_offset.min(total);
+            let end = offset.saturating_add(requested_size).min(total);
+            (offset, metadata[offset..end].to_vec())
+        }
+        None => (0, metadata),
+    };
+    let count = metadata.len();
+    let mut response = plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": count,
+            "totalSize": total,
+            "offset": offset,
+            "librarySectionID": section,
+            "librarySectionTitle": library.name,
+            "librarySectionUUID": uuid,
+            "Metadata": metadata
+        }
+    }));
+    response.headers_mut().insert(
+        "X-Plex-Container-Start",
+        HeaderValue::from_str(&offset.to_string()).expect("numeric header value"),
+    );
+    response.headers_mut().insert(
+        "X-Plex-Container-Total-Size",
+        HeaderValue::from_str(&total.to_string()).expect("numeric header value"),
+    );
+    response
+}
+
+fn plex_container_page(headers: &HeaderMap, uri: &Uri) -> Option<(usize, usize)> {
+    fn value(headers: &HeaderMap, uri: &Uri, name: &'static str) -> Option<usize> {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .or_else(|| plex_query_value(uri, name))
+            .and_then(|value| value.parse().ok())
+    }
+
+    Some((
+        value(headers, uri, "X-Plex-Container-Start")?,
+        value(headers, uri, "X-Plex-Container-Size")?,
     ))
 }
 
@@ -4011,12 +5325,15 @@ async fn plex_item(State(s): State<AppState>, Path(id): Path<String>) -> Respons
     let Some((section, library)) = media_library(&s, media) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    plex_xml(format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><MediaContainer size="1" librarySectionID="{}" librarySectionTitle="{}">{}</MediaContainer>"#,
-        section,
-        xml_escape(&library.name),
-        plex_video(media, section, &library)
-    ))
+    let metadata_by_id = plex_section_metadata(&s, section);
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": 1,
+            "librarySectionID": section,
+            "librarySectionTitle": library.name,
+            "Metadata": [plex_video_json(media, section, &library, metadata_by_id.get(&media.id))]
+        }
+    }))
 }
 
 async fn plex_part(
@@ -4052,25 +5369,30 @@ async fn plex_artwork(state: &AppState, id: &str, filename: &str) -> Response {
         .into_response()
 }
 
-fn plex_section_directories(state: &AppState) -> (usize, String) {
+fn plex_section_directories(state: &AppState) -> (usize, Vec<serde_json::Value>) {
     let libraries = state
         .config
         .lock()
         .map(|config| config.libraries.clone())
         .unwrap_or_default();
-    let directories = libraries
+    let directories_json = libraries
         .iter()
         .enumerate()
         .map(|(index, library)| {
             let section = index + 1;
-            format!(
-                r#"<Directory key="/library/sections/{section}" type="{}" title="{}" agent="com.plexapp.agents.none" scanner="harbringer" />"#,
-                plex_kind(&library.kind),
-                xml_escape(&library.name)
-            )
+            serde_json::json!({
+                "key": format!("/library/sections/{section}"),
+                "type": plex_kind(&library.kind),
+                "title": library.name,
+                "agent": if library.kind == "tv" { "tv.plex.agents.series" } else { "tv.plex.agents.movie" },
+                "scanner": if library.kind == "tv" { "Plex TV Series" } else { "Plex Movie" },
+                "language": "en-US",
+                "uuid": plex_library_uuid(&state.machine_identifier, section),
+                "refreshing": false
+            })
         })
-        .collect::<String>();
-    (libraries.len(), directories)
+        .collect::<Vec<_>>();
+    (libraries.len(), directories_json)
 }
 
 fn plex_kind(kind: &str) -> &'static str {
@@ -4100,31 +5422,189 @@ fn media_library(state: &AppState, media: &Media) -> Option<(usize, ConfigLibrar
         .map(|(index, library)| (index + 1, library.clone()))
 }
 
-fn plex_video(media: &Media, section: usize, library: &ConfigLibrary) -> String {
+fn plex_video_json(
+    media: &Media,
+    section: usize,
+    library: &ConfigLibrary,
+    metadata: Option<&serde_json::Value>,
+) -> serde_json::Value {
     let media_type = plex_kind(&library.kind);
     let title = if media_type == "show" {
         tv_episode_display_name(&media.title)
     } else {
         media.title.clone()
     };
-    format!(
-        r#"<Video ratingKey="{}" key="/library/metadata/{}" type="{}" title="{}" thumb="/library/metadata/{}/thumb" art="/library/metadata/{}/art" librarySectionID="{}" librarySectionTitle="{}" duration="0"><Media id="{}" duration="0" container="{}" videoResolution="unknown"><Part id="{}" key="/media/{}" duration="0" file="{}" size="{}" container="{}"/></Media></Video>"#,
-        xml(&media.id),
-        xml(&media.id),
-        media_type,
-        xml(&title),
-        xml(&media.id),
-        xml(&media.id),
-        section,
-        xml(&library.name),
-        xml(&media.id),
-        xml(&media.container),
-        xml(&media.id),
-        xml(&media.id),
-        xml_path(&media.path),
-        media.size,
-        xml(&media.container)
-    )
+    let modified_at = media_modified_at(media);
+    let mut item = serde_json::json!({
+        "ratingKey": media.id,
+        "key": format!("/library/metadata/{}", media.id),
+        "type": media_type,
+        "title": title,
+        "thumb": format!("/library/metadata/{}/thumb", media.id),
+        "art": format!("/library/metadata/{}/art", media.id),
+        "librarySectionID": section,
+        "librarySectionTitle": library.name,
+        "originalTitle": media.title,
+        "titleSort": media.title.to_lowercase(),
+        "updatedAt": modified_at,
+        "addedAt": modified_at,
+        "duration": 0,
+        "Media": [{
+            "id": media.id,
+            "duration": 0,
+            "container": media.container,
+            "videoResolution": "unknown",
+            "Part": [{
+                "id": media.id,
+                "key": format!("/media/{}", media.id),
+                "duration": 0,
+                "file": media.path,
+                "size": media.size,
+                "container": media.container
+            }]
+        }]
+    });
+    if let Some(year) = title_year(&media.title) {
+        item["year"] = serde_json::json!(year);
+    }
+    if let Some(metadata) = metadata {
+        let metadata_title = if media_type == "show" {
+            metadata
+                .get("mplex_episode_title")
+                .and_then(serde_json::Value::as_str)
+        } else {
+            metadata.get("title").and_then(serde_json::Value::as_str)
+        };
+        if let Some(title) = metadata_title.filter(|title| !title.is_empty()) {
+            item["title"] = serde_json::json!(title);
+        }
+        if let Some(summary) = metadata
+            .get("overview")
+            .and_then(serde_json::Value::as_str)
+            .filter(|summary| !summary.is_empty())
+        {
+            item["summary"] = serde_json::json!(summary);
+        }
+        let date = if media_type == "show" {
+            metadata.get("first_air_date")
+        } else {
+            metadata.get("release_date")
+        }
+        .and_then(serde_json::Value::as_str)
+        .filter(|date| !date.is_empty());
+        if let Some(date) = date {
+            item["originallyAvailableAt"] = serde_json::json!(date);
+            if let Some(year) = date.get(..4).and_then(|year| year.parse::<i64>().ok()) {
+                item["year"] = serde_json::json!(year);
+            }
+        }
+        let original_title = metadata
+            .get("original_title")
+            .or_else(|| metadata.get("original_name"))
+            .and_then(serde_json::Value::as_str);
+        if let Some(original_title) = original_title.filter(|title| !title.is_empty()) {
+            item["originalTitle"] = serde_json::json!(original_title);
+        }
+        if let Some(rating) = plex_rating(metadata) {
+            item["rating"] = serde_json::json!(rating);
+            item["audienceRating"] = serde_json::json!(rating);
+        }
+        let genre_names = metadata
+            .get("genres")
+            .and_then(serde_json::Value::as_array)
+            .map(|genres| {
+                genres
+                    .iter()
+                    .filter_map(|genre| genre.get("name").and_then(serde_json::Value::as_str))
+                    .map(|name| serde_json::json!({"tag": name}))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                metadata
+                    .get("genre_ids")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_i64)
+                    .filter_map(|id| tmdb_genre_name(media_type, id))
+                    .map(|name| serde_json::json!({"tag": name}))
+                    .collect()
+            });
+        if !genre_names.is_empty() {
+            item["Genre"] = serde_json::json!(genre_names);
+        }
+        if let Some(tmdb_id) = metadata.get("id").and_then(serde_json::Value::as_i64) {
+            item["guid"] = serde_json::json!(format!(
+                "tmdb://{}/{}",
+                if media_type == "show" { "tv" } else { "movie" },
+                tmdb_id
+            ));
+        }
+        if media_type == "show" {
+            if let Some(show_title) = metadata.get("name").and_then(serde_json::Value::as_str) {
+                item["grandparentTitle"] = serde_json::json!(show_title);
+            }
+            if let Some(season) = metadata
+                .get("mplex_season")
+                .and_then(serde_json::Value::as_u64)
+            {
+                item["parentIndex"] = serde_json::json!(season);
+                item["parentTitle"] = serde_json::json!(format!("Season {season:02}"));
+            }
+            if let Some(episode) = metadata
+                .get("mplex_episode")
+                .and_then(serde_json::Value::as_u64)
+            {
+                item["index"] = serde_json::json!(episode);
+            }
+        }
+    }
+    item
+}
+
+fn title_year(title: &str) -> Option<u32> {
+    title
+        .split(|character: char| !character.is_ascii_digit())
+        .find_map(|part| {
+            (part.len() == 4)
+                .then(|| part.parse::<u32>().ok())
+                .flatten()
+                .filter(|year| (1888..=2100).contains(year))
+        })
+}
+
+fn tmdb_genre_name(media_type: &str, id: i64) -> Option<&'static str> {
+    let name = match id {
+        12 => "Adventure",
+        14 => "Fantasy",
+        16 => "Animation",
+        18 => "Drama",
+        27 => "Horror",
+        28 => "Action",
+        35 => "Comedy",
+        36 => "History",
+        37 => "Western",
+        53 => "Thriller",
+        80 => "Crime",
+        99 => "Documentary",
+        878 => "Science Fiction",
+        9648 => "Mystery",
+        10402 => "Music",
+        10749 => "Romance",
+        10751 => "Family",
+        10752 => "War",
+        10759 if media_type == "show" => "Action & Adventure",
+        10762 if media_type == "show" => "Kids",
+        10763 if media_type == "show" => "News",
+        10764 if media_type == "show" => "Reality",
+        10765 if media_type == "show" => "Sci-Fi & Fantasy",
+        10766 if media_type == "show" => "Soap",
+        10767 if media_type == "show" => "Talk",
+        10768 if media_type == "show" => "War & Politics",
+        10770 => "TV Movie",
+        _ => return None,
+    };
+    Some(name)
 }
 
 async fn jellyfin_public_system() -> Json<serde_json::Value> {
@@ -4309,17 +5789,6 @@ fn parse_range(value: Option<&str>, size: u64) -> Result<(u64, u64), ()> {
     Ok((start, end))
 }
 
-fn xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-fn xml_path(path: &PathBuf) -> String {
-    xml(&path.to_string_lossy())
-}
-
 fn html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -4333,8 +5802,9 @@ fn html(value: &str) -> String {
 mod tests {
     use super::{
         ass_to_vtt, clean_relative_path, contains_hidden_component, extract_xml_token, html,
-        parse_range, parse_tv_episode_marker, parse_tv_season_directory, sidebar_nav_with_settings,
-        srt_to_vtt,
+        parse_range, parse_tv_episode_marker, parse_tv_season_directory, plex_connectivity_url,
+        plex_device_announce_query, plex_device_announce_url, plex_presence_url, plex_publish_urls,
+        sidebar_nav_with_settings, srt_to_vtt,
     };
     #[test]
     fn full_file() {
@@ -4365,6 +5835,48 @@ mod tests {
             Some("server-token".to_owned())
         );
         assert_eq!(extract_xml_token("<user />"), None);
+    }
+    #[test]
+    fn plex_publishes_lan_http_urls_for_plex_direct_discovery() {
+        assert_eq!(
+            plex_publish_urls(
+                &[
+                    "10.20.61.51".parse().unwrap(),
+                    "192.168.1.10".parse().unwrap()
+                ],
+                32400
+            ),
+            ["http://10.20.61.51:32400", "http://192.168.1.10:32400"]
+        );
+    }
+    #[test]
+    fn plex_device_announce_matches_measured_pms_request_shape() {
+        let urls = vec!["http://10.20.61.51:32400".to_owned()];
+        assert_eq!(
+            plex_device_announce_url("machine-id"),
+            "https://servers.plex.tv/devices/machine-id"
+        );
+        assert_eq!(
+            plex_device_announce_query(&urls, true, "server-token"),
+            [
+                ("Connection[][uri]", "http://10.20.61.51:32400"),
+                ("httpsEnabled", "1"),
+                ("httpsRequired", "0"),
+                ("dnsRebindingProtection", "0"),
+                ("X-Plex-Token", "server-token"),
+            ]
+        );
+    }
+    #[test]
+    fn plex_presence_and_connectivity_urls_match_measured_pms_endpoints() {
+        assert_eq!(
+            plex_presence_url("12345", "machine-id"),
+            "https://pubsub.plex.tv/sub/eventsource/12345/machine-id"
+        );
+        assert_eq!(
+            plex_connectivity_url("machine-id"),
+            "https://plex.tv/api/servers/machine-id/connectivity"
+        );
     }
     #[test]
     fn converts_srt_to_webvtt() {

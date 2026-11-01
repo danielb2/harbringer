@@ -78,6 +78,8 @@ This is the working checklist for making harbringer a drop-in Plex Media Server 
 - Plex registration now includes the server device field used by Ether in Authorized Devices metadata.
 - Plex PIN authorization now uses the same stable client identifier as the server registration to avoid creating a separate auth-only client record.
 - Plex authentication now uses the documented Ed25519 JWK and signed device-JWT flow instead of the legacy claim PIN path.
+- Plex publication now advertises all detected non-loopback IPv4 LAN addresses to reduce unavailable-server failures caused by VPN or multi-interface routing.
+- Added Plex GDM LAN discovery responses and announcements; broader official-client validation remains outstanding.
 - Settings now supports reconnecting an already connected Plex account without first disconnecting.
 - Added Plex `thumb` and `art` routes for media entries with cached sidecar artwork; broader artwork coverage and client validation remain outstanding.
 - Implemented the TV browsing hierarchy: show overview, season cards with compact episode-count badges, season artwork/descriptions, selectable episode cards, and one-player episode detail views with episode descriptions.
