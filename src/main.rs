@@ -6586,6 +6586,22 @@ fn plex_edit_distance(left: &str, right: &str) -> Option<usize> {
     Some(previous[right.len()])
 }
 
+fn plex_episode_search_rank(
+    query: &str,
+    episode_title: &str,
+    filename_title: &str,
+    show_rank: Option<u8>,
+) -> Option<u8> {
+    [
+        plex_search_rank(query, episode_title),
+        plex_search_rank(query, filename_title),
+        show_rank,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
 fn plex_search_type_matches(query: &BTreeMap<String, String>, kind: &str) -> bool {
     let Some(type_filter) = query.get("type") else {
         return true;
@@ -6646,19 +6662,19 @@ async fn plex_search_items(
                     .and_then(|value| value.get("name"))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or(&show.title);
+                let show_rank = [
+                    show_title,
+                    show.title.as_str(),
+                    show_metadata
+                        .and_then(|value| value.get("original_name"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default(),
+                ]
+                .into_iter()
+                .filter_map(|candidate| plex_search_rank(term, candidate))
+                .min();
                 if plex_search_type_matches(query, "show") {
-                    if let Some(rank) = [
-                        show_title,
-                        show.title.as_str(),
-                        show_metadata
-                            .and_then(|value| value.get("original_name"))
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or_default(),
-                    ]
-                    .into_iter()
-                    .filter_map(|candidate| plex_search_rank(term, candidate))
-                    .min()
-                    {
+                    if let Some(rank) = show_rank {
                         results.push((
                             rank,
                             show_title.to_lowercase(),
@@ -6676,11 +6692,12 @@ async fn plex_search_items(
                         .and_then(|value| value.get("mplex_episode_title"))
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or(&episode_filename_title);
-                    let Some(rank) = [episode_title, episode_filename_title.as_str()]
-                        .into_iter()
-                        .filter_map(|candidate| plex_search_rank(term, candidate))
-                        .min()
-                    else {
+                    let Some(rank) = plex_episode_search_rank(
+                        term,
+                        episode_title,
+                        episode_filename_title.as_str(),
+                        show_rank,
+                    ) else {
                         continue;
                     };
                     let episode_info = library
@@ -7449,6 +7466,12 @@ fn plex_tv_episode_parents(
     item["parentType"] = serde_json::json!("season");
     item["parentIndex"] = serde_json::json!(season);
     item["index"] = serde_json::json!(episode);
+    if let Some(representative) = show.episodes.first() {
+        item["grandparentThumb"] =
+            serde_json::json!(format!("/library/metadata/{}/thumb", representative.id));
+        item["grandparentArt"] =
+            serde_json::json!(format!("/library/metadata/{}/art", representative.id));
+    }
 }
 
 fn plex_library_media_container(
@@ -9164,6 +9187,10 @@ mod tests {
             episode_item["grandparentKey"],
             format!("/library/metadata/{}", show.rating_key)
         );
+        assert_eq!(
+            episode_item["grandparentThumb"],
+            "/library/metadata/3-1/thumb"
+        );
         assert_eq!(episode_item["title"], "Episode 1 · Pilot");
     }
 
@@ -9204,6 +9231,14 @@ mod tests {
         assert_eq!(plex_search_rank("br", "Harbringer"), Some(2));
         assert_eq!(plex_search_rank("harbringer", "The Harbinger"), Some(3));
         assert_eq!(plex_search_rank("star trek", "Star Trek"), Some(0));
+        assert_eq!(
+            super::plex_episode_search_rank("Example Show", "Pilot", "Pilot.mkv", Some(0)),
+            Some(0)
+        );
+        assert_eq!(
+            super::plex_episode_search_rank("Pilot", "Pilot", "Pilot.mkv", None),
+            Some(0)
+        );
         assert_eq!(plex_search_rank("", "Harbringer"), None);
         assert_eq!(plex_search_rank("missing", "Harbringer"), None);
 

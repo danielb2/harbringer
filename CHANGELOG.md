@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Include TV episodes in title searches for their matching series name, and include the show poster/background routes on episode metadata as `grandparentThumb` and `grandparentArt`.
+- Reflection: Plex search returns episodes when a query matches their parent show; Harbringer previously only compared episode titles. Episode results now match either the episode title or show title, while retaining the direct episode-title match behavior. The episode metadata also points to the show artwork using Plex's parent artwork fields. Regression tests cover show-name and episode-name ranking and the artwork URL.
 - Implement Plex library and hub search, advertise the `/hubs/search` provider feature, and enable the root `hubSearch` capability. Search returns matching movie, show, and episode metadata by title with optional type/section filters.
 - Implement section first-character indexes for both `/library/sections/{id}/firstCharacter` and Plex's documented `/firstCharacters` alias, including letter-filtered item listings. Advertise the first-character URL in title sort metadata.
 - Search uses case-insensitive, normalized title matching with a bounded edit-distance fallback for spelling mistakes, in addition to partial substrings; TV search includes original series titles.
