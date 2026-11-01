@@ -143,7 +143,7 @@ impl PlexTls {
         app: axum::Router,
     ) -> std::io::Result<()> {
         loop {
-            let (stream, _) = listener.accept().await?;
+            let (stream, remote_addr) = listener.accept().await?;
             let tls = self.clone();
             let app = app.clone();
             tokio::spawn(async move {
@@ -160,18 +160,18 @@ impl PlexTls {
                         return;
                     };
                     match TlsAcceptor::from(config).accept(stream).await {
-                        Ok(tls_stream) => serve_http(tls_stream, app).await,
+                        Ok(tls_stream) => serve_http(tls_stream, app, remote_addr).await,
                         Err(error) => tracing::debug!(%error, "Plex TLS handshake failed"),
                     }
                 } else {
-                    serve_http(stream, app).await;
+                    serve_http(stream, app, remote_addr).await;
                 }
             });
         }
     }
 }
 
-async fn serve_http<S>(stream: S, app: axum::Router)
+async fn serve_http<S>(stream: S, app: axum::Router, remote_addr: std::net::SocketAddr)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -180,12 +180,14 @@ where
     use hyper_util::rt::TokioIo;
     use tower::ServiceExt;
 
-    let service = service_fn(move |request: hyper::Request<Incoming>| {
+    let service = service_fn(move |mut request: hyper::Request<Incoming>| {
         let app = app.clone();
+        request.extensions_mut().insert(remote_addr);
         async move { app.oneshot(request.map(Body::new)).await }
     });
     if let Err(error) = hyper::server::conn::http1::Builder::new()
         .serve_connection(TokioIo::new(stream), service)
+        .with_upgrades()
         .await
     {
         tracing::debug!(%error, "Plex HTTP connection closed");

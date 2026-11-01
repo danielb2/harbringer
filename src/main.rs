@@ -58,8 +58,6 @@ struct Config {
     token: String,
     #[serde(default)]
     libraries: Vec<ConfigLibrary>,
-    #[serde(default)]
-    metadata_in_media_folder: bool,
     #[serde(default = "default_metadata_storage")]
     metadata_storage: String,
     #[serde(default)]
@@ -279,6 +277,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/settings/browse", get(settings_browse))
         .route("/identity", get(plex_identity))
         .route("/myplex/account", get(plex_myplex_account))
+        .route("/accounts", get(plex_accounts))
+        .route("/accounts/:id", get(plex_account))
+        .route("/activities", get(plex_activities))
+        .route("/status/sessions", get(plex_sessions))
         .route("/servers", get(plex_servers))
         .route("/media/providers", get(plex_media_providers))
         .route("/security/resources", get(plex_security_resources))
@@ -290,6 +292,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/library/sections/:section/collections",
             get(plex_section_collections),
+        )
+        .route(
+            "/library/sections/:section/prefs",
+            get(plex_section_prefs).put(plex_section_prefs),
         )
         .route("/library/sections/:section/sorts", get(plex_section_sorts))
         .route("/library/sections/:section/filters", get(plex_section_filters))
@@ -319,8 +325,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map(|duration| duration.as_millis())
                         .unwrap_or_default();
                     eprintln!(
-                        "Plex client request: t={}ms {} {} accept={:?} product_header={:?} token_present={}",
+                        "Plex client request: t={}ms remote_ip={} {} {} accept={:?} product_header={:?} token_present={}",
                         timestamp,
+                        request.extensions().get::<SocketAddr>().map(|addr| addr.ip().to_string()).unwrap_or_else(|| "unknown".to_owned()),
                         request.method(),
                         request.uri().path(),
                         request.headers().get(header::ACCEPT),
@@ -328,6 +335,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         plex_request_token(request.headers(), request.uri()).is_some()
                     );
                     info!(
+                        remote_ip = request.extensions().get::<SocketAddr>().map(|addr| addr.ip().to_string()).unwrap_or_else(|| "unknown".to_owned()),
                         method = %request.method(),
                         path = %request.uri().path(),
                         accept = ?request.headers().get(header::ACCEPT),
@@ -520,16 +528,23 @@ fn load_config(path: &std::path::Path) -> Result<Config, Box<dyn std::error::Err
             bind: default_bind(),
             token: default_token(),
             libraries: Vec::new(),
-            metadata_in_media_folder: false,
             metadata_storage: default_metadata_storage(),
             tmdb_bearer_token: None,
         });
     }
-    let mut config: Config = toml::from_str(&std::fs::read_to_string(path)?)?;
-    if config.metadata_in_media_folder {
+    let contents = std::fs::read_to_string(path)?;
+    let mut config: Config = toml::from_str(&contents)?;
+    let legacy: toml::Value = toml::from_str(&contents)?;
+    if legacy.get("metadata_storage").is_none()
+        && legacy
+            .get("metadata_in_media_folder")
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+    {
         config.metadata_storage = "sidecar".to_owned();
-    } else if config.metadata_storage == "sidecar" {
-        config.metadata_in_media_folder = true;
+    }
+    if !matches!(config.metadata_storage.as_str(), "database" | "sidecar") {
+        config.metadata_storage = default_metadata_storage();
     }
     Ok(config)
 }
@@ -1794,8 +1809,7 @@ async fn settings_page(
     let metadata_enabled = state
         .config
         .lock()
-        .map(|config| config.metadata_in_media_folder)
-        .unwrap_or(false);
+        .is_ok_and(|config| config.metadata_storage == "sidecar");
     let plex_status = state
         .db
         .lock()
@@ -1858,7 +1872,7 @@ details {{ margin-top: .7rem; }} summary {{ display: inline-block; padding: .45r
 </style></head><body><div class="app-shell">{}
 <main><h1>Settings</h1>{}{}{}
 <p class="note">A library is a named collection with one type and one or more monitored folders. Create it with its first folder, then add more folders to that same library below.</p>
-<h2>Metadata storage</h2><p class="note">Choose where matched movie and TV metadata is stored. SQLite is the runtime database; sidecar mode also writes portable files beside the media.</p><form method="post" action="/settings/preferences"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="database" {}><span><strong>SQLite database {}</strong><br><span class="note">Store metadata in harbringer’s database only.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="sidecar" {}><span><strong>.mplex files in media folders {}</strong><br><span class="note">Also write <code>.mplex/cover.jpg</code>, <code>banner.jpg</code>, and <code>info.toml</code>.</span></span></label></div><input name="tmdb_bearer_token" type="password" placeholder="TMDB bearer token (leave blank to keep current)" value=""><button type="submit">Save preferences</button></form>
+<h2>Metadata storage</h2><p class="note">Choose one place for matched movie and TV metadata. SQLite mode stores matches in this server’s database. Sidecar mode stores matches and artwork beside the media, so another mplex server can reuse them without its database or a new TMDB lookup. SQLite still stores server identity, library configuration, and playback progress.</p><form method="post" action="/settings/preferences"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="database" {}><span><strong>SQLite database {}</strong><br><span class="note">Matched metadata stays in this server’s database.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="sidecar" {}><span><strong>.mplex files in media folders {}</strong><br><span class="note">Matched metadata and artwork live in <code>.mplex/cover.jpg</code>, <code>banner.jpg</code>, and <code>info.toml</code> beside the media.</span></span></label></div><input name="tmdb_bearer_token" type="password" placeholder="TMDB bearer token (leave blank to keep current)" value=""><button type="submit">Save preferences</button></form>
 <details open><summary>＋ Add library</summary><form method="post" action="/settings/libraries"><input name="name" type="text" placeholder="Library name" required><select name="kind"><option value="movie">Movies</option><option value="tv">TV Shows</option><option value="other">Other</option></select><div class="path-list" id="new-library-paths"><div class="path-row"><input name="path[]" type="text" placeholder="/path/to/folder" value="{}" required><a href="/settings/browse">Browse</a><button type="button" class="remove-path" disabled>−</button></div></div><button type="button" id="add-path">＋</button><button type="submit">Create library</button></form></details>
 <h2>Libraries</h2><ul>{}</ul>
  </main></div><script>
@@ -1912,10 +1926,8 @@ async fn update_preferences(
         || form.metadata_in_media_folder.is_some()
     {
         config.metadata_storage = "sidecar".to_owned();
-        config.metadata_in_media_folder = true;
     } else if form.metadata_storage.as_deref() == Some("database") {
         config.metadata_storage = "database".to_owned();
-        config.metadata_in_media_folder = false;
     }
     config.tmdb_bearer_token = token;
     if save_config(&state.config_path, &config).is_err() {
@@ -1941,14 +1953,12 @@ async fn scan_library_metadata(
     let Some(library) = config.libraries.get(library_id) else {
         return settings_error("Library does not exist");
     };
-    let Some(token) = config
+    let client = reqwest::Client::new();
+    let token = config
         .tmdb_bearer_token
         .as_deref()
-        .filter(|token| !token.is_empty())
-    else {
-        return settings_error("Add a TMDB bearer token in Settings before scanning metadata");
-    };
-    let client = reqwest::Client::new();
+        .filter(|token| !token.is_empty());
+    let sidecar_mode = config.metadata_storage == "sidecar";
     let kind = if library.kind == "tv" { "tv" } else { "movie" };
     let mut matched = 0;
     let forced = scan_query.force.unwrap_or(false);
@@ -1963,6 +1973,77 @@ async fn scan_library_metadata(
         }
         for (group_path, group) in groups {
             let group_title = metadata_group_title(&group_path, folder);
+            if !forced {
+                let media_key = format!("{}-{}", library_id + 1, group[0].id);
+                let selected = if sidecar_mode {
+                    read_sidecar_metadata(&group_path)
+                } else {
+                    read_database_metadata(&state, &media_key)
+                };
+                if selected
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.get("id").is_some())
+                {
+                    if sidecar_mode {
+                        clear_group_database_metadata(&state, library_id, &group);
+                    }
+                    matched += 1;
+                    continue;
+                }
+                let previous = if sidecar_mode {
+                    read_database_metadata(&state, &media_key)
+                } else {
+                    read_sidecar_metadata(&group_path)
+                };
+                if let Some(metadata) = previous.filter(|metadata| metadata.get("id").is_some()) {
+                    if sidecar_mode {
+                        let representative = &group[0];
+                        if store_metadata_sidecar(
+                            folder,
+                            &group_path,
+                            &group_title,
+                            representative,
+                            &metadata,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return settings_error(
+                                "Could not move matched metadata to the media-folder sidecar",
+                            );
+                        }
+                        clear_group_database_metadata(&state, library_id, &group);
+                        if let Some(token) = token {
+                            let _ = download_tmdb_artwork(
+                                &client,
+                                token,
+                                folder,
+                                &group_path,
+                                &media_key,
+                                &metadata,
+                                &state,
+                            )
+                            .await;
+                        }
+                    } else {
+                        for media in &group {
+                            let metadata =
+                                tv_metadata_for_media(&metadata, folder, &media.path, kind);
+                            let key = format!("{}-{}", library_id + 1, media.id);
+                            if !write_database_metadata(&state, &key, &metadata) {
+                                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                            }
+                        }
+                    }
+                    matched += 1;
+                    continue;
+                }
+            }
+            let Some(token) = token else {
+                return settings_error(
+                    "Add a TMDB bearer token before matching media without stored metadata",
+                );
+            };
             let title = metadata_search_title(&group_title);
             let response = client
                 .get(format!("https://api.themoviedb.org/3/search/{}", kind))
@@ -1987,36 +2068,44 @@ async fn scan_library_metadata(
             };
             for media in &group {
                 let media_metadata = tv_metadata_for_media(result, folder, &media.path, kind);
-                let metadata_json =
-                    serde_json::to_string(&media_metadata).unwrap_or_else(|_| "{}".to_owned());
-                let media_key = format!("{}-{}", library_id + 1, media.id);
-                let database_ok = state
-                    .db
-                    .lock()
-                    .ok()
-                    .and_then(|connection| {
-                        connection
-                            .execute(
-                                "UPDATE media SET metadata_json = ?1, matched_at = strftime('%s', 'now') WHERE media_key = ?2",
-                                (&metadata_json, &media_key),
-                            )
-                            .ok()
-                    })
-                    .is_some();
-                if !database_ok {
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                if !sidecar_mode {
+                    let metadata_json =
+                        serde_json::to_string(&media_metadata).unwrap_or_else(|_| "{}".to_owned());
+                    let media_key = format!("{}-{}", library_id + 1, media.id);
+                    let database_ok = state
+                        .db
+                        .lock()
+                        .ok()
+                        .and_then(|connection| {
+                            connection
+                                .execute(
+                                    "UPDATE media SET metadata_json = ?1, matched_at = strftime('%s', 'now') WHERE media_key = ?2",
+                                    (&metadata_json, &media_key),
+                                )
+                                .ok()
+                        })
+                        .is_some();
+                    if !database_ok {
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
                 }
             }
-            if config.metadata_in_media_folder {
+            if sidecar_mode {
                 let representative = &group[0];
-                let _ = store_metadata_sidecar(
+                if store_metadata_sidecar(
                     folder,
                     &group_path,
                     &group_title,
                     representative,
                     &tv_metadata_for_media(result, folder, &representative.path, kind),
                 )
-                .await;
+                .await
+                .is_err()
+                {
+                    return settings_error(
+                        "Could not write matched metadata to the media-folder sidecar",
+                    );
+                }
                 let media_key = format!("{}-{}", library_id + 1, representative.id);
                 let _ = download_tmdb_artwork(
                     &client,
@@ -2073,6 +2162,7 @@ async fn scan_media_metadata(
     let Some(library) = config.libraries.get(library_id) else {
         return settings_error("Library does not exist");
     };
+    let sidecar_mode = config.metadata_storage == "sidecar";
     let Some(token) = config
         .tmdb_bearer_token
         .as_deref()
@@ -2127,25 +2217,32 @@ async fn scan_media_metadata(
     };
     let media_key = format!("{}-{}", library_id + 1, media.id);
     let metadata_json = serde_json::to_string(result).unwrap_or_else(|_| "{}".to_owned());
-    let database_ok = state
-        .db
-        .lock()
-        .ok()
-        .and_then(|connection| {
-            connection
-                .execute(
-                    "UPDATE media SET metadata_json = ?1, matched_at = strftime('%s', 'now') WHERE media_key = ?2",
-                    (&metadata_json, &media_key),
-                )
-                .ok()
-        })
-        .is_some();
-    if !database_ok {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    if !sidecar_mode {
+        let database_ok = state
+            .db
+            .lock()
+            .ok()
+            .and_then(|connection| {
+                connection
+                    .execute(
+                        "UPDATE media SET metadata_json = ?1, matched_at = strftime('%s', 'now') WHERE media_key = ?2",
+                        (&metadata_json, &media_key),
+                    )
+                    .ok()
+            })
+            .is_some();
+        if !database_ok {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
     }
-    if config.metadata_in_media_folder {
+    if sidecar_mode {
         let group_path = metadata_group_path(root, &media.path, kind);
-        let _ = store_metadata_sidecar(root, &group_path, &title, &media, result).await;
+        if store_metadata_sidecar(root, &group_path, &title, &media, result)
+            .await
+            .is_err()
+        {
+            return settings_error("Could not write matched metadata to the media-folder sidecar");
+        }
         let _ = download_tmdb_artwork(
             &client,
             token,
@@ -2178,6 +2275,71 @@ fn metadata_group_path(root: &PathBuf, media: &std::path::Path, kind: &str) -> P
         media.to_path_buf()
     } else {
         parent.to_path_buf()
+    }
+}
+
+fn metadata_sidecar_info_path(group_path: &std::path::Path) -> PathBuf {
+    let directory = if group_path.is_file() {
+        group_path.parent().unwrap_or(group_path)
+    } else {
+        group_path
+    };
+    directory.join(".mplex/info.toml")
+}
+
+fn parse_sidecar_metadata(contents: &str) -> Option<serde_json::Value> {
+    toml::from_str::<toml::Value>(contents)
+        .ok()?
+        .get("metadata_json")?
+        .as_str()
+        .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+        .filter(|metadata| metadata.is_object())
+}
+
+fn read_sidecar_metadata(group_path: &std::path::Path) -> Option<serde_json::Value> {
+    let contents = std::fs::read_to_string(metadata_sidecar_info_path(group_path)).ok()?;
+    parse_sidecar_metadata(&contents)
+}
+
+fn read_database_metadata(state: &AppState, media_key: &str) -> Option<serde_json::Value> {
+    let connection = state.db.lock().ok()?;
+    let contents = connection
+        .query_row(
+            "SELECT metadata_json FROM media WHERE media_key = ?1",
+            [media_key],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()??;
+    serde_json::from_str(&contents).ok()
+}
+
+fn write_database_metadata(
+    state: &AppState,
+    media_key: &str,
+    metadata: &serde_json::Value,
+) -> bool {
+    let Ok(connection) = state.db.lock() else {
+        return false;
+    };
+    let metadata_json = serde_json::to_string(metadata).unwrap_or_else(|_| "{}".to_owned());
+    connection
+        .execute(
+            "UPDATE media SET metadata_json = ?1, matched_at = strftime('%s', 'now') WHERE media_key = ?2",
+            (&metadata_json, media_key),
+        )
+        .is_ok()
+}
+
+fn clear_group_database_metadata(state: &AppState, library_id: usize, group: &[Media]) {
+    let Ok(connection) = state.db.lock() else {
+        return;
+    };
+    for media in group {
+        let media_key = format!("{}-{}", library_id + 1, media.id);
+        let _ = connection.execute(
+            "UPDATE media SET metadata_json = NULL, matched_at = NULL WHERE media_key = ?1",
+            [media_key],
+        );
     }
 }
 
@@ -2764,7 +2926,11 @@ async fn home_client(State(state): State<AppState>) -> Response {
     };
     let mut libraries = String::new();
     for (index, library) in config.libraries.iter().enumerate() {
-        let artwork = library_artwork(library, index).await;
+        let artwork = if config.metadata_storage == "sidecar" {
+            library_artwork(library, index).await
+        } else {
+            None
+        };
         let artwork_markup = artwork
             .map(|(cover, banner)| {
                 format!(
@@ -2851,12 +3017,14 @@ async fn home_client(State(state): State<AppState>) -> Response {
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or(&media.title);
-        let cover = tokio::fs::metadata(folder.join(".mplex/cover.jpg"))
-            .await
-            .is_ok();
-        let banner = tokio::fs::metadata(folder.join(".mplex/banner.jpg"))
-            .await
-            .is_ok();
+        let cover = config.metadata_storage == "sidecar"
+            && tokio::fs::metadata(folder.join(".mplex/cover.jpg"))
+                .await
+                .is_ok();
+        let banner = config.metadata_storage == "sidecar"
+            && tokio::fs::metadata(folder.join(".mplex/banner.jpg"))
+                .await
+                .is_ok();
         let progress = duration
             .filter(|duration| *duration > 0)
             .map(|duration| (position as f64 / duration as f64).clamp(0.0, 1.0));
@@ -2907,12 +3075,14 @@ async fn home_client(State(state): State<AppState>) -> Response {
             continue;
         };
         let preview = media.path.strip_prefix(root).ok();
-        let cover = tokio::fs::metadata(folder.join(".mplex/cover.jpg"))
-            .await
-            .is_ok();
-        let banner = tokio::fs::metadata(folder.join(".mplex/banner.jpg"))
-            .await
-            .is_ok();
+        let cover = config.metadata_storage == "sidecar"
+            && tokio::fs::metadata(folder.join(".mplex/cover.jpg"))
+                .await
+                .is_ok();
+        let banner = config.metadata_storage == "sidecar"
+            && tokio::fs::metadata(folder.join(".mplex/banner.jpg"))
+                .await
+                .is_ok();
         let name = folder
             .file_name()
             .and_then(|value| value.to_str())
@@ -2988,6 +3158,10 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
                 .map(|library| library.kind.clone())
         })
     });
+    let sidecar_mode = s
+        .config
+        .lock()
+        .is_ok_and(|config| config.metadata_storage == "sidecar");
     let directory = match web_path(&s, &library_root, &relative).await {
         Ok(path) if path.is_dir() => path,
         Ok(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -3004,9 +3178,10 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
             _ => return StatusCode::NOT_FOUND.into_response(),
         }
     }
-    let pane_banner = if tokio::fs::metadata(directory.join(".mplex/banner.jpg"))
-        .await
-        .is_ok()
+    let pane_banner = if sidecar_mode
+        && tokio::fs::metadata(directory.join(".mplex/banner.jpg"))
+            .await
+            .is_ok()
     {
         format!(
             r#" style="background-size:cover;background-position:center;background-attachment:fixed;background-image:linear-gradient(180deg,rgba(17,24,39,.72),rgba(17,24,39,.96)),url('{}')""#,
@@ -3017,8 +3192,10 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
     };
     let info_panel = if let Some(selected_relative) = selected_relative.as_deref() {
         episode_info_panel(&s, &library_root, selected_relative).await
-    } else {
+    } else if sidecar_mode {
         media_info_panel(&directory).await
+    } else {
+        String::new()
     };
     let mut entries = match tokio::fs::read_dir(&directory).await {
         Ok(entries) => entries,
@@ -3098,12 +3275,14 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
                 let preview = first_media_file(&directory)
                     .await
                     .and_then(|path| path.strip_prefix(&library_root).ok().map(PathBuf::from));
-                let cover = tokio::fs::metadata(directory.join(".mplex/cover.jpg"))
-                    .await
-                    .is_ok();
-                let banner = tokio::fs::metadata(directory.join(".mplex/banner.jpg"))
-                    .await
-                    .is_ok();
+                let cover = sidecar_mode
+                    && tokio::fs::metadata(directory.join(".mplex/cover.jpg"))
+                        .await
+                        .is_ok();
+                let banner = sidecar_mode
+                    && tokio::fs::metadata(directory.join(".mplex/banner.jpg"))
+                        .await
+                        .is_ok();
                 let season_count = episode_count.to_string();
                 let season_card = folder_card_with_badge(
                     &format!("Season {season_number:02}"),
@@ -3128,12 +3307,14 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
             let preview = first_media_file(&directory)
                 .await
                 .and_then(|path| path.strip_prefix(&library_root).ok().map(PathBuf::from));
-            let cover = tokio::fs::metadata(directory.join(".mplex/cover.jpg"))
-                .await
-                .is_ok();
-            let banner = tokio::fs::metadata(directory.join(".mplex/banner.jpg"))
-                .await
-                .is_ok();
+            let cover = sidecar_mode
+                && tokio::fs::metadata(directory.join(".mplex/cover.jpg"))
+                    .await
+                    .is_ok();
+            let banner = sidecar_mode
+                && tokio::fs::metadata(directory.join(".mplex/banner.jpg"))
+                    .await
+                    .is_ok();
             folder_cards.push_str(&folder_card(
                 &name,
                 &child_relative,
@@ -3152,13 +3333,14 @@ async fn web_client(State(s): State<AppState>, Query(query): Query<WebPath>) -> 
                 items.push_str(&tv_episode_card(&name, &child_relative, query.library));
                 continue;
             }
-            let artwork = if tokio::fs::metadata(
-                path.parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .join(".mplex/cover.jpg"),
-            )
-            .await
-            .is_ok()
+            let artwork = if sidecar_mode
+                && tokio::fs::metadata(
+                    path.parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .join(".mplex/cover.jpg"),
+                )
+                .await
+                .is_ok()
             {
                 path.parent()
                     .and_then(|parent| parent.strip_prefix(&library_root).ok())
@@ -3716,10 +3898,17 @@ async fn media_info_panel(directory: &std::path::Path) -> String {
 }
 
 async fn episode_info_panel(
-    _state: &AppState,
+    state: &AppState,
     root: &std::path::Path,
     relative: &std::path::Path,
 ) -> String {
+    if !state
+        .config
+        .lock()
+        .is_ok_and(|config| config.metadata_storage == "sidecar")
+    {
+        return String::new();
+    }
     let path = root.join(relative);
     let season_directory = path.parent().unwrap_or(root);
     let Ok(contents) = tokio::fs::read_to_string(season_directory.join(".mplex/info.toml")).await
@@ -3844,6 +4033,13 @@ async fn web_artwork(State(s): State<AppState>, Query(query): Query<WebPath>) ->
     };
     if contains_hidden_component(&relative)
         || !matches!(query.kind.as_deref(), Some("cover" | "banner"))
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !s
+        .config
+        .lock()
+        .is_ok_and(|config| config.metadata_storage == "sidecar")
     {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -4489,7 +4685,11 @@ async fn log_not_found(State(state): State<AppState>, req: Request<Body>) -> Res
             return StatusCode::BAD_REQUEST.into_response();
         };
         let Some((id, filename)) = plex_photo_source(&source) else {
-            warn!(source, "unsupported Plex photo source");
+            let source_path = Uri::try_from(source.as_str())
+                .ok()
+                .map(|uri| uri.path().to_owned())
+                .unwrap_or_else(|| "<invalid-uri>".to_owned());
+            warn!(source_path, "unsupported Plex photo source");
             return StatusCode::NOT_FOUND.into_response();
         };
         return plex_artwork(&state, &id, filename).await;
@@ -4504,8 +4704,137 @@ async fn log_not_found(State(state): State<AppState>, req: Request<Body>) -> Res
             Err(rejection) => rejection.into_response(),
         };
     }
+    if req.uri().path() == "/:/timeline" {
+        let query = req
+            .uri()
+            .query()
+            .and_then(|query| serde_urlencoded::from_str::<PlexTimelineQuery>(query).ok());
+        let Some(query) = query else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        return plex_timeline(&state, query);
+    }
+    if req.uri().path() == "/:/prefs" {
+        return plex_prefs();
+    }
+    if matches!(req.uri().path(), "/:/scrobble" | "/:/unscrobble") {
+        let watched = req.uri().path() == "/:/scrobble";
+        let query = req
+            .uri()
+            .query()
+            .and_then(|query| serde_urlencoded::from_str::<PlexScrobbleQuery>(query).ok());
+        let Some(query) = query else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        return plex_scrobble(&state, query, watched);
+    }
     warn!(method = %req.method(), path = %req.uri().path(), "unsupported route");
     StatusCode::NOT_FOUND.into_response()
+}
+
+#[derive(Deserialize)]
+struct PlexTimelineQuery {
+    #[serde(rename = "ratingKey")]
+    rating_key: Option<String>,
+    key: Option<String>,
+    time: Option<i64>,
+    duration: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct PlexScrobbleQuery {
+    #[serde(rename = "ratingKey")]
+    rating_key: Option<String>,
+    key: Option<String>,
+}
+
+fn plex_query_media_id(rating_key: Option<&str>, key: Option<&str>) -> Option<String> {
+    rating_key
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            let key = key?;
+            key.rsplit("/library/metadata/")
+                .next()
+                .filter(|id| !id.is_empty() && !id.contains('/'))
+                .map(str::to_owned)
+        })
+}
+
+fn plex_progress_path(state: &AppState, media_id: &str) -> Option<String> {
+    let media = find_media(state, media_id)?;
+    let (_, library) = media_library(state, media)?;
+    let root = library
+        .folders
+        .iter()
+        .find(|folder| media.path.starts_with(folder))?;
+    Some(
+        media
+            .path
+            .strip_prefix(root)
+            .ok()?
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+fn plex_timeline(state: &AppState, query: PlexTimelineQuery) -> Response {
+    let Some(media_id) = plex_query_media_id(query.rating_key.as_deref(), query.key.as_deref())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(path) = plex_progress_path(state, &media_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let position = query.time.unwrap_or_default().max(0);
+    let duration = query.duration.filter(|duration| *duration > 0);
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if connection.execute(
+        "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, updated_at) VALUES (?1, ?2, ?3, ?4, 0, ?5) ON CONFLICT(user_id, media_key) DO UPDATE SET position_ms = excluded.position_ms, duration_ms = COALESCE(excluded.duration_ms, watch_progress.duration_ms), watched = 0, updated_at = excluded.updated_at",
+        (USER_ID, path, position, duration, updated_at),
+    ).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    StatusCode::OK.into_response()
+}
+
+fn plex_scrobble(state: &AppState, query: PlexScrobbleQuery, watched: bool) -> Response {
+    let Some(media_id) = plex_query_media_id(query.rating_key.as_deref(), query.key.as_deref())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(path) = plex_progress_path(state, &media_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let result = if watched {
+        connection.execute(
+            "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, updated_at) VALUES (?1, ?2, 0, NULL, 1, ?3) ON CONFLICT(user_id, media_key) DO UPDATE SET position_ms = 0, watched = 1, updated_at = excluded.updated_at",
+            (USER_ID, path, updated_at),
+        )
+    } else {
+        connection.execute(
+            "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, updated_at) VALUES (?1, ?2, 0, NULL, 0, ?3) ON CONFLICT(user_id, media_key) DO UPDATE SET position_ms = 0, watched = 0, updated_at = excluded.updated_at",
+            (USER_ID, path, updated_at),
+        )
+    };
+    if result.is_err() {
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    } else {
+        StatusCode::OK.into_response()
+    }
 }
 
 fn plex_photo_source(source: &str) -> Option<(String, &'static str)> {
@@ -4591,13 +4920,23 @@ fn plex_cors_path(path: &str) -> bool {
             path,
             "/identity"
                 | "/myplex/account"
+                | "/accounts"
+                | "/activities"
                 | "/servers"
                 | "/media/providers"
                 | "/security/resources"
         )
-        || ["/:/", "/hubs", "/library/", "/photo/", "/media/"]
-            .iter()
-            .any(|prefix| path.starts_with(prefix))
+        || [
+            "/:/",
+            "/hubs",
+            "/library/",
+            "/photo/",
+            "/media/",
+            "/accounts/",
+            "/status/",
+        ]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
 }
 
 async fn root_handler(State(s): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
@@ -4766,13 +5105,126 @@ async fn plex_sections(State(state): State<AppState>) -> Response {
     }))
 }
 
-async fn plex_myplex_account() -> Response {
-    plex_json(serde_json::json!({
-        "MyPlexAccount": {
-            "mappingState": "mapped",
-            "signInState": "ok",
-            "subscriptionState": "Unknown"
+async fn plex_myplex_account(State(state): State<AppState>) -> Response {
+    let profile = plex_cloud_profile(&state).await;
+    let mut account = serde_json::json!({
+        "mappingState": "mapped",
+        "signInState": "ok",
+        "subscriptionState": "Unknown"
+    });
+    if let Some((name, thumb)) = profile {
+        account["username"] = serde_json::json!(name);
+        if let Some(thumb) = thumb {
+            account["thumb"] = serde_json::json!(thumb);
         }
+    }
+    plex_json(serde_json::json!({"MyPlexAccount": account}))
+}
+
+async fn plex_accounts(State(state): State<AppState>) -> Response {
+    plex_account_value(plex_cloud_profile(&state).await)
+}
+
+async fn plex_account(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if id != "1" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    plex_account_value(plex_cloud_profile(&state).await)
+}
+
+async fn plex_cloud_profile(state: &AppState) -> Option<(String, Option<String>)> {
+    let token = state.db.lock().ok().and_then(|connection| {
+        connection
+            .query_row(
+                "SELECT plex_account_token FROM server_identity WHERE id = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+    })?;
+    let response = reqwest::Client::new()
+        .get("https://plex.tv/api/v2/user")
+        .header("Accept", "application/json")
+        .header("X-Plex-Product", "Plex Media Server")
+        .header(
+            "X-Plex-Client-Identifier",
+            state.machine_identifier.as_ref(),
+        )
+        .header("X-Plex-Token", token)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json::<serde_json::Value>()
+        .await
+        .ok()?;
+    let name = ["username", "title", "friendlyName"]
+        .iter()
+        .find_map(|key| {
+            response
+                .get(*key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+        })
+        .map(str::to_owned);
+    let thumb = response
+        .get("thumb")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    name.or_else(|| thumb.as_ref().map(|_| "harbringer".to_owned()))
+        .map(|name| (name, thumb))
+}
+
+fn plex_account_value(profile: Option<(String, Option<String>)>) -> Response {
+    let mut account = serde_json::json!({
+        "id": 1,
+        "key": "/accounts/1",
+        "name": "harbringer",
+        "defaultAudioLanguage": "en",
+        "autoSelectAudio": true,
+        "defaultSubtitleLanguage": "en",
+        "subtitleMode": 2
+    });
+    if let Some((name, thumb)) = profile {
+        account["name"] = serde_json::json!(name);
+        if let Some(thumb) = thumb {
+            account["thumb"] = serde_json::json!(thumb);
+        }
+    }
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": 1,
+            "identifier": "com.plexapp.system.accounts",
+            "Account": [account]
+        }
+    }))
+}
+
+async fn plex_activities() -> Response {
+    plex_json(serde_json::json!({"MediaContainer": {"size": 0}}))
+}
+
+async fn plex_sessions() -> Response {
+    plex_json(serde_json::json!({"MediaContainer": {"size": 0}}))
+}
+
+fn plex_prefs() -> Response {
+    let settings = serde_json::json!([
+        {"id":"FriendlyName","label":"Friendly name","summary":"Other computers on your network see this server under this name.","type":"text","default":"","value":"harbringer","hidden":false,"advanced":false,"group":"general"},
+        {"id":"OnDeckLimit","label":"On Deck limit","summary":"The maximum number of items shown in Continue Watching.","type":"int","default":40,"value":40,"hidden":false,"advanced":false,"group":"library"},
+        {"id":"ScannerLowPriority","label":"Run scans at a lower priority","summary":"","type":"bool","default":false,"value":false,"hidden":false,"advanced":false,"group":"library"},
+        {"id":"AllowLegacyAgents","label":"Allow legacy agents","summary":"","type":"bool","default":true,"value":true,"hidden":true,"advanced":false,"group":"library"},
+        {"id":"CLDriver","label":"","summary":"","type":"text","default":"","value":"","hidden":true,"advanced":false,"group":"transcoder"},
+        {"id":"LanNetworksBandwidth","label":"LAN Networks","summary":"","type":"text","default":"","value":"","hidden":false,"advanced":true,"group":"network"},
+        {"id":"secureConnections","label":"Secure connections","summary":"","type":"int","default":1,"value":1,"hidden":false,"advanced":true,"group":"network","enumValues":"0:Disabled|1:Preferred|2:Required"},
+        {"id":"PublishServerOnPlexOnline","label":"Show your server on plex.tv","summary":"","type":"bool","default":true,"value":true,"hidden":false,"advanced":false,"group":"network"}
+    ]);
+    plex_json(serde_json::json!({
+        "MediaContainer": {"size": settings.as_array().map_or(0, Vec::len), "Setting": settings}
     }))
 }
 
@@ -4922,15 +5374,37 @@ async fn plex_global_hubs(
 fn plex_notification_response(upgrade: WebSocketUpgrade) -> Response {
     upgrade
         .on_upgrade(|mut socket| async move {
-            while let Some(Ok(message)) = socket.recv().await {
-                match message {
-                    Message::Ping(payload) => {
-                        if socket.send(Message::Pong(payload)).await.is_err() {
+            let mut heartbeat = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_secs(10),
+                Duration::from_secs(10),
+            );
+            loop {
+                tokio::select! {
+                    message = socket.recv() => match message {
+                        Some(Ok(Message::Ping(payload))) => {
+                            if socket.send(Message::Pong(payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Close(frame))) => {
+                            info!(?frame, "Plex notification socket closed by client");
+                            break;
+                        }
+                        Some(Ok(Message::Text(_) | Message::Binary(_) | Message::Pong(_))) => {}
+                        Some(Err(error)) => {
+                            info!(%error, "Plex notification socket read failed");
+                            break;
+                        }
+                        None => {
+                            info!("Plex notification socket ended by client");
+                            break;
+                        }
+                    },
+                    _ = heartbeat.tick() => {
+                        if socket.send(Message::Ping(vec![b'?'].into())).await.is_err() {
                             break;
                         }
                     }
-                    Message::Close(_) => break,
-                    Message::Text(_) | Message::Binary(_) | Message::Pong(_) => {}
                 }
             }
         })
@@ -5111,8 +5585,16 @@ fn plex_rating(metadata: &serde_json::Value) -> Option<f64> {
 
 fn plex_section_metadata(state: &AppState, section: usize) -> HashMap<String, serde_json::Value> {
     let mut metadata = HashMap::new();
-    if let Ok(connection) = state.db.lock() {
-        if let Ok(mut statement) = connection.prepare(
+    let Ok(config) = state.config.lock().map(|config| config.clone()) else {
+        return metadata;
+    };
+    let Some(library) = config.libraries.get(section.saturating_sub(1)).cloned() else {
+        return metadata;
+    };
+    let sidecar_mode = config.metadata_storage == "sidecar";
+    if !sidecar_mode {
+        if let Ok(connection) = state.db.lock() {
+            if let Ok(mut statement) = connection.prepare(
             "SELECT media_key, metadata_json FROM media WHERE media_key LIKE ?1 AND metadata_json IS NOT NULL",
         ) {
             if let Ok(rows) = statement.query_map([format!("{section}-%")], |row| {
@@ -5129,21 +5611,17 @@ fn plex_section_metadata(state: &AppState, section: usize) -> HashMap<String, se
                 }
             }
         }
+        }
     }
 
-    let library = state
-        .config
-        .lock()
-        .ok()
-        .and_then(|config| config.libraries.get(section.saturating_sub(1)).cloned());
-    let Some(library) = library else {
-        return metadata;
-    };
     for media in state
         .media
         .iter()
         .filter(|media| media_in_library(media, &library))
     {
+        if !sidecar_mode {
+            continue;
+        }
         if metadata.contains_key(&media.id) {
             continue;
         }
@@ -5155,22 +5633,7 @@ fn plex_section_metadata(state: &AppState, section: usize) -> HashMap<String, se
             continue;
         };
         let group_path = metadata_group_path(root, &media.path, &library.kind);
-        let info_path = if group_path.is_file() {
-            group_path.parent().unwrap_or(root).join(".mplex/info.toml")
-        } else {
-            group_path.join(".mplex/info.toml")
-        };
-        let Ok(contents) = std::fs::read_to_string(info_path) else {
-            continue;
-        };
-        let Ok(info) = toml::from_str::<toml::Value>(&contents) else {
-            continue;
-        };
-        let Some(mut item) = info
-            .get("metadata_json")
-            .and_then(toml::Value::as_str)
-            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-        else {
+        let Some(mut item) = read_sidecar_metadata(&group_path) else {
             continue;
         };
         if library.kind == "tv" {
@@ -5191,6 +5654,60 @@ fn plex_section_metadata(state: &AppState, section: usize) -> HashMap<String, se
             }
         }
         metadata.insert(media.id.clone(), item);
+    }
+    if let Ok(connection) = state.db.lock() {
+        if let Ok(mut statement) = connection.prepare(
+            "SELECT media_key, position_ms, duration_ms, watched, updated_at FROM watch_progress WHERE user_id = ?1",
+        ) {
+            if let Ok(rows) = statement.query_map([USER_ID], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            }) {
+                let progress = rows
+                    .filter_map(Result::ok)
+                    .map(|(path, position, duration, watched, updated_at)| {
+                        (path, (position, duration, watched, updated_at))
+                    })
+                    .collect::<HashMap<_, _>>();
+                for media in state
+                    .media
+                    .iter()
+                    .filter(|media| media_in_library(media, &library))
+                {
+                    let Some(root) = library
+                        .folders
+                        .iter()
+                        .find(|folder| media.path.starts_with(folder))
+                    else {
+                        continue;
+                    };
+                    let Some(path) = media.path.strip_prefix(root).ok() else {
+                        continue;
+                    };
+                    let Some((position, duration, watched, updated_at)) =
+                        progress.get(path.to_string_lossy().as_ref())
+                    else {
+                        continue;
+                    };
+                    let item = metadata
+                        .entry(media.id.clone())
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let Some(object) = item.as_object_mut() {
+                        object.insert("mplex_view_offset".to_owned(), serde_json::json!(position));
+                        object.insert("mplex_view_count".to_owned(), serde_json::json!(i64::from(*watched)));
+                        object.insert("mplex_last_viewed_at".to_owned(), serde_json::json!(updated_at));
+                        if let Some(duration) = duration {
+                            object.insert("mplex_duration".to_owned(), serde_json::json!(duration));
+                        }
+                    }
+                }
+            }
+        }
     }
     metadata
 }
@@ -5216,6 +5733,25 @@ async fn plex_section(State(state): State<AppState>, Path(section): Path<usize>)
                 "title": library.name,
                 "uuid": uuid
             }]
+        }
+    }))
+}
+
+async fn plex_section_prefs(State(state): State<AppState>, Path(section): Path<usize>) -> Response {
+    let Some(library) = state
+        .config
+        .lock()
+        .ok()
+        .and_then(|config| config.libraries.get(section.saturating_sub(1)).cloned())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": 0,
+            "librarySectionID": section,
+            "librarySectionTitle": library.name,
+            "Setting": []
         }
     }))
 }
@@ -5461,9 +5997,19 @@ async fn plex_art(State(state): State<AppState>, Path(id): Path<String>) -> Resp
 
 async fn plex_artwork(state: &AppState, id: &str, filename: &str) -> Response {
     let Some(media) = find_media(state, id) else {
+        info!(
+            media_id = id,
+            artwork = filename,
+            "Plex artwork references unknown media"
+        );
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some((_, library)) = media_library(state, media) else {
+        info!(
+            media_id = id,
+            artwork = filename,
+            "Plex artwork media has no library"
+        );
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some(root) = library
@@ -5473,26 +6019,41 @@ async fn plex_artwork(state: &AppState, id: &str, filename: &str) -> Response {
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let group_path = metadata_group_path(root, &media.path, &library.kind);
-    let group_directory = if group_path.is_file() {
-        group_path.parent().unwrap_or(root)
-    } else {
-        group_path.as_path()
-    };
-    let season_directory = media.path.parent().unwrap_or(root);
-    let artwork_paths = if library.kind == "tv" && filename == "cover.jpg" {
-        [
-            season_directory.join(".mplex").join(filename),
-            group_directory.join(".mplex").join(filename),
-        ]
-    } else {
-        [
-            group_directory.join(".mplex").join(filename),
-            season_directory.join(".mplex").join(filename),
-        ]
-    };
-    for artwork in artwork_paths {
-        if let Ok(bytes) = tokio::fs::read(artwork).await {
+    let sidecar_mode = state
+        .config
+        .lock()
+        .is_ok_and(|config| config.metadata_storage == "sidecar");
+    if sidecar_mode {
+        let group_path = metadata_group_path(root, &media.path, &library.kind);
+        let group_directory = if group_path.is_file() {
+            group_path.parent().unwrap_or(root)
+        } else {
+            group_path.as_path()
+        };
+        let season_directory = media.path.parent().unwrap_or(root);
+        let artwork_paths = if library.kind == "tv" && filename == "cover.jpg" {
+            [
+                season_directory.join(".mplex").join(filename),
+                group_directory.join(".mplex").join(filename),
+            ]
+        } else {
+            [
+                group_directory.join(".mplex").join(filename),
+                season_directory.join(".mplex").join(filename),
+            ]
+        };
+        for artwork in artwork_paths {
+            if let Ok(bytes) = tokio::fs::read(artwork).await {
+                return (
+                    [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
+                    bytes,
+                )
+                    .into_response();
+            }
+        }
+    }
+    if filename == "cover.jpg" {
+        if let Some(bytes) = plex_frame_cover(state, media).await {
             return (
                 [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
                 bytes,
@@ -5500,7 +6061,75 @@ async fn plex_artwork(state: &AppState, id: &str, filename: &str) -> Response {
                 .into_response();
         }
     }
+    info!(
+        media_id = id,
+        artwork = filename,
+        "Plex artwork unavailable"
+    );
     StatusCode::NOT_FOUND.into_response()
+}
+
+async fn plex_frame_cover(state: &AppState, media: &Media) -> Option<Vec<u8>> {
+    let cache_dir = state
+        .config_path
+        .parent()
+        .unwrap_or(std::path::Path::new("config"))
+        .join("artwork-cache");
+    let cache_key = format!(
+        "{:x}",
+        Sha256::digest(format!(
+            "{}:{}:{}",
+            media.id,
+            media.size,
+            media_modified_at(media)
+        ))
+    );
+    let cache_path = cache_dir.join(format!("{cache_key}.jpg"));
+    if let Ok(bytes) = tokio::fs::read(&cache_path).await {
+        return Some(bytes);
+    }
+
+    let probe = probe_media(&media.path).await?;
+    let duration = probe
+        .get("format")?
+        .get("duration")?
+        .as_str()?
+        .parse::<f64>()
+        .ok()?;
+    let seek = plex_frame_seek(duration)?;
+    let output = tokio::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-ss", &seek, "-i"])
+        .arg(&media.path)
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=640:-2",
+            "-q:v",
+            "3",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "pipe:1",
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        warn!(media_id = %media.id, "could not extract 10% Plex cover frame");
+        return None;
+    }
+    if tokio::fs::create_dir_all(&cache_dir).await.is_ok() {
+        if let Err(error) = tokio::fs::write(&cache_path, &output.stdout).await {
+            warn!(media_id = %media.id, %error, "could not cache Plex cover frame");
+        }
+    }
+    Some(output.stdout)
+}
+
+fn plex_frame_seek(duration: f64) -> Option<String> {
+    (duration.is_finite() && duration > 0.0).then(|| format!("{:.3}", duration * 0.1))
 }
 
 fn plex_section_directories(state: &AppState) -> (usize, Vec<serde_json::Value>) {
@@ -5563,6 +6192,10 @@ fn plex_video_json(
     metadata: Option<&serde_json::Value>,
 ) -> serde_json::Value {
     let media_type = plex_kind(&library.kind);
+    let playback_duration = metadata
+        .and_then(|metadata| metadata.get("mplex_duration"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_default();
     let title = if media_type == "show" {
         tv_episode_display_name(&media.title)
     } else {
@@ -5582,22 +6215,45 @@ fn plex_video_json(
         "titleSort": media.title.to_lowercase(),
         "updatedAt": modified_at,
         "addedAt": modified_at,
-        "duration": 0,
+        "duration": playback_duration,
+        "viewOffset": 0,
+        "viewCount": 0,
+        "lastViewedAt": 0,
         "Media": [{
             "id": media.id,
-            "duration": 0,
+            "duration": playback_duration,
             "container": media.container,
             "videoResolution": "unknown",
             "Part": [{
                 "id": media.id,
                 "key": format!("/media/{}", media.id),
-                "duration": 0,
+                "duration": playback_duration,
                 "file": media.path,
                 "size": media.size,
                 "container": media.container
             }]
         }]
     });
+    if let Some(metadata) = metadata {
+        if let Some(position) = metadata
+            .get("mplex_view_offset")
+            .and_then(serde_json::Value::as_i64)
+        {
+            item["viewOffset"] = serde_json::json!(position);
+        }
+        if let Some(count) = metadata
+            .get("mplex_view_count")
+            .and_then(serde_json::Value::as_i64)
+        {
+            item["viewCount"] = serde_json::json!(count);
+        }
+        if let Some(last_viewed) = metadata
+            .get("mplex_last_viewed_at")
+            .and_then(serde_json::Value::as_i64)
+        {
+            item["lastViewedAt"] = serde_json::json!(last_viewed);
+        }
+    }
     if let Some(year) = title_year(&media.title) {
         item["year"] = serde_json::json!(year);
     }
@@ -5936,10 +6592,23 @@ fn html(value: &str) -> String {
 mod tests {
     use super::{
         ass_to_vtt, clean_relative_path, contains_hidden_component, extract_xml_token, html,
-        parse_range, parse_tv_episode_marker, parse_tv_season_directory, plex_connectivity_url,
-        plex_device_announce_query, plex_device_announce_url, plex_photo_source, plex_presence_url,
-        plex_publish_urls, sidebar_nav_with_settings, srt_to_vtt,
+        parse_range, parse_sidecar_metadata, parse_tv_episode_marker, parse_tv_season_directory,
+        plex_connectivity_url, plex_device_announce_query, plex_device_announce_url,
+        plex_frame_seek, plex_photo_source, plex_presence_url, plex_publish_urls,
+        plex_query_media_id, sidebar_nav_with_settings, srt_to_vtt,
     };
+    #[test]
+    fn plex_playback_ids_resolve_rating_keys_and_metadata_paths() {
+        assert_eq!(
+            plex_query_media_id(Some("2-42"), Some("/library/metadata/other")),
+            Some("2-42".to_owned())
+        );
+        assert_eq!(
+            plex_query_media_id(None, Some("/library/metadata/2-42")),
+            Some("2-42".to_owned())
+        );
+        assert_eq!(plex_query_media_id(None, None), None);
+    }
     #[test]
     fn plex_photo_sources_resolve_thumb_and_art_routes() {
         assert_eq!(
@@ -5951,6 +6620,20 @@ mod tests {
             Some(("2-42".to_owned(), "banner.jpg"))
         );
         assert_eq!(plex_photo_source("/library/metadata/2-42/poster"), None);
+    }
+    #[test]
+    fn fallback_cover_frame_uses_ten_percent_position() {
+        assert_eq!(plex_frame_seek(120.0), Some("12.000".to_owned()));
+        assert_eq!(plex_frame_seek(0.0), None);
+        assert_eq!(plex_frame_seek(f64::NAN), None);
+    }
+    #[test]
+    fn sidecar_metadata_json_loads_without_database_state() {
+        let info = r#"metadata_json = '{"id":42,"title":"Portable match"}'"#;
+        let metadata = parse_sidecar_metadata(info).unwrap();
+        assert_eq!(metadata["id"], 42);
+        assert_eq!(metadata["title"], "Portable match");
+        assert_eq!(parse_sidecar_metadata("title = 'Unmatched media'"), None);
     }
     #[test]
     fn full_file() {
