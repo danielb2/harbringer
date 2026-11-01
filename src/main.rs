@@ -27,6 +27,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     net::SocketAddr,
     path::{Component, PathBuf},
+    process::Command,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -41,16 +42,14 @@ use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn, Span};
 
-const USER_ID: &str = "mplex-user";
 const POSTER_CARD_MIN_WIDTH: usize = 140;
 const PLEX_DEFAULT_AUDIO_LANGUAGE: &str = "en";
+const USER_ID: &str = "mplex-user";
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 struct Args {
     #[arg(long, value_name = "DIRECTORY")]
     config: Option<PathBuf>,
-    #[arg(long)]
-    token: Option<String>,
     #[arg(long)]
     bind: Option<SocketAddr>,
 }
@@ -59,8 +58,6 @@ struct Args {
 struct Config {
     #[serde(default = "default_bind")]
     bind: String,
-    #[serde(default = "default_token")]
-    token: String,
     #[serde(default)]
     libraries: Vec<ConfigLibrary>,
     #[serde(default = "default_metadata_storage")]
@@ -83,9 +80,6 @@ struct ConfigLibrary {
 
 fn default_bind() -> String {
     "0.0.0.0:32400".to_owned()
-}
-fn default_token() -> String {
-    "development-token".to_owned()
 }
 fn default_metadata_storage() -> String {
     "database".to_owned()
@@ -137,7 +131,6 @@ struct AppState {
     plex_stream_selections: Arc<Mutex<HashMap<u64, PlexStreamSelection>>>,
     plex_play_queues: Arc<Mutex<HashMap<u64, serde_json::Value>>>,
     next_plex_play_queue_id: Arc<AtomicU64>,
-    token: Arc<str>,
     plex_tls: PlexTls,
 }
 
@@ -148,6 +141,7 @@ struct Media {
     size: u64,
     container: String,
     mime: String,
+    metadata_revision: u64,
 }
 
 struct LocalSecondTimer;
@@ -172,6 +166,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_timer(LocalSecondTimer)
         .init();
     let args = Args::parse();
+    if run_server(args).await? == RunOutcome::Reload {
+        restart_process()?;
+    }
+    Ok(())
+}
+
+#[derive(PartialEq)]
+enum RunOutcome {
+    Reload,
+    Shutdown,
+}
+
+async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>> {
     let config_arg = args.config.unwrap_or_else(|| PathBuf::from("config"));
     let config_path = if config_arg
         .extension()
@@ -193,9 +200,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = load_config(&config_path)?;
     if let Some(bind) = args.bind {
         config.bind = bind.to_string();
-    }
-    if let Some(token) = args.token {
-        config.token = token;
     }
     save_config(&config_path, &config)?;
     let (db, machine_identifier) = open_database(&config_path)?;
@@ -247,12 +251,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         plex_stream_selections: Arc::new(Mutex::new(HashMap::new())),
         plex_play_queues: Arc::new(Mutex::new(HashMap::new())),
         next_plex_play_queue_id: Arc::new(AtomicU64::new(1)),
-        token: Arc::from(config.token),
         plex_tls,
     };
     let server_tls = state.plex_tls.clone();
     let publication_state = state.clone();
-    tokio::spawn(async move {
+    let publication_task = tokio::spawn(async move {
         let server_token = publication_state.db.lock().ok().and_then(|connection| {
             connection
                 .query_row(
@@ -285,7 +288,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
-    let app = Router::new()
+    let app = build_app(state.clone());
+    let listener = tokio::net::TcpListener::bind(config.bind.parse::<SocketAddr>()?).await?;
+    let address = listener.local_addr()?;
+    let gdm_task = tokio::spawn(run_gdm_responder(gdm_machine_identifier, address.port()));
+    let host = if address.ip().is_unspecified() {
+        "127.0.0.1".to_owned()
+    } else {
+        format!("{}", address.ip())
+    };
+    print!("\n");
+    print_startup_banner();
+    println!(
+        "harbringer running on port {}\nWeb client: http://{}:{}/\n",
+        address.port(),
+        host,
+        address.port()
+    );
+    #[cfg(unix)]
+    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = server_tls.serve_until(listener, app, async move {
+        let _ = shutdown_rx.await;
+    });
+    tokio::pin!(server);
+    #[cfg(unix)]
+    let outcome = tokio::select! {
+        result = &mut server => {
+            result?;
+            RunOutcome::Shutdown
+        }
+        _ = hangup.recv() => {
+            info!("SIGHUP received; gracefully reloading Harbringer");
+            RunOutcome::Reload
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("shutdown signal received");
+            RunOutcome::Shutdown
+        }
+    };
+    #[cfg(not(unix))]
+    let outcome = tokio::select! {
+        result = &mut server => {
+            result?;
+            RunOutcome::Shutdown
+        }
+        _ = tokio::signal::ctrl_c() => {
+            info!("shutdown signal received");
+            RunOutcome::Shutdown
+        }
+    };
+    let _ = shutdown_tx.send(());
+    if tokio::time::timeout(Duration::from_secs(5), &mut server)
+        .await
+        .is_err()
+    {
+        warn!("timed out waiting for active connections to close during shutdown");
+    }
+    gdm_task.abort();
+    publication_task.abort();
+    Ok(outcome)
+}
+
+#[cfg(unix)]
+fn restart_process() -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::process::CommandExt;
+
+    let executable = std::env::current_exe()?;
+    let error = Command::new(executable)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    Err(error.into())
+}
+
+#[cfg(not(unix))]
+fn restart_process() -> Result<(), Box<dyn std::error::Error>> {
+    Err("SIGHUP process reload is only available on Unix".into())
+}
+
+fn build_app(state: AppState) -> Router {
+    Router::new()
         .route("/", get(root_handler))
         .route("/library", get(web_client))
         .route("/web", get(web_client))
@@ -354,15 +436,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/library/metadata/:id/thumb", get(plex_thumb))
         .route("/library/metadata/:id/art", get(plex_art))
         .route("/media/:id", any(stream_media))
-        .route("/System/Info/Public", get(jellyfin_public_system))
-        .route("/Users/Public", get(jellyfin_public_users))
-        .route("/Users/AuthenticateByName", post(jellyfin_authenticate))
-        .route("/Users/:user/Views", get(jellyfin_views))
-        .route("/Users/:user/Items", get(jellyfin_items))
-        .route("/Items/:id", get(jellyfin_item))
-        .route("/Items/:id/PlaybackInfo", get(jellyfin_playback_info))
-        .route("/Videos/:id/stream", any(jellyfin_stream))
-        .route("/Videos/:id/stream.mp4", any(jellyfin_stream))
         .fallback(log_not_found)
         .layer(middleware::from_fn(plex_cors))
         .layer(
@@ -373,13 +446,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .get::<SocketAddr>()
                         .map(|addr| addr.ip().to_string())
                         .unwrap_or_else(|| "unknown".to_owned());
+                    let plex_product = request
+                        .headers()
+                        .get("X-Plex-Product")
+                        .and_then(|value| value.to_str().ok())
+                        .or_else(|| plex_query_value(request.uri(), "X-Plex-Product"));
+                    let client_profile = request
+                        .headers()
+                        .get("X-Plex-Client-Profile-Name")
+                        .and_then(|value| value.to_str().ok())
+                        .or_else(|| {
+                            plex_query_value(request.uri(), "X-Plex-Client-Profile-Name")
+                        });
+                    let client_platform = request
+                        .headers()
+                        .get("X-Plex-Platform")
+                        .and_then(|value| value.to_str().ok())
+                        .or_else(|| plex_query_value(request.uri(), "X-Plex-Platform"));
                     info!(
-                        "event=http_request remote_ip={} method={} path={} accept={:?} plex_product={:?} token_present={}",
+                        "event=http_request remote_ip={} method={} path={} accept={:?} plex_product={:?} client_profile={:?} client_platform={:?} token_present={}",
                         remote_ip,
                         request.method(),
                         request.uri().path(),
                         request.headers().get(header::ACCEPT),
-                        request.headers().get("X-Plex-Product"),
+                        plex_product,
+                        client_profile,
+                        client_platform,
                         plex_request_token(request.headers(), request.uri()).is_some()
                     );
                 })
@@ -391,25 +483,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }),
         )
-        .with_state(state);
-    let listener = tokio::net::TcpListener::bind(config.bind.parse::<SocketAddr>()?).await?;
-    let address = listener.local_addr()?;
-    tokio::spawn(run_gdm_responder(gdm_machine_identifier, address.port()));
-    let host = if address.ip().is_unspecified() {
-        "127.0.0.1".to_owned()
-    } else {
-        format!("{}", address.ip())
-    };
-    print!("\n");
-    print_startup_banner();
-    println!(
-        "harbringer running on port {}\nWeb client: http://{}:{}/\n",
-        address.port(),
-        host,
-        address.port()
-    );
-    server_tls.serve(listener, app).await?;
-    Ok(())
+        .with_state(state)
 }
 
 async fn run_gdm_responder(machine_identifier: String, port: u16) {
@@ -497,6 +571,10 @@ async fn scan_media(dir: &PathBuf) -> Result<Vec<Media>, Box<dyn std::error::Err
     }
     paths.sort_by_key(|path| path.file_name().map(|name| name.to_ascii_lowercase()));
 
+    let metadata_revision = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
     let mut result = Vec::with_capacity(paths.len());
     for (index, path) in paths.into_iter().enumerate() {
         let metadata = tokio::fs::metadata(&path).await?;
@@ -513,6 +591,7 @@ async fn scan_media(dir: &PathBuf) -> Result<Vec<Media>, Box<dyn std::error::Err
             size: metadata.len(),
             container: container.to_owned(),
             mime: mime.to_owned(),
+            metadata_revision,
         });
     }
     Ok(result)
@@ -533,7 +612,11 @@ fn media_type(path: &PathBuf) -> Option<(&'static str, &'static str)> {
 }
 
 fn find_media<'a>(state: &'a AppState, id: &str) -> Option<&'a Media> {
-    state.media.iter().find(|item| item.id == id)
+    let public_rating_key = id.parse::<u64>().ok();
+    state
+        .media
+        .iter()
+        .find(|item| item.id == id || public_rating_key == Some(plex_rating_key(item)))
 }
 
 fn persist_media_records(
@@ -561,7 +644,6 @@ fn load_config(path: &std::path::Path) -> Result<Config, Box<dyn std::error::Err
     if !path.exists() {
         return Ok(Config {
             bind: default_bind(),
-            token: default_token(),
             libraries: Vec::new(),
             metadata_storage: default_metadata_storage(),
             tmdb_bearer_token: None,
@@ -2730,6 +2812,44 @@ fn technical_text<'a>(track: &'a serde_json::Value, key: &str) -> Option<&'a str
     track.get(key).and_then(serde_json::Value::as_str)
 }
 
+fn technical_bitrate_kbps(track: &serde_json::Value) -> Option<u64> {
+    technical_text(track, "BitRate")
+        .or_else(|| technical_text(track, "BitRate_Nominal"))
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|bits_per_second| bits_per_second / 1000)
+}
+
+fn average_bitrate_kbps(size_bytes: u64, duration_ms: i64) -> Option<u64> {
+    let duration_ms = u128::try_from(duration_ms).ok()?;
+    if duration_ms == 0 {
+        return None;
+    }
+    let bits = u128::from(size_bytes).checked_mul(8)?;
+    u64::try_from((bits + duration_ms / 2) / duration_ms).ok()
+}
+
+fn plex_video_profile(value: &str) -> String {
+    let profile = value
+        .split('@')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .to_ascii_lowercase();
+    match profile.as_str() {
+        "constrained baseline" => "baseline".to_owned(),
+        "high 10" | "high 10 intra" => "high10".to_owned(),
+        "high 4:2:2" => "high422".to_owned(),
+        "high 4:4:4" => "high444".to_owned(),
+        "main 10" => "main10".to_owned(),
+        _ => profile.replace([' ', '-'], ""),
+    }
+}
+
+fn plex_video_level(value: &str) -> Option<u64> {
+    let level = value.trim().parse::<f64>().ok()?;
+    (level.is_finite() && level > 0.0).then(|| (level * 10.0).round() as u64)
+}
+
 fn technical_track_id(track: &serde_json::Value) -> u64 {
     technical_text(track, "StreamOrder")
         .or_else(|| technical_text(track, "ID"))
@@ -2767,6 +2887,23 @@ fn plex_media_id(media: &Media) -> u64 {
     plex_safe_numeric_id(&format!("media:{}", media.id))
 }
 
+fn plex_rating_key(media: &Media) -> u64 {
+    const ITEM_ID_BITS: u32 = 20;
+    const ITEM_ID_MASK: u64 = (1 << ITEM_ID_BITS) - 1;
+    const MAX_SECTION_ID: u64 = (i32::MAX as u64) >> ITEM_ID_BITS;
+
+    media
+        .id
+        .split_once('-')
+        .and_then(|(section, item)| {
+            let section = section.parse::<u64>().ok()?;
+            let item = item.parse::<u64>().ok()?;
+            (section > 0 && section <= MAX_SECTION_ID && item > 0 && item <= ITEM_ID_MASK)
+                .then_some((section << ITEM_ID_BITS) | item)
+        })
+        .unwrap_or_else(|| plex_safe_numeric_id(&format!("rating-key:{}", media.id)))
+}
+
 fn find_media_part<'a>(state: &'a AppState, id: &str) -> Option<&'a Media> {
     let id = id.parse::<u64>().ok()?;
     state.media.iter().find(|media| plex_part_id(media) == id)
@@ -2799,6 +2936,16 @@ fn plex_language(language: &str) -> (&'static str, &'static str) {
             )
         })
         .unwrap_or(("und", "Unknown"))
+}
+
+fn plex_language_code_3(code: &str) -> &'static str {
+    if code == "und" {
+        return "und";
+    }
+    Language::from_639_1(code)
+        .or_else(|| Language::from_639_3(code))
+        .map(|language| language.to_639_3())
+        .unwrap_or("und")
 }
 
 fn iso_639_2_bibliographic_alias(code: &str) -> Option<&'static str> {
@@ -3000,6 +3147,14 @@ fn apply_plex_technical_metadata(
         return;
     };
     media_json["duration"] = serde_json::json!(duration);
+    if let Some(bitrate) = tracks
+        .iter()
+        .find(|track| technical_text(track, "@type") == Some("General"))
+        .and_then(|track| technical_bitrate_kbps(track))
+        .or_else(|| average_bitrate_kbps(media.size, duration))
+    {
+        media_json["bitrate"] = serde_json::json!(bitrate);
+    }
     let mut plex_streams = Vec::new();
     for track in tracks {
         let stream_type = match technical_text(track, "@type") {
@@ -3013,12 +3168,12 @@ fn apply_plex_technical_metadata(
             .or_else(|| technical_text(track, "CodecID"))
             .unwrap_or("unknown");
         let codec = plex_codec(codec_value);
-        let (mut language_code, _) = plex_track_language(track);
+        let (mut language_code, mut language_name) = plex_track_language(track);
         let fallback_audio_language =
             (stream_type == 2 && audio_track_count == 1 && language_code == "und")
                 .then_some(plex_language(PLEX_DEFAULT_AUDIO_LANGUAGE).1);
         if fallback_audio_language.is_some() {
-            language_code = plex_language(PLEX_DEFAULT_AUDIO_LANGUAGE).0;
+            (language_code, language_name) = plex_language(PLEX_DEFAULT_AUDIO_LANGUAGE);
         }
         let display_title = fallback_audio_language
             .map(|language| plex_track_label_with_fallback(track, stream_type, Some(language)))
@@ -3029,9 +3184,11 @@ fn apply_plex_technical_metadata(
             "type": stream_type,
             "index": track_id,
             "codec": codec,
-            "language": language_code,
-            "languageCode": language_code,
+            "language": if language_code == "und" { "None" } else { language_name },
+            "languageCode": plex_language_code_3(language_code),
+            "languageTag": language_code,
             "displayTitle": display_title,
+            "extendedDisplayTitle": display_title,
             "title": technical_text(track, "Title")
                 .map(str::to_owned)
                 .unwrap_or_else(|| display_title.clone()),
@@ -3064,6 +3221,25 @@ fn apply_plex_technical_metadata(
             media_json["videoCodec"] = serde_json::json!(codec);
             plex_stream["width"] = serde_json::json!(width);
             plex_stream["height"] = serde_json::json!(height);
+            if let Some(profile) = technical_text(track, "Format_Profile") {
+                let profile = plex_video_profile(profile);
+                media_json["videoProfile"] = serde_json::json!(profile);
+                plex_stream["profile"] = serde_json::json!(profile);
+            }
+            if let Some(level) = technical_text(track, "Format_Level").and_then(plex_video_level) {
+                media_json["videoLevel"] = serde_json::json!(level);
+                plex_stream["level"] = serde_json::json!(level);
+            }
+            if let Some(bitrate) = technical_bitrate_kbps(track) {
+                plex_stream["bitrate"] = serde_json::json!(bitrate);
+            }
+            if let Some(aspect_ratio) = technical_text(track, "DisplayAspectRatio")
+                .and_then(|value| value.parse::<f64>().ok())
+            {
+                media_json["aspectRatio"] = serde_json::json!(aspect_ratio);
+            } else if height > 0 {
+                media_json["aspectRatio"] = serde_json::json!(width as f64 / height as f64);
+            }
             if let Some(frame_rate) = technical_text(track, "FrameRate") {
                 media_json["videoFrameRate"] = serde_json::json!(frame_rate);
                 plex_stream["frameRate"] = serde_json::json!(frame_rate);
@@ -3096,9 +3272,11 @@ fn apply_plex_technical_metadata(
             "type": 3,
             "index": -1,
             "codec": subtitle_path.extension().and_then(|value| value.to_str()).unwrap_or("srt").to_ascii_lowercase(),
-            "language": external_subtitle_language(&media.path, &subtitle_path).0,
-            "languageCode": external_subtitle_language(&media.path, &subtitle_path).0,
+            "language": external_subtitle_language(&media.path, &subtitle_path).1,
+            "languageCode": plex_language_code_3(external_subtitle_language(&media.path, &subtitle_path).0),
+            "languageTag": external_subtitle_language(&media.path, &subtitle_path).0,
             "displayTitle": label,
+            "extendedDisplayTitle": label,
             "title": label,
             "external": true,
             "key": format!(
@@ -3113,6 +3291,10 @@ fn apply_plex_technical_metadata(
         }));
     }
     media_json["id"] = serde_json::json!(plex_media_id(media));
+    let part_technical_fields = ["bitrate", "videoProfile", "videoLevel"]
+        .iter()
+        .filter_map(|field| media_json.get(*field).cloned().map(|value| (*field, value)))
+        .collect::<Vec<_>>();
     let part = media_json
         .get_mut("Part")
         .and_then(serde_json::Value::as_array_mut)
@@ -3127,6 +3309,9 @@ fn apply_plex_technical_metadata(
         ));
         part["duration"] = serde_json::json!(duration);
         part["Stream"] = serde_json::json!(plex_streams);
+        for (field, value) in part_technical_fields {
+            part[field] = value;
+        }
     }
 }
 
@@ -5144,6 +5329,7 @@ async fn web_stream(
         size: metadata.len(),
         container: container.to_owned(),
         mime: mime.to_owned(),
+        metadata_revision: 0,
     };
     stream_file(&media, method, headers).await
 }
@@ -5218,7 +5404,43 @@ async fn log_not_found(State(state): State<AppState>, req: Request<Body>) -> Res
         let Some(query) = query else {
             return StatusCode::BAD_REQUEST.into_response();
         };
+        info!(
+            protocol = ?query.get("protocol"),
+            direct_play = ?query.get("directPlay"),
+            direct_stream = ?query.get("directStream"),
+            direct_stream_audio = ?query.get("directStreamAudio"),
+            media_index = ?query.get("mediaIndex"),
+            part_index = ?query.get("partIndex"),
+            media_path = ?query.get("path"),
+            plex_product = ?query.get("X-Plex-Product"),
+            client_profile = ?query.get("X-Plex-Client-Profile-Name"),
+            client_platform = ?query.get("X-Plex-Platform"),
+            "Plex universal playback decision requested"
+        );
         return plex_playback_decision(State(state), Query(query)).await;
+    }
+    if let Some(extension) = req
+        .uri()
+        .path()
+        .strip_prefix("/video/:/transcode/universal/start.")
+    {
+        let query = req
+            .uri()
+            .query()
+            .and_then(|query| serde_urlencoded::from_str::<BTreeMap<String, String>>(query).ok())
+            .unwrap_or_default();
+        info!(
+            extension,
+            protocol = ?query.get("protocol"),
+            direct_play = ?query.get("directPlay"),
+            direct_stream = ?query.get("directStream"),
+            direct_stream_audio = ?query.get("directStreamAudio"),
+            media_path = ?query.get("path"),
+            plex_product = ?query.get("X-Plex-Product"),
+            client_profile = ?query.get("X-Plex-Client-Profile-Name"),
+            client_platform = ?query.get("X-Plex-Platform"),
+            "Plex universal stream start requested"
+        );
     }
     if req.uri().path() == "/photo/:/transcode" {
         let query = req
@@ -5459,28 +5681,12 @@ async fn plex_cors(request: Request<Body>, next: Next) -> Response {
 }
 
 fn plex_cors_path(path: &str) -> bool {
-    path == "/"
-        || matches!(
-            path,
-            "/identity"
-                | "/myplex/account"
-                | "/accounts"
-                | "/activities"
-                | "/servers"
-                | "/media/providers"
-                | "/security/resources"
-        )
-        || [
-            "/:/",
-            "/hubs",
-            "/library/",
-            "/photo/",
-            "/media/",
-            "/accounts/",
-            "/status/",
-        ]
-        .iter()
-        .any(|prefix| path.starts_with(prefix))
+    // Keep the built-in UI same-origin while allowing Plex Web's file://
+    // origin to call every Plex API operation, including queues and transcode.
+    path != "/library"
+        && path != "/web"
+        && !path.starts_with("/web/")
+        && !path.starts_with("/settings")
 }
 
 async fn root_handler(State(s): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
@@ -5575,10 +5781,10 @@ async fn plex_root(state: &AppState) -> Response {
             "transcoderLyrics": false,
             "transcoderPhoto": false,
             "transcoderSubtitles": false,
+            // Harbringer serves the original media file and has no transcoder.
+            // Advertising video transcoding makes Plex choose its universal
+            // DASH start endpoint, which Harbringer cannot fulfill.
             "transcoderVideo": false,
-            "transcoderVideoBitrates": "64,96,208,320,720,1500,2000,3000,4000,8000,10000,12000,20000",
-            "transcoderVideoQualities": "0,1,2,3,4,5,6,7,8,9,10,11,12",
-            "transcoderVideoResolutions": "128,128,160,240,320,480,768,720,720,1080,1080,1080,1080",
             "updatedAt": updated_at,
             "updater": false,
             "version": "1.43.4.10903-e5521bd8c",
@@ -5884,9 +6090,6 @@ async fn plex_media_providers(State(state): State<AppState>) -> Response {
             "transcoderLyrics": false,
             "transcoderSubtitles": false,
             "transcoderVideo": false,
-            "transcoderVideoBitrates": "64,96,208,320,720,1500,2000,3000,4000,8000,10000,12000,20000",
-            "transcoderVideoQualities": "0,1,2,3,4,5,6,7,8,9,10,11,12",
-            "transcoderVideoResolutions": "128,128,160,240,320,480,768,720,720,1080,1080,1080,1080",
             "updatedAt": updated_at,
             "updater": false,
             "version": "1.43.4.10903-e5521bd8c",
@@ -7482,10 +7685,11 @@ fn plex_tv_episode_parents(
     item["parentIndex"] = serde_json::json!(season);
     item["index"] = serde_json::json!(episode);
     if let Some(representative) = show.episodes.first() {
+        let representative_key = plex_rating_key(representative);
         item["grandparentThumb"] =
-            serde_json::json!(format!("/library/metadata/{}/thumb", representative.id));
+            serde_json::json!(format!("/library/metadata/{representative_key}/thumb"));
         item["grandparentArt"] =
-            serde_json::json!(format!("/library/metadata/{}/art", representative.id));
+            serde_json::json!(format!("/library/metadata/{representative_key}/art"));
     }
 }
 
@@ -7750,6 +7954,9 @@ async fn plex_item(
         }
     }
     add_plex_technical_metadata(&s, &mut video, media).await;
+    // Plex for Mac refetches the selected item after creating the queue and
+    // bases its playability check on this metadata response as well.
+    plex_mark_direct_play(&mut video);
     let mut container = plex_library_media_container(
         &library,
         section,
@@ -7758,6 +7965,7 @@ async fn plex_item(
         0,
         1,
     );
+    plex_mark_direct_play_decision(&mut container);
     container["Metadata"] = serde_json::json!([video]);
     plex_json(serde_json::json!({
         "MediaContainer": container
@@ -7809,6 +8017,11 @@ fn plex_rating_key_from_source(source: &str) -> Option<String> {
     (!id.is_empty()).then(|| id.to_owned())
 }
 
+fn plex_play_queue_source_uri(library_uuid: &str, rating_key: &str) -> String {
+    let item_path = format!("/library/metadata/{rating_key}");
+    format!("library://{library_uuid}/item/{}", url_encode(&item_path))
+}
+
 fn plex_play_queue_response(
     id: u64,
     source_uri: &str,
@@ -7821,14 +8034,25 @@ fn plex_play_queue_response(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     let selected_metadata_item_id = selected
-        .and_then(|item| item.get("Media"))
-        .and_then(serde_json::Value::as_array)
-        .and_then(|media| media.first())
-        .and_then(|media| media.get("id"))
-        .cloned()
+        .and_then(|item| item.get("ratingKey"))
+        .and_then(|rating_key| {
+            rating_key.as_u64().or_else(|| {
+                rating_key
+                    .as_str()
+                    .and_then(|rating_key| rating_key.parse::<u64>().ok())
+            })
+        })
+        .map(serde_json::Value::from)
         .unwrap_or(serde_json::Value::Null);
-    serde_json::json!({
+    let media_tag_version = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let mut response = serde_json::json!({
         "MediaContainer": {
+            "identifier": "com.plexapp.plugins.library",
+            "mediaTagPrefix": "/system/bundle/media/flags/",
+            "mediaTagVersion": media_tag_version,
             "playQueueID": id,
             "playQueueSelectedItemID": selected_item_id,
             "playQueueSelectedItemOffset": 0,
@@ -7840,7 +8064,9 @@ fn plex_play_queue_response(
             "size": items.len(),
             "Metadata": items
         }
-    })
+    });
+    plex_mark_direct_play_decision(&mut response["MediaContainer"]);
+    response
 }
 
 async fn plex_create_play_queue(
@@ -7848,9 +8074,15 @@ async fn plex_create_play_queue(
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
     let Some(source_uri) = query.get("uri") else {
+        warn!(reason = "missing_uri", "Plex play queue request rejected");
         return StatusCode::BAD_REQUEST.into_response();
     };
     if !matches!(query.get("type").map(String::as_str), Some("video")) {
+        warn!(
+            queue_type = query.get("type").map(String::as_str).unwrap_or("<missing>"),
+            reason = "unsupported_type",
+            "Plex play queue request rejected"
+        );
         return StatusCode::BAD_REQUEST.into_response();
     }
     let rating_key = query
@@ -7858,25 +8090,60 @@ async fn plex_create_play_queue(
         .and_then(|key| plex_rating_key_from_source(key))
         .or_else(|| plex_rating_key_from_source(source_uri));
     let Some(rating_key) = rating_key else {
+        warn!(
+            reason = "unrecognized_item_uri",
+            "Plex play queue request rejected"
+        );
         return StatusCode::BAD_REQUEST.into_response();
     };
     let Some(media) = find_media(&state, &rating_key) else {
+        warn!(
+            rating_key,
+            reason = "item_not_found",
+            "Plex play queue request rejected"
+        );
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some((section, library)) = media_library(&state, media) else {
+        warn!(
+            rating_key,
+            reason = "item_has_no_library",
+            "Plex play queue request rejected"
+        );
         return StatusCode::NOT_FOUND.into_response();
     };
     let metadata = plex_section_metadata(&state, section);
     let mut item = plex_video_json(media, section, &library, metadata.get(&media.id));
     add_plex_technical_metadata(&state, &mut item, media).await;
+    // Harbringer serves original files without transcoding. Include the direct
+    // play selection in the queue item so clients that do not request the
+    // separate universal decision endpoint still see a playable stream.
+    plex_mark_direct_play(&mut item);
     let queue_id = state
         .next_plex_play_queue_id
         .fetch_add(1, Ordering::Relaxed);
-    let queue_item_id = plex_safe_numeric_id(&format!("play-queue:{queue_id}:{}", media.id));
+    // This queue currently contains one item, so its server-unique queue ID
+    // also serves as the compact integer playQueueItemID expected by PMS clients.
+    let queue_item_id = queue_id;
     item["playQueueItemID"] = serde_json::json!(queue_item_id);
-    let response = plex_play_queue_response(queue_id, source_uri, vec![item], 0);
+    let library_uuid = plex_library_uuid(&state.machine_identifier, section);
+    let plex_rating_key = plex_rating_key(media).to_string();
+    let normalized_source_uri = plex_play_queue_source_uri(&library_uuid, &plex_rating_key);
+    let selected_metadata_item_id = plex_rating_key.parse::<u64>().unwrap_or_default();
+    info!(
+        queue_id,
+        incoming_key = %rating_key,
+        public_rating_key = %plex_rating_key,
+        selected_metadata_item_id,
+        queue_item_id,
+        source_uri = %normalized_source_uri,
+        "Plex play queue created"
+    );
+    let response = plex_play_queue_response(queue_id, &normalized_source_uri, vec![item], 0);
     if let Ok(mut queues) = state.plex_play_queues.lock() {
         queues.insert(queue_id, response.clone());
+    } else {
+        warn!(queue_id, "Plex play queue response was not retained");
     }
     plex_json(response)
 }
@@ -7902,12 +8169,26 @@ async fn plex_playback_decision(
         .or_else(|| query.get("ratingKey").cloned())
         .or_else(|| query.get("mediaId").cloned());
     let Some(media_id) = media_id else {
+        warn!(
+            reason = "missing_media_id",
+            "Plex playback decision rejected"
+        );
         return StatusCode::BAD_REQUEST.into_response();
     };
     let Some(media) = find_media(&state, &media_id) else {
+        warn!(
+            media_id,
+            reason = "item_not_found",
+            "Plex playback decision rejected"
+        );
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some((section, library)) = media_library(&state, media) else {
+        warn!(
+            media_id,
+            reason = "item_has_no_library",
+            "Plex playback decision rejected"
+        );
         return StatusCode::NOT_FOUND.into_response();
     };
 
@@ -7916,6 +8197,7 @@ async fn plex_playback_decision(
     add_plex_technical_metadata(&state, &mut video, media).await;
     plex_mark_direct_play(&mut video);
     let library_uuid = plex_library_uuid(&state.machine_identifier, section);
+    info!(media_id, section, "Plex direct-play decision returned");
     plex_json(plex_direct_play_decision_response(
         video,
         section,
@@ -7931,14 +8213,23 @@ fn plex_direct_play_decision_response(
     library_uuid: &str,
 ) -> serde_json::Value {
     let mut container = plex_library_media_container(library, section, library_uuid, 1, 0, 1);
-    container["directPlayDecisionCode"] = serde_json::json!(1000);
-    container["directPlayDecisionText"] = serde_json::json!("Direct play OK.");
-    container["generalDecisionCode"] = serde_json::json!(1000);
-    container["generalDecisionText"] = serde_json::json!("Direct play OK.");
+    plex_mark_direct_play_decision(&mut container);
+    // The client uses the overall decision fields to choose its playback
+    // path. Returning a conversion failure here overrides the successful
+    // direct-play result and produces Plex's "server is not powerful enough"
+    // error before it requests the original media part. This response is a
+    // direct-play decision; advertise that same successful result consistently.
     container["transcodeDecisionCode"] = serde_json::json!(1000);
     container["transcodeDecisionText"] = serde_json::json!("Direct play OK.");
     container["Metadata"] = serde_json::json!([video]);
     serde_json::json!({"MediaContainer": container})
+}
+
+fn plex_mark_direct_play_decision(container: &mut serde_json::Value) {
+    container["directPlayDecisionCode"] = serde_json::json!(1000);
+    container["directPlayDecisionText"] = serde_json::json!("Direct play OK.");
+    container["generalDecisionCode"] = serde_json::json!(1000);
+    container["generalDecisionText"] = serde_json::json!("Direct play OK.");
 }
 
 fn plex_mark_direct_play(video: &mut serde_json::Value) {
@@ -8336,6 +8627,7 @@ fn plex_video_json(
     library: &ConfigLibrary,
     metadata: Option<&serde_json::Value>,
 ) -> serde_json::Value {
+    let rating_key = plex_rating_key(media).to_string();
     let media_type = if library.kind == "tv" {
         "episode"
     } else {
@@ -8352,18 +8644,18 @@ fn plex_video_json(
     };
     let modified_at = media_modified_at(media);
     let mut item = serde_json::json!({
-        "ratingKey": media.id,
-        "key": format!("/library/metadata/{}", media.id),
+        "ratingKey": rating_key,
+        "key": format!("/library/metadata/{rating_key}"),
         "type": media_type,
         "title": title,
-        "thumb": format!("/library/metadata/{}/thumb", media.id),
-        "art": format!("/library/metadata/{}/art", media.id),
+        "thumb": format!("/library/metadata/{rating_key}/thumb"),
+        "art": format!("/library/metadata/{rating_key}/art"),
         "librarySectionID": section,
         "librarySectionKey": format!("/library/sections/{section}"),
         "librarySectionTitle": library.name,
         "originalTitle": media.title,
         "titleSort": media.title.to_lowercase(),
-        "updatedAt": modified_at,
+        "updatedAt": modified_at.max(media.metadata_revision),
         "addedAt": modified_at,
         "duration": playback_duration,
         "viewOffset": 0,
@@ -8384,6 +8676,8 @@ fn plex_video_json(
                 "file": media.path,
                 "size": media.size,
                 "container": media.container,
+                "exists": true,
+                "accessible": true,
                 "has64bitOffsets": media.size > i32::MAX as u64,
                 "optimizedForStreaming": false
             }]
@@ -8563,74 +8857,6 @@ fn tmdb_genre_name(media_type: &str, id: i64) -> Option<&'static str> {
     Some(name)
 }
 
-async fn jellyfin_public_system() -> Json<serde_json::Value> {
-    Json(serde_json::json!({"LocalAddress":"","ServerName":"mplex","Version":"0.1.0","Id":"mplex"}))
-}
-
-async fn jellyfin_public_users() -> Json<serde_json::Value> {
-    Json(serde_json::json!([{"Name":"mplex","Id":USER_ID,"HasPassword":false}]))
-}
-
-#[derive(Deserialize)]
-struct Login {
-    #[serde(rename = "Username")]
-    _username: Option<String>,
-    #[serde(rename = "Pw")]
-    _password: Option<String>,
-}
-
-async fn jellyfin_authenticate(
-    State(s): State<AppState>,
-    Json(_login): Json<Login>,
-) -> Json<serde_json::Value> {
-    Json(
-        serde_json::json!({"User":{"Name":"mplex","Id":USER_ID},"AccessToken":s.token.as_ref(),"ServerId":"mplex"}),
-    )
-}
-
-async fn jellyfin_views() -> Json<serde_json::Value> {
-    Json(
-        serde_json::json!({"Items":[{"Name":"Movies","Id":"library","CollectionType":"movies","ServerId":"mplex"}],"TotalRecordCount":1}),
-    )
-}
-
-async fn jellyfin_items(State(s): State<AppState>) -> Json<serde_json::Value> {
-    Json(
-        serde_json::json!({"Items":s.media.iter().map(jellyfin_item_value).collect::<Vec<_>>(),"TotalRecordCount":s.media.len()}),
-    )
-}
-
-async fn jellyfin_item(
-    State(s): State<AppState>,
-    Path(id): Path<String>,
-) -> Json<serde_json::Value> {
-    Json(
-        serde_json::json!({"Items":find_media(&s, &id).map(jellyfin_item_value).into_iter().collect::<Vec<_>>(),"TotalRecordCount":if find_media(&s, &id).is_some() { 1 } else { 0 }}),
-    )
-}
-
-fn jellyfin_item_value(media: &Media) -> serde_json::Value {
-    let path = media.path.to_string_lossy().to_string();
-    serde_json::json!({"Name":media.title,"Id":media.id,"Type":"Movie","MediaType":"Video","RunTimeTicks":0,"Container":media.container,"Path":path,"ImageTags":{},"MediaSources":[{"Id":media.id,"Path":path,"DirectStreamUrl":format!("/Videos/{}/stream", media.id),"Container":media.container,"Size":media.size,"SupportsDirectPlay":true,"SupportsDirectStream":false,"SupportsTranscoding":false,"MediaStreams":[]}]})
-}
-
-async fn jellyfin_playback_info(State(s): State<AppState>, Path(id): Path<String>) -> Response {
-    let Some(media) = find_media(&s, &id) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let path = media.path.to_string_lossy().to_string();
-    Json(serde_json::json!({"MediaSources":[{"Id":media.id,"Path":path,"DirectStreamUrl":format!("/Videos/{}/stream", media.id),"Container":media.container,"Size":media.size,"SupportsDirectPlay":true,"SupportsDirectStream":false,"SupportsTranscoding":false,"MediaStreams":[]}]})).into_response()
-}
-
-async fn jellyfin_stream(
-    State(s): State<AppState>,
-    Path(id): Path<String>,
-    method: Method,
-    headers: HeaderMap,
-) -> Response {
-    stream_for_id(s, id, method, headers).await
-}
-
 async fn stream_media(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -8765,14 +8991,15 @@ mod tests {
         plex_external_subtitle_id, plex_genre_tokens, plex_hub_categories, plex_language,
         plex_library_children_container, plex_library_media_container,
         plex_library_provider_features, plex_mark_direct_play, plex_media_id, plex_paged_children,
-        plex_part_id, plex_photo_source, plex_play_queue_response, plex_presence_url,
-        plex_publish_urls, plex_query_media_id, plex_ranked_tv_shows, plex_rating_key_from_source,
-        plex_safe_numeric_id, plex_search_hubs, plex_search_rank, plex_search_result_entries,
-        plex_search_type_matches, plex_stream_id, plex_track_label, plex_tv_episode_parents,
-        plex_tv_season_groups, plex_tv_season_json, plex_tv_show_groups, plex_tv_show_json,
-        plex_video_json, plex_video_resolution, sidebar_nav_with_settings, srt_to_vtt,
-        technical_duration_ms, technical_tracks, tv_show_title, vtt_to_srt, ConfigLibrary,
-        HeaderMap, HeaderValue, Media, PathBuf, PlexStreamSelection, Uri,
+        plex_part_id, plex_photo_source, plex_play_queue_response, plex_play_queue_source_uri,
+        plex_presence_url, plex_publish_urls, plex_query_media_id, plex_ranked_tv_shows,
+        plex_rating_key, plex_rating_key_from_source, plex_safe_numeric_id, plex_search_hubs,
+        plex_search_rank, plex_search_result_entries, plex_search_type_matches, plex_stream_id,
+        plex_track_label, plex_tv_episode_parents, plex_tv_season_groups, plex_tv_season_json,
+        plex_tv_show_groups, plex_tv_show_json, plex_video_json, plex_video_resolution,
+        sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms, technical_tracks,
+        tv_show_title, vtt_to_srt, ConfigLibrary, HeaderMap, HeaderValue, Media, PathBuf,
+        PlexStreamSelection, Uri,
     };
     #[test]
     fn plex_playback_ids_resolve_rating_keys_and_metadata_paths() {
@@ -8836,6 +9063,7 @@ mod tests {
             size: 9_000_000,
             container: "mkv".to_owned(),
             mime: "video/x-matroska".to_owned(),
+            metadata_revision: 4_000_000_000,
         };
         let library = ConfigLibrary {
             name: "Movies".to_owned(),
@@ -8845,8 +9073,8 @@ mod tests {
             show_continue_watching: true,
         };
         let info = serde_json::json!({"media":{"track":[
-            {"@type":"General", "Duration":"120.5"},
-            {"@type":"Video", "StreamOrder":"0", "Format":"AVC", "Width":"1280", "Height":"720"},
+            {"@type":"General", "Duration":"120.5", "BitRate":"1800000"},
+            {"@type":"Video", "StreamOrder":"0", "Format":"AVC", "Format_Profile":"High@L4.0", "Format_Level":"4.0", "BitRate":"1600000", "DisplayAspectRatio":"1.778", "Width":"1280", "Height":"720"},
             {"@type":"Audio", "StreamOrder":"1", "Format":"AC-3", "Channels":"6", "Language":"eng"},
             {"@type":"Text", "StreamOrder":"2", "Format":"UTF-8", "Language":"rum"}
         ]}});
@@ -8856,16 +9084,29 @@ mod tests {
 
         assert_eq!(item["duration"], 120_500);
         assert!(item.get("id").is_none());
-        assert_eq!(item["ratingKey"], "1-7");
+        assert_eq!(plex_rating_key(&media), (1 << 20) | 7);
+        assert!(plex_rating_key(&media) <= i32::MAX as u64);
+        assert_eq!(item["ratingKey"], plex_rating_key(&media).to_string());
+        assert_eq!(
+            item["key"],
+            format!("/library/metadata/{}", plex_rating_key(&media))
+        );
         assert_eq!(item["librarySectionKey"], "/library/sections/1");
         assert_eq!(item["Media"][0]["videoResolution"], "720");
         assert_eq!(item["Media"][0]["videoCodec"], "h264");
+        assert_eq!(item["Media"][0]["bitrate"], 1800);
+        assert_eq!(item["Media"][0]["videoProfile"], "high");
+        assert_eq!(item["Media"][0]["videoLevel"], 40);
+        assert_eq!(item["Media"][0]["aspectRatio"], 1.778);
         assert_eq!(item["Media"][0]["audioCodec"], "ac3");
         assert_eq!(item["Media"][0]["audioChannels"], 6);
         assert_eq!(item["Media"][0]["id"], plex_media_id(&media));
         assert_ne!(item["Media"][0]["id"], item["Media"][0]["Part"][0]["id"]);
         assert!(plex_media_id(&media) <= (1_u64 << 53) - 1);
         assert_eq!(item["Media"][0]["Part"][0]["id"], plex_part_id(&media));
+        assert_eq!(item["Media"][0]["Part"][0]["exists"], true);
+        assert_eq!(item["Media"][0]["Part"][0]["accessible"], true);
+        assert_eq!(item["Media"][0]["Part"][0]["videoProfile"], "high");
         assert!(plex_part_id(&media) <= (1_u64 << 53) - 1);
         assert!(item["Media"][0]["Part"][0]["key"]
             .as_str()
@@ -8873,11 +9114,19 @@ mod tests {
             .ends_with("/file.mkv"));
         let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
         assert_eq!(streams.len(), 4);
+        assert_eq!(streams[0]["profile"], "high");
+        assert_eq!(streams[0]["level"], 40);
+        assert_eq!(streams[0]["languageCode"], "und");
         assert_eq!(streams[1]["type"], 2);
         assert_eq!(streams[1]["channels"], 6);
         assert_eq!(streams[1]["selected"], true);
-        assert_eq!(streams[2]["language"], "ro");
+        assert_eq!(streams[2]["language"], "Romanian");
+        assert_eq!(streams[2]["languageCode"], "ron");
+        assert_eq!(streams[2]["languageTag"], "ro");
         assert_eq!(streams[3]["displayTitle"], "Romanian (SRT External)");
+        assert_eq!(streams[3]["language"], "Romanian");
+        assert_eq!(streams[3]["languageCode"], "ron");
+        assert_eq!(streams[3]["languageTag"], "ro");
         assert!(streams[3]["id"].as_u64().unwrap() <= (1_u64 << 53) - 1);
         assert!(streams[3]["key"]
             .as_str()
@@ -8911,10 +9160,46 @@ mod tests {
         let decision_container = &decision["MediaContainer"];
         assert_eq!(decision_container["directPlayDecisionCode"], 1000);
         assert_eq!(decision_container["generalDecisionText"], "Direct play OK.");
+        assert_eq!(decision_container["transcodeDecisionCode"], 1000);
+        assert_eq!(
+            decision_container["transcodeDecisionText"],
+            "Direct play OK."
+        );
         assert_eq!(
             decision_container["Metadata"][0]["Media"][0]["Part"][0]["decision"],
             "directplay"
         );
+    }
+
+    #[test]
+    fn plex_media_infers_average_bitrate_when_media_info_omits_it() {
+        let media = Media {
+            id: "1-8".to_owned(),
+            title: "Film".to_owned(),
+            path: PathBuf::from("/media/Film.mkv"),
+            size: 9_000_000,
+            container: "mkv".to_owned(),
+            mime: "video/x-matroska".to_owned(),
+            metadata_revision: 0,
+        };
+        let library = ConfigLibrary {
+            name: "Movies".to_owned(),
+            kind: "movie".to_owned(),
+            folders: Vec::new(),
+            show_recently_added: true,
+            show_continue_watching: true,
+        };
+        let info = serde_json::json!({"media":{"track":[
+            {"@type":"General", "Duration":"120.5"},
+            {"@type":"Video", "StreamOrder":"0", "Format":"AVC", "Width":"1280", "Height":"720"},
+            {"@type":"Audio", "StreamOrder":"1", "Format":"AAC", "Channels":"2"}
+        ]}});
+        let mut item = plex_video_json(&media, 1, &library, None);
+
+        apply_plex_technical_metadata(&mut item, &media, &info, &[], None);
+
+        assert_eq!(item["Media"][0]["bitrate"], 598);
+        assert_eq!(item["Media"][0]["Part"][0]["bitrate"], 598);
     }
 
     #[test]
@@ -8926,6 +9211,7 @@ mod tests {
             size: 9_000_000,
             container: "mkv".to_owned(),
             mime: "video/x-matroska".to_owned(),
+            metadata_revision: 0,
         };
         let subtitle = PathBuf::from("/media/Film.en.srt");
         let id = plex_external_subtitle_id(&first, &subtitle);
@@ -9135,6 +9421,7 @@ mod tests {
                 size: 100,
                 container: "mkv".to_owned(),
                 mime: "video/x-matroska".to_owned(),
+                metadata_revision: 0,
             },
             Media {
                 id: "3-2".to_owned(),
@@ -9143,6 +9430,7 @@ mod tests {
                 size: 100,
                 container: "mkv".to_owned(),
                 mime: "video/x-matroska".to_owned(),
+                metadata_revision: 0,
             },
         ];
         let roots = vec![root.clone()];
@@ -9204,7 +9492,7 @@ mod tests {
         );
         assert_eq!(
             episode_item["grandparentThumb"],
-            "/library/metadata/3-1/thumb"
+            format!("/library/metadata/{}/thumb", plex_rating_key(&media[0]))
         );
         assert_eq!(episode_item["title"], "Episode 1 · Pilot");
     }
@@ -9338,22 +9626,1022 @@ mod tests {
             Some("2-42".to_owned())
         );
         let item = serde_json::json!({
-            "ratingKey": "2-42",
+            "ratingKey": "142",
             "playQueueItemID": 73,
             "Media": [{"id": 51}]
         });
-        let queue = plex_play_queue_response(
-            9,
-            "library://library-id/item/%2Flibrary%2Fmetadata%2F2-42",
-            vec![item],
-            0,
-        );
+        let source_uri = plex_play_queue_source_uri("library-id", "142");
+        let queue = plex_play_queue_response(9, &source_uri, vec![item], 0);
         assert_eq!(queue["MediaContainer"]["playQueueID"], 9);
         assert_eq!(queue["MediaContainer"]["playQueueSelectedItemID"], 73);
         assert_eq!(
             queue["MediaContainer"]["playQueueSelectedMetadataItemID"],
-            51
+            142
         );
+        assert_eq!(
+            queue["MediaContainer"]["playQueueSourceURI"],
+            "library://library-id/item/%2Flibrary%2Fmetadata%2F142"
+        );
+        assert_eq!(
+            queue["MediaContainer"]["identifier"],
+            "com.plexapp.plugins.library"
+        );
+        assert_eq!(
+            queue["MediaContainer"]["mediaTagPrefix"],
+            "/system/bundle/media/flags/"
+        );
+        assert!(queue["MediaContainer"]["mediaTagVersion"]
+            .as_u64()
+            .is_some());
         assert_eq!(queue["MediaContainer"]["playQueueTotalCount"], 1);
+        assert_eq!(queue["MediaContainer"]["directPlayDecisionCode"], 1000);
+        assert_eq!(queue["MediaContainer"]["generalDecisionCode"], 1000);
+        assert_eq!(
+            queue["MediaContainer"]["generalDecisionText"],
+            "Direct play OK."
+        );
+    }
+}
+
+#[cfg(test)]
+mod plex_endpoint_tests {
+    use super::{
+        build_app, migrate_library_model, open_database, plex_external_subtitle_id, plex_part_id,
+        sync_config_libraries, AppState, Config, ConfigLibrary, Media, PlexTls,
+    };
+    use axum::{
+        body::{to_bytes, Body},
+        http::{header, Method, Request, StatusCode},
+        Router,
+    };
+    use std::{
+        collections::HashMap,
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc, Mutex,
+        },
+    };
+    use tower::ServiceExt;
+
+    #[derive(serde::Deserialize)]
+    struct PlexApiInventory {
+        spec_version: String,
+        operation_count: usize,
+        operations: Vec<PlexApiOperation>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PlexApiOperation {
+        method: String,
+        path: String,
+        operation_id: String,
+        summary: String,
+        expected_status: u16,
+    }
+
+    fn inventory_request_path(path: &str, fixture: &Fixture) -> String {
+        let mut result = String::new();
+        let mut remaining = path;
+        while let Some(open) = remaining.find('{') {
+            result.push_str(&remaining[..open]);
+            let after_open = &remaining[open + 1..];
+            let Some(close) = after_open.find('}') else {
+                result.push_str(&remaining[open..]);
+                remaining = "";
+                break;
+            };
+            let name = &after_open[..close];
+            let sample = match name {
+                "transcodeType" => "video".to_owned(),
+                "identifier" => "test".to_owned(),
+                "ext" => "srt".to_owned(),
+                "filename" => "file.mkv".to_owned(),
+                "country" | "region" => "US".to_owned(),
+                "task" => "refresh".to_owned(),
+                "element" => "thumb".to_owned(),
+                "ids" | "metadataId" => "1-1".to_owned(),
+                "partId" => fixture.part_id.to_string(),
+                "streamId" => fixture.subtitle_id.to_string(),
+                "changestamp" => fixture.change_stamp.to_string(),
+                _ => "1".to_owned(),
+            };
+            result.push_str(&sample);
+            remaining = &after_open[close + 1..];
+        }
+        result.push_str(remaining);
+        result.replace("start.*", "start.mkv")
+    }
+
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+    struct Fixture {
+        app: Router,
+        root: PathBuf,
+        part_id: u64,
+        subtitle_id: u64,
+        change_stamp: u64,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn fixture() -> Fixture {
+        let id = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "mplex-plex-endpoint-tests-{}-{id}",
+            std::process::id()
+        ));
+        let config_dir = root.join("config");
+        let media_dir = root.join("media");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(media_dir.join(".mplex")).unwrap();
+        let media_path = media_dir.join("Demo.mkv");
+        std::fs::write(&media_path, b"0123456789abcdef").unwrap();
+        std::fs::write(media_dir.join(".mplex/cover.jpg"), b"cover").unwrap();
+        std::fs::write(media_dir.join(".mplex/banner.jpg"), b"banner").unwrap();
+        std::fs::write(
+            media_dir.join("Demo.en.srt"),
+            b"1\n00:00:01,000 --> 00:00:02,000\nHello\n",
+        )
+        .unwrap();
+
+        let config_path = config_dir.join("mplex.toml");
+        let (db, machine_identifier) = open_database(&config_path).unwrap();
+        migrate_library_model(&db).unwrap();
+        let library = ConfigLibrary {
+            name: "Movies".to_owned(),
+            kind: "movie".to_owned(),
+            folders: vec![media_dir.clone()],
+            show_recently_added: true,
+            show_continue_watching: true,
+        };
+        let config = Config {
+            bind: "127.0.0.1:0".to_owned(),
+            libraries: vec![library],
+            metadata_storage: "sidecar".to_owned(),
+            tmdb_bearer_token: None,
+        };
+        sync_config_libraries(&db, &config).unwrap();
+        let mut media = Media {
+            id: "1-1".to_owned(),
+            title: "Demo".to_owned(),
+            path: media_path.clone(),
+            size: 16,
+            container: "mkv".to_owned(),
+            mime: "video/x-matroska".to_owned(),
+            metadata_revision: 0,
+        };
+        let part_id = plex_part_id(&media);
+        let subtitle_id = plex_external_subtitle_id(&media, &media_dir.join("Demo.en.srt"));
+        let change_stamp = super::media_modified_at(&media);
+        media.metadata_revision = change_stamp.saturating_add(60);
+        let state = AppState {
+            config: Arc::new(Mutex::new(config)),
+            config_path: Arc::new(config_path),
+            db: Arc::new(Mutex::new(db)),
+            machine_identifier: Arc::from(machine_identifier),
+            root: Arc::new(media_dir),
+            media: Arc::new(vec![media]),
+            media_info: Arc::new(Mutex::new(HashMap::new())),
+            plex_stream_selections: Arc::new(Mutex::new(HashMap::new())),
+            plex_play_queues: Arc::new(Mutex::new(HashMap::new())),
+            next_plex_play_queue_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            plex_tls: PlexTls::load(root.join("config/certs")).unwrap(),
+        };
+        Fixture {
+            app: build_app(state),
+            root,
+            part_id,
+            subtitle_id,
+            change_stamp,
+        }
+    }
+
+    async fn send(app: &Router, method: Method, uri: &str, body: Body) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn plex_playback_endpoints_cover_success_and_failure_paths() {
+        let fixture = fixture();
+
+        let providers = send(&fixture.app, Method::GET, "/media/providers", Body::empty()).await;
+        assert_eq!(providers.status(), StatusCode::OK);
+        let providers_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(providers.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(providers_json["MediaContainer"]["transcoderVideo"], false);
+
+        let root = send(
+            &fixture.app,
+            Method::GET,
+            "/?X-Plex-Token=test",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(root.status(), StatusCode::OK);
+        let root_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(root.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(root_json["MediaContainer"]["transcoderVideo"], false);
+
+        let preflight = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/playQueues")
+                    .header(header::ORIGIN, "file://")
+                    .header("access-control-request-method", "POST")
+                    .header(
+                        "access-control-request-headers",
+                        "content-type,x-plex-token",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::OK);
+        assert_eq!(
+            preflight.headers()["access-control-allow-origin"],
+            "file://"
+        );
+        assert_eq!(
+            preflight.headers()["access-control-allow-methods"],
+            "GET, POST, PUT, DELETE, HEAD, OPTIONS"
+        );
+
+        let queue_from_file_origin = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/playQueues?type=video&uri=%2Flibrary%2Fmetadata%2F1-1")
+                    .header(header::ORIGIN, "file://")
+                    .header(header::ACCEPT, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queue_from_file_origin.status(), StatusCode::OK);
+        assert_eq!(
+            queue_from_file_origin.headers()["access-control-allow-origin"],
+            "file://"
+        );
+
+        let item = send(
+            &fixture.app,
+            Method::GET,
+            "/library/metadata/1-1",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(item.status(), StatusCode::OK);
+        let item_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(item.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(item_json["MediaContainer"]["directPlayDecisionCode"], 1000);
+        assert_eq!(item_json["MediaContainer"]["generalDecisionCode"], 1000);
+        assert!(
+            item_json["MediaContainer"]["Metadata"][0]["updatedAt"]
+                .as_u64()
+                .unwrap()
+                > fixture.change_stamp
+        );
+        assert_eq!(
+            item_json["MediaContainer"]["Metadata"][0]["Media"][0]["decision"],
+            "directplay"
+        );
+        assert_eq!(
+            item_json["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["decision"],
+            "directplay"
+        );
+        let rating_key = item_json["MediaContainer"]["Metadata"][0]["ratingKey"]
+            .as_str()
+            .unwrap();
+        let numeric_key = rating_key.parse::<u64>().unwrap();
+        assert_eq!(item_json["MediaContainer"]["Metadata"][0]["type"], "movie");
+        assert!(
+            item_json["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["key"]
+                .as_str()
+                .unwrap()
+                .starts_with("/library/parts/")
+        );
+
+        assert_eq!(
+            send(
+                &fixture.app,
+                Method::GET,
+                "/library/metadata/missing",
+                Body::empty()
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let queue_uri = format!(
+            "/playQueues?type=video&uri=%2Flibrary%2Fmetadata%2F1-1&key=%2Flibrary%2Fmetadata%2F1-1"
+        );
+        let queue = send(&fixture.app, Method::POST, &queue_uri, Body::empty()).await;
+        assert_eq!(queue.status(), StatusCode::OK);
+        let queue_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(queue.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let queue_id = queue_json["MediaContainer"]["playQueueID"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            queue_json["MediaContainer"]["playQueueSelectedMetadataItemID"],
+            numeric_key
+        );
+        assert_eq!(
+            queue_json["MediaContainer"]["Metadata"][0]["ratingKey"],
+            rating_key
+        );
+        assert_eq!(
+            queue_json["MediaContainer"]["Metadata"][0]["Media"][0]["decision"],
+            "directplay"
+        );
+        assert_eq!(
+            queue_json["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["decision"],
+            "directplay"
+        );
+        assert_eq!(
+            send(
+                &fixture.app,
+                Method::GET,
+                &format!("/playQueues/{queue_id}"),
+                Body::empty()
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(&fixture.app, Method::GET, "/playQueues/999", Body::empty())
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            send(&fixture.app, Method::POST, "/playQueues", Body::empty())
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            send(
+                &fixture.app,
+                Method::POST,
+                "/playQueues?type=audio&uri=%2Flibrary%2Fmetadata%2F1-1",
+                Body::empty()
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            send(
+                &fixture.app,
+                Method::POST,
+                "/playQueues?type=video&uri=%2Flibrary%2Fmetadata%2F404",
+                Body::empty()
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let decision = send(
+            &fixture.app,
+            Method::GET,
+            &format!("/video/:/transcode/universal/decision?ratingKey=1-1"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(decision.status(), StatusCode::OK);
+        let decision_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(decision.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            decision_json["MediaContainer"]["directPlayDecisionCode"],
+            1000
+        );
+        assert_eq!(
+            decision_json["MediaContainer"]["Metadata"][0]["ratingKey"],
+            rating_key
+        );
+        assert_eq!(
+            send(
+                &fixture.app,
+                Method::GET,
+                "/video/:/transcode/universal/decision",
+                Body::empty()
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            send(
+                &fixture.app,
+                Method::GET,
+                "/video/:/transcode/universal/decision?ratingKey=missing",
+                Body::empty()
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let part = send(
+            &fixture.app,
+            Method::GET,
+            &format!("/library/metadata/1-1/media/{}", fixture.part_id),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(part.status(), StatusCode::OK);
+        let part_file = send(
+            &fixture.app,
+            Method::GET,
+            &format!(
+                "/library/parts/{}/{}/file.mkv",
+                fixture.part_id, fixture.change_stamp
+            ),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(part_file.status(), StatusCode::OK);
+        assert_eq!(part_file.headers()[header::ACCEPT_RANGES], "bytes");
+        let part_range = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/library/parts/{}/{}/file.mkv",
+                        fixture.part_id, fixture.change_stamp
+                    ))
+                    .header(header::RANGE, "bytes=2-5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(part_range.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(part_range.headers()[header::CONTENT_RANGE], "bytes 2-5/16");
+        assert_eq!(
+            to_bytes(part_range.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"2345"
+        );
+        assert_eq!(
+            send(
+                &fixture.app,
+                Method::GET,
+                &format!(
+                    "/library/parts/{}/{}/wrong.mkv",
+                    fixture.part_id, fixture.change_stamp
+                ),
+                Body::empty()
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            send(
+                &fixture.app,
+                Method::GET,
+                &format!(
+                    "/library/parts/{}/{}/file.mkv",
+                    fixture.part_id, fixture.change_stamp
+                ),
+                Body::empty()
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+
+        let ranged = send(&fixture.app, Method::GET, "/media/1-1", Body::empty()).await;
+        assert_eq!(ranged.status(), StatusCode::OK);
+        let range_request = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/media/1-1")
+                    .header(header::RANGE, "bytes=2-5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(range_request.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            range_request.headers()[header::CONTENT_RANGE],
+            "bytes 2-5/16"
+        );
+        assert_eq!(
+            to_bytes(range_request.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"2345"
+        );
+        let invalid_range = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/media/1-1")
+                    .header(header::RANGE, "bytes=99-")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_range.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            send(&fixture.app, Method::GET, "/media/missing", Body::empty())
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            send(
+                &fixture.app,
+                Method::PUT,
+                &format!("/library/parts/{}", fixture.part_id),
+                Body::empty()
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(
+                &fixture.app,
+                Method::PUT,
+                &format!("/library/parts/{}?audioStreamID=999", fixture.part_id),
+                Body::empty()
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            send(
+                &fixture.app,
+                Method::GET,
+                &format!("/library/streams/{}.srt?format=vtt", fixture.subtitle_id),
+                Body::empty()
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(
+                &fixture.app,
+                Method::GET,
+                "/library/streams/0.unknown",
+                Body::empty()
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        let thumb = send(
+            &fixture.app,
+            Method::GET,
+            "/library/metadata/1-1/thumb",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(thumb.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(thumb.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"cover"
+        );
+        let photo = send(
+            &fixture.app,
+            Method::GET,
+            "/photo/:/transcode?url=%2Flibrary%2Fmetadata%2F1-1%2Fthumb",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(photo.status(), StatusCode::OK);
+
+        assert_eq!(
+            send(
+                &fixture.app,
+                Method::GET,
+                "/:/timeline?ratingKey=1-1&time=500&duration=1000",
+                Body::empty()
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let progress_item = send(
+            &fixture.app,
+            Method::GET,
+            "/library/metadata/1-1",
+            Body::empty(),
+        )
+        .await;
+        let progress_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(progress_item.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            progress_json["MediaContainer"]["Metadata"][0]["viewOffset"],
+            500
+        );
+        assert_eq!(
+            send(&fixture.app, Method::GET, "/:/timeline", Body::empty())
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            send(
+                &fixture.app,
+                Method::GET,
+                "/:/scrobble?ratingKey=1-1",
+                Body::empty()
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let watched_item = send(
+            &fixture.app,
+            Method::GET,
+            "/library/metadata/1-1",
+            Body::empty(),
+        )
+        .await;
+        let watched_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(watched_item.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            watched_json["MediaContainer"]["Metadata"][0]["viewCount"],
+            1
+        );
+        assert_eq!(
+            send(
+                &fixture.app,
+                Method::GET,
+                "/:/unscrobble?ratingKey=1-1",
+                Body::empty()
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(&fixture.app, Method::GET, "/:/prefs", Body::empty())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn every_registered_plex_route_has_success_and_failure_cases() {
+        let fixture = fixture();
+        let queue = send(
+            &fixture.app,
+            Method::POST,
+            "/playQueues?type=video&uri=%2Flibrary%2Fmetadata%2F1-1",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(queue.status(), StatusCode::OK);
+
+        let cases = [
+            (Method::GET, "/?X-Plex-Product=Plex%20Test"),
+            (Method::GET, "/identity"),
+            (Method::GET, "/myplex/account"),
+            (Method::GET, "/accounts"),
+            (Method::GET, "/accounts/1"),
+            (Method::GET, "/activities"),
+            (Method::GET, "/status/sessions"),
+            (Method::GET, "/servers"),
+            (Method::GET, "/media/providers"),
+            (Method::GET, "/security/resources"),
+            (Method::GET, "/hubs"),
+            (Method::GET, "/hubs/promoted"),
+            (Method::GET, "/hubs/search?query=Demo"),
+            (Method::GET, "/hubs/sections/1"),
+            (Method::GET, "/hubs/metadata/1-1/related"),
+            (Method::GET, "/hubs/sections/1/recommended"),
+            (Method::GET, "/library/sections"),
+            (Method::GET, "/library/sections/1"),
+            (Method::GET, "/library/sections/1/collections"),
+            (Method::GET, "/library/sections/1/prefs"),
+            (Method::PUT, "/library/sections/1/prefs"),
+            (Method::GET, "/library/sections/1/sorts"),
+            (Method::GET, "/library/sections/1/filters"),
+            (Method::GET, "/library/sections/1/firstCharacter"),
+            (Method::GET, "/library/sections/1/firstCharacter/D"),
+            (Method::GET, "/library/sections/1/firstCharacters"),
+            (Method::GET, "/library/search?query=Demo"),
+            (Method::GET, "/library/sections/1/all"),
+            (Method::GET, "/library/metadata/1-1"),
+            (Method::GET, "/library/metadata/1-1/children"),
+            (Method::GET, "/library/metadata/1-1/related"),
+            (Method::GET, "/library/metadata/1-1/extras"),
+            (
+                Method::GET,
+                &format!("/library/metadata/1-1/media/{}", fixture.part_id),
+            ),
+            (Method::PUT, &format!("/library/parts/{}", fixture.part_id)),
+            (
+                Method::GET,
+                &format!(
+                    "/library/parts/{}/{}/file.mkv",
+                    fixture.part_id, fixture.change_stamp
+                ),
+            ),
+            (
+                Method::GET,
+                &format!("/library/streams/{}.srt", fixture.subtitle_id),
+            ),
+            (
+                Method::POST,
+                "/playQueues?type=video&uri=%2Flibrary%2Fmetadata%2F1-1",
+            ),
+            (Method::GET, "/playQueues/1"),
+            (Method::GET, "/library/metadata/1-1/thumb"),
+            (Method::GET, "/library/metadata/1-1/art"),
+            (Method::GET, "/media/1-1"),
+            (Method::HEAD, "/media/1-1"),
+            (
+                Method::GET,
+                "/video/:/transcode/universal/decision?ratingKey=1-1",
+            ),
+            (
+                Method::GET,
+                "/photo/:/transcode?url=%2Flibrary%2Fmetadata%2F1-1%2Fthumb",
+            ),
+            (Method::GET, "/:/timeline?ratingKey=1-1&time=100"),
+            (Method::GET, "/:/scrobble?ratingKey=1-1"),
+            (Method::GET, "/:/unscrobble?ratingKey=1-1"),
+            (Method::GET, "/:/prefs"),
+        ];
+
+        for (method, uri) in cases {
+            let response = send(&fixture.app, method.clone(), uri, Body::empty()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{method} {uri} did not dispatch successfully"
+            );
+            if uri.starts_with("/video/:/")
+                || uri.starts_with("/photo/:/")
+                || uri.starts_with("/:/")
+            {
+                continue;
+            }
+            let (failure_uri, failure_status) = if uri.starts_with("/media/") {
+                ("/media/no-such-item", StatusCode::NOT_FOUND)
+            } else {
+                (uri, StatusCode::METHOD_NOT_ALLOWED)
+            };
+            assert_eq!(
+                send(&fixture.app, Method::DELETE, failure_uri, Body::empty())
+                    .await
+                    .status(),
+                failure_status,
+                "DELETE {failure_uri} did not produce its expected failure"
+            );
+        }
+
+        // Axum's in-process oneshot service has no Hyper OnUpgrade extension,
+        // so it can verify dispatch and the expected upgrade rejection only.
+        let websocket = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/:/websockets/notifications")
+                    .header(header::CONNECTION, "Upgrade")
+                    .header(header::UPGRADE, "websocket")
+                    .header("sec-websocket-version", "13")
+                    .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(websocket.status(), StatusCode::UPGRADE_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn every_official_pms_openapi_operation_has_a_real_router_test() {
+        let inventory: PlexApiInventory =
+            serde_json::from_str(include_str!("../tests/plex_pms_api_inventory.json"))
+                .expect("checked-in PMS API inventory must be valid JSON");
+        assert_eq!(inventory.spec_version, "1.2.3");
+        assert_eq!(inventory.operations.len(), inventory.operation_count);
+        assert_eq!(inventory.operation_count, 260);
+
+        let fixture = fixture();
+        // `expected_status` is the checked-in baseline, including expected
+        // 404/405 results for documented operations not implemented yet.
+        // When an operation is implemented, update its status alongside
+        // request/response assertions rather than masking the old gap.
+        let initial_queue = send(
+            &fixture.app,
+            Method::POST,
+            "/playQueues?type=video&uri=%2Flibrary%2Fmetadata%2F1-1&key=%2Flibrary%2Fmetadata%2F1-1",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(initial_queue.status(), StatusCode::OK);
+        for operation in &inventory.operations {
+            let method = Method::from_bytes(operation.method.as_bytes())
+                .unwrap_or_else(|_| panic!("invalid HTTP method: {}", operation.method));
+            let mut uri = inventory_request_path(&operation.path, &fixture);
+            match operation.operation_id.as_str() {
+                "playQueuePostSlash" => uri.push_str(
+                    "?type=video&uri=%2Flibrary%2Fmetadata%2F1-1&key=%2Flibrary%2Fmetadata%2F1-1",
+                ),
+                "transcodeDecision" => uri.push_str("?ratingKey=1-1"),
+                "imageTranscode" => uri.push_str("?url=%2Flibrary%2Fmetadata%2F1-1%2Fthumb"),
+                _ => {}
+            }
+            let request = Request::builder()
+                .method(method.clone())
+                .uri(&uri)
+                .header(header::ACCEPT, "application/json")
+                .header("X-Plex-Product", "mplex-openapi-tests")
+                .header("X-Plex-Client-Identifier", "mplex-openapi-tests")
+                .body(Body::empty())
+                .unwrap_or_else(|error| {
+                    panic!("could not build {} {} test request: {error}", method, uri)
+                });
+            let response = fixture
+                .app
+                .clone()
+                .oneshot(request)
+                .await
+                .unwrap_or_else(|error| panic!("router failed for {} {}: {error}", method, uri));
+            let status = response.status();
+            eprintln!(
+                "PMS_OPERATION_STATUS\t{}\t{}\t{}\t{}\t{}",
+                operation.operation_id,
+                operation.method,
+                uri,
+                status.as_u16(),
+                operation.summary
+            );
+            assert_eq!(
+                status.as_u16(),
+                operation.expected_status,
+                "{} {} ({}) status changed",
+                method,
+                uri,
+                operation.operation_id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plex_route_errors_are_explicit_for_unknown_resources_and_bad_requests() {
+        let fixture = fixture();
+        let failures = [
+            (Method::GET, "/accounts/2", StatusCode::NOT_FOUND),
+            (
+                Method::GET,
+                "/hubs/sections/1/not-a-hub",
+                StatusCode::NOT_FOUND,
+            ),
+            (Method::GET, "/library/sections/99", StatusCode::NOT_FOUND),
+            (
+                Method::GET,
+                "/library/sections/99/collections",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
+                "/library/sections/99/prefs",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
+                "/library/sections/99/sorts",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
+                "/library/sections/99/filters",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
+                "/library/sections/99/firstCharacter",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
+                "/library/sections/99/firstCharacter/A",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
+                "/library/sections/99/firstCharacters",
+                StatusCode::NOT_FOUND,
+            ),
+            (Method::GET, "/library/search", StatusCode::BAD_REQUEST),
+            (Method::GET, "/hubs/search", StatusCode::BAD_REQUEST),
+            (
+                Method::GET,
+                "/library/metadata/missing/related",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Method::GET,
+                "/library/metadata/missing/extras",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
+                "/library/metadata/missing/media/1",
+                StatusCode::NOT_FOUND,
+            ),
+            (Method::PUT, "/library/parts/missing", StatusCode::NOT_FOUND),
+            (Method::GET, "/playQueues/999", StatusCode::NOT_FOUND),
+            (
+                Method::GET,
+                "/playQueues/not-a-number",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                Method::GET,
+                "/library/metadata/missing/thumb",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::GET,
+                "/library/metadata/missing/art",
+                StatusCode::NOT_FOUND,
+            ),
+            (Method::GET, "/media/missing", StatusCode::NOT_FOUND),
+            (Method::GET, "/photo/:/transcode", StatusCode::BAD_REQUEST),
+            (
+                Method::GET,
+                "/video/:/transcode/universal/decision",
+                StatusCode::BAD_REQUEST,
+            ),
+            (Method::GET, "/:/timeline", StatusCode::BAD_REQUEST),
+            (Method::GET, "/:/scrobble", StatusCode::BAD_REQUEST),
+            (Method::GET, "/:/unscrobble", StatusCode::BAD_REQUEST),
+            (Method::POST, "/identity", StatusCode::METHOD_NOT_ALLOWED),
+        ];
+
+        for (method, uri, expected) in failures {
+            let response = send(&fixture.app, method.clone(), uri, Body::empty()).await;
+            assert_eq!(
+                response.status(),
+                expected,
+                "{method} {uri} returned an unexpected failure response"
+            );
+        }
     }
 }

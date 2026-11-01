@@ -2,7 +2,7 @@
 name = "mplex"
 version = "0.1.0"
 edition = "2021"
-description = "A minimal single-file Plex and Jellyfin media server"
+description = "A Rust Plex Media Server replacement"
 
 [dependencies]
 axum = { version = "0.7", features = ["macros", "ws"] }

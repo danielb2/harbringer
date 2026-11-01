@@ -1,38 +1,36 @@
 # mplex
 
-Project guidance for the `mplex` repository. `mplex` is a small Rust proof-of-concept media server that exposes one local video through Plex and Jellyfin-compatible APIs.
+Project guidance for `mplex`: a Rust implementation of a fully functional Plex Media Server replacement. The goal is compatibility with Plex's documented PMS API and real Plex clients, including Plex Web and Plex Desktop. This is past the MVP stage.
 
 ## Essential rules
 
-- Read relevant code before making changes.
-- Keep changes focused and remove unused code.
-- Add or update tests for behavior changes.
-- Do not commit secrets or generated files.
-- Keep Plex and Jellyfin adapters separate from shared file serving.
-- Keep the media scope to one configured directory; do not add recursive scanning, databases, transcoding, or user management.
+- Read relevant code and current Plex request traces before changing behavior.
+- Keep the protocol surface Plex-only. Do not add Jellyfin routes or mix adapters.
+- Implement Plex behavior against the PMS documentation and validate it with route tests and client playback where available.
+- Playback is a core requirement: support direct play, direct stream/remux, and transcoding when a Plex client requires it.
+- Media inspection, remuxing, decoding, encoding, and transcoding must use portable in-process Rust libraries. Do not depend on installed commands such as `ffmpeg` or `ffprobe`.
+- Keep platform support in mind when selecting media libraries and features. Do not make one operating system's hardware decoder mandatory.
+- Preserve original-file serving and seeking when a client can play the source directly. Transcoding must be selected from client capabilities and media metadata, not used as a blanket path.
+- Keep shared file handling and media logic reusable. Avoid duplicated protocol responses, route behavior, or UI implementations.
+- Add or update tests for behavior changes, including success and failure paths. Keep the Plex endpoint inventory and route tests in sync with the official API documentation.
+- Do not commit secrets, generated artifacts, or changes unless explicitly asked.
 
 ## Commands
 
 - Build: `cargo build`
 - Test: `cargo test`
-- Run: `cargo run -- --dir /path/to/videos --token development-token --bind 0.0.0.0:8096`
+- Run: `cargo run`
 
 ## Structure
 
-- `src/main.rs`: command-line configuration, directory scan, shared media state, adapters, and range-enabled file serving.
-- `README.md`: setup, connection, validation, and limitations.
-- `CHANGELOG.md`: change history and reflections.
+- `src/main.rs`: configuration, media/library state, Plex routes, shared media serving, playback, and the built-in web client.
+- `src/plex_tls.rs`: Plex discovery, TLS, and HTTP/WebSocket serving.
+- `README.md`: setup, connection, playback behavior, validation, and current limitations.
+- `ROADMAP.md`: full PMS compatibility checklist and client validation status.
+- `CHANGELOG.md`: change history and short implementation reflections.
 
-## Doc Routing
+## Documentation and UI rules
 
-| Topic | Document |
-| --- | --- |
-| Setup and Plezy connection | [README.md](README.md) |
-| Changes and validation reflections | [CHANGELOG.md](CHANGELOG.md) |
-
-## Rules
-
-Keep documentation and `CHANGELOG.md` in sync with code changes. For each change, record a short reflection that states what changed, why it changed, and what checks were run.
-- Dialog close controls must remain fixed in the dialog's top-right corner, with an accessible label and tooltip.
-- Pressing Escape must close an open dialog.
-- Follow DRY principles across the project. Anything used in more than one place—UI components, markup, styles, route behavior, data transformations, validation, or media logic—must use a shared reusable implementation whenever sensible. Avoid duplicated implementations that can drift, including but not limited to Home and Library media presentation.
+- Keep `README.md`, `ROADMAP.md`, and `CHANGELOG.md` in sync with behavior changes. Each change needs a brief reflection recording what changed, why, and the checks run.
+- Dialog close controls must stay fixed at the dialog's top-right corner, have an accessible label and tooltip, and close on Escape.
+- Follow DRY principles across UI components, markup, styles, route behavior, data transformations, validation, and media logic. Home and Library presentation should share implementations where sensible.

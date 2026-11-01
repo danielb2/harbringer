@@ -1,0 +1,1828 @@
+{
+  "spec_title": "Plex Media Server",
+  "spec_version": "1.2.3",
+  "source": "https://developer.plex.tv/pms/",
+  "operation_count": 260,
+  "operations": [
+    {
+      "method": "GET",
+      "path": "/",
+      "operation_id": "getSlash",
+      "summary": "Get PMS info",
+      "expected_status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/:/eventsource/notifications",
+      "operation_id": "eventsourceGetSlash",
+      "summary": "Connect to Eventsource",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/:/prefs",
+      "operation_id": "preferencesGetSlash",
+      "summary": "Get all preferences",
+      "expected_status": 200
+    },
+    {
+      "method": "PUT",
+      "path": "/:/prefs",
+      "operation_id": "preferencesPutSlash",
+      "summary": "Set preferences",
+      "expected_status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/:/prefs/get",
+      "operation_id": "preferencesGetGet",
+      "summary": "Get a preferences",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/:/rate",
+      "operation_id": "putRate",
+      "summary": "Rate an item",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/:/scrobble",
+      "operation_id": "putScrobble",
+      "summary": "Mark an item as played",
+      "expected_status": 400
+    },
+    {
+      "method": "POST",
+      "path": "/:/timeline",
+      "operation_id": "timelinePostSlash",
+      "summary": "Report media timeline",
+      "expected_status": 400
+    },
+    {
+      "method": "PUT",
+      "path": "/:/unscrobble",
+      "operation_id": "putUnscrobble",
+      "summary": "Mark an item as unplayed",
+      "expected_status": 400
+    },
+    {
+      "method": "GET",
+      "path": "/:/websocket/notifications",
+      "operation_id": "websocketGetSlash",
+      "summary": "Connect to WebSocket",
+      "expected_status": 400
+    },
+    {
+      "method": "GET",
+      "path": "/activities",
+      "operation_id": "activitiesGetSlash",
+      "summary": "Get all activities",
+      "expected_status": 200
+    },
+    {
+      "method": "DELETE",
+      "path": "/activities/{activityId}",
+      "operation_id": "activitiesDeleteActivity",
+      "summary": "Cancel a running activity",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/butler",
+      "operation_id": "butlerGetSlash",
+      "summary": "Get all Butler tasks",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/butler",
+      "operation_id": "butlerPostSlash",
+      "summary": "Start all Butler tasks",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/butler",
+      "operation_id": "butlerDeleteSlash",
+      "summary": "Stop all Butler tasks",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/butler/{task}",
+      "operation_id": "butlerPostTask",
+      "summary": "Start a single Butler task",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/butler/{task}",
+      "operation_id": "butlerDeleteTask",
+      "summary": "Stop a single Butler task",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/downloadQueue",
+      "operation_id": "downloadQueuePost",
+      "summary": "Get or create a download queue",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/downloadQueue/{queueId}",
+      "operation_id": "downloadQueueGetQueue",
+      "summary": "Get a download queue",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/downloadQueue/{queueId}/add",
+      "operation_id": "downloadQueuePostQueueAdd",
+      "summary": "Add to download queue",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/downloadQueue/{queueId}/item/{itemId}/media",
+      "operation_id": "downloadQueueGetQueueItemItemMedia",
+      "summary": "Grab download queue media",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/downloadQueue/{queueId}/item/{itemId}/decision",
+      "operation_id": "downloadQueueGetQueueItemItemDecision",
+      "summary": "Grab download queue item decision",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/downloadQueue/{queueId}/items",
+      "operation_id": "downloadQueueGetQueueItems",
+      "summary": "Get download queue items",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/downloadQueue/{queueId}/items/{itemId}",
+      "operation_id": "downloadQueueGetQueueItemsItem",
+      "summary": "Get download queue items",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/downloadQueue/{queueId}/items/{itemId}",
+      "operation_id": "downloadQueueDeleteQueueItemsItem",
+      "summary": "Delete download queue items",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/downloadQueue/{queueId}/items/{itemId}/restart",
+      "operation_id": "downloadQueuePostQueueItemsItemRestart",
+      "summary": "Restart processing of items from the decision",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/identity",
+      "operation_id": "getIdentity",
+      "summary": "Get PMS identity",
+      "expected_status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/hubs",
+      "operation_id": "hubsGetSlash",
+      "summary": "Get global hubs",
+      "expected_status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/hubs/items",
+      "operation_id": "hubsGetItems",
+      "summary": "Get a hub's items",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/hubs/continueWatching",
+      "operation_id": "hubsGetContinueWatching",
+      "summary": "Get the continue watching hub",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/hubs/popularInLibraries",
+      "operation_id": "hubsGetPopularInLibraries",
+      "summary": "Get the popular in your libraries hub",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/hubs/promoted",
+      "operation_id": "hubsGetPromoted",
+      "summary": "Get the hubs which are promoted",
+      "expected_status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/hubs/metadata/{metadataId}",
+      "operation_id": "hubsGetMetadataMetadata",
+      "summary": "Get hubs for a section by metadata item",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/hubs/metadata/{metadataId}/related",
+      "operation_id": "hubsGetMetadataMetadataRelated",
+      "summary": "Get related hubs",
+      "expected_status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/hubs/metadata/{metadataId}/postplay",
+      "operation_id": "hubsGetMetadataMetadataPostplay",
+      "summary": "Get postplay hubs",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/hubs/search",
+      "operation_id": "hubsGetSearch",
+      "summary": "Search Hub",
+      "expected_status": 400
+    },
+    {
+      "method": "GET",
+      "path": "/hubs/search/voice",
+      "operation_id": "hubsSearchGetVoice",
+      "summary": "Voice Search Hub",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/hubs/sections/{sectionId}",
+      "operation_id": "hubsGetSection",
+      "summary": "Get section hubs",
+      "expected_status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/hubs/sections/{sectionId}/manage",
+      "operation_id": "hubsSectionsSectionManageGetSlash",
+      "summary": "Get hubs",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/hubs/sections/{sectionId}/manage",
+      "operation_id": "hubsSectionsSectionManageDeleteSlash",
+      "summary": "Reset hubs to defaults",
+      "expected_status": 405
+    },
+    {
+      "method": "POST",
+      "path": "/hubs/sections/{sectionId}/manage",
+      "operation_id": "hubsSectionsSectionManagePostSlash",
+      "summary": "Create a custom hub",
+      "expected_status": 405
+    },
+    {
+      "method": "PUT",
+      "path": "/hubs/sections/{sectionId}/manage/move",
+      "operation_id": "hubsSectionsSectionManagePutMove",
+      "summary": "Move Hub",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/hubs/sections/{sectionId}/manage/{identifier}",
+      "operation_id": "hubsSectionsSectionManagePutIdentifier",
+      "summary": "Change hub visibility",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/hubs/sections/{sectionId}/manage/{identifier}",
+      "operation_id": "hubsSectionsSectionManageDeleteIdentifier",
+      "summary": "Delete a custom hub",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/all",
+      "operation_id": "libraryGetAll",
+      "summary": "Get all items in library",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/library/caches",
+      "operation_id": "libraryDeleteCaches",
+      "summary": "Delete library caches",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/clean/bundles",
+      "operation_id": "libraryPutCleanBundles",
+      "summary": "Clean bundles",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/library/collections",
+      "operation_id": "libraryCollectionPostSlash",
+      "summary": "Create a collection",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/collections/{collectionId}/composite/{updatedAt}",
+      "operation_id": "libraryCollectionCollectionGetComposite",
+      "summary": "Get a collection's image",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/collections/{collectionId}/items",
+      "operation_id": "libraryCollectionCollectionGetItems",
+      "summary": "Get items in a collection",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/collections/{collectionId}/items",
+      "operation_id": "libraryCollectionCollectionPutItems",
+      "summary": "Add items to a collection",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/collections/{collectionId}/items/{itemId}",
+      "operation_id": "libraryCollectionCollectionPutItemsItem",
+      "summary": "Delete an item from a collection",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/collections/{collectionId}/items/{itemId}/move",
+      "operation_id": "libraryCollectionCollectionPutItemsItemMove",
+      "summary": "Reorder an item in the collection",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/library/file",
+      "operation_id": "libraryPostFile",
+      "summary": "Ingest a transient item",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/matches",
+      "operation_id": "libraryGetMatches",
+      "summary": "Get library matches",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/media/{mediaId}/chapterImages/{chapter}",
+      "operation_id": "libraryGetMediaMediaChapterImagesChapter",
+      "summary": "Get a chapter image",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/metadata/{ids}",
+      "operation_id": "libraryMetadataGetSlash",
+      "summary": "Get a metadata item",
+      "expected_status": 200
+    },
+    {
+      "method": "PUT",
+      "path": "/library/metadata/{ids}",
+      "operation_id": "libraryMetadataPutSlash",
+      "summary": "Edit a metadata item",
+      "expected_status": 405
+    },
+    {
+      "method": "DELETE",
+      "path": "/library/metadata/{ids}",
+      "operation_id": "libraryMetadataDeleteSlash",
+      "summary": "Delete a metadata item",
+      "expected_status": 405
+    },
+    {
+      "method": "PUT",
+      "path": "/library/metadata/{ids}/addetect",
+      "operation_id": "libraryMetadataPutAddetect",
+      "summary": "Ad-detect an item",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/metadata/{ids}/allLeaves",
+      "operation_id": "libraryMetadataGetAllLeaves",
+      "summary": "Get the leaves of an item",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/metadata/{ids}/analyze",
+      "operation_id": "libraryMetadataPutAnalyze",
+      "summary": "Analyze an item",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/metadata/{ids}/chapterThumbs",
+      "operation_id": "libraryMetadataPutChapterThumbs",
+      "summary": "Generate thumbs of chapters for an item",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/metadata/{ids}/credits",
+      "operation_id": "libraryMetadataPutCredits",
+      "summary": "Credit detect a metadata item",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/metadata/{ids}/extras",
+      "operation_id": "libraryMetadataGetExtras",
+      "summary": "Get an item's extras",
+      "expected_status": 200
+    },
+    {
+      "method": "POST",
+      "path": "/library/metadata/{ids}/extras",
+      "operation_id": "libraryMetadataPostExtras",
+      "summary": "Add to an item's extras",
+      "expected_status": 405
+    },
+    {
+      "method": "GET",
+      "path": "/library/metadata/{ids}/file",
+      "operation_id": "libraryMetadataGetFile",
+      "summary": "Get a file from a metadata or media bundle",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/metadata/{ids}/index",
+      "operation_id": "libraryMetadataPutIndex",
+      "summary": "Start BIF generation of an item",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/metadata/{ids}/intro",
+      "operation_id": "libraryMetadataPutIntro",
+      "summary": "Intro detect an item",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/library/metadata/{ids}/marker",
+      "operation_id": "libraryMetadataPostMarker",
+      "summary": "Create a marker",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/library/metadata/{ids}/marker/{marker}",
+      "operation_id": "libraryMetadataDeleteMarkerMarker",
+      "summary": "Delete a marker",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/metadata/{ids}/marker/{marker}",
+      "operation_id": "libraryMetadataPutMarkerMarker",
+      "summary": "Edit a marker",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/metadata/{ids}/match",
+      "operation_id": "libraryMetadataPutMatch",
+      "summary": "Match a metadata item",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/metadata/{ids}/matches",
+      "operation_id": "libraryMetadataGetMatches",
+      "summary": "Get metadata matches for an item",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/library/metadata/{ids}/media/{mediaItem}",
+      "operation_id": "libraryMetadataDeleteMediaMediaItem",
+      "summary": "Delete a media item",
+      "expected_status": 405
+    },
+    {
+      "method": "PUT",
+      "path": "/library/metadata/{ids}/merge",
+      "operation_id": "libraryMetadataPutMerge",
+      "summary": "Merge a metadata item",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/metadata/{ids}/nearest",
+      "operation_id": "libraryMetadataGetNearest",
+      "summary": "Get nearest tracks to metadata item",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/metadata/{ids}/prefs",
+      "operation_id": "libraryMetadataPutPrefs",
+      "summary": "Set metadata preferences",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/metadata/{ids}/refresh",
+      "operation_id": "libraryMetadataPutRefresh",
+      "summary": "Refresh a metadata item",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/metadata/{ids}/related",
+      "operation_id": "libraryMetadataGetRelated",
+      "summary": "Get related items",
+      "expected_status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/library/metadata/{ids}/similar",
+      "operation_id": "libraryMetadataGetSimilar",
+      "summary": "Get similar items",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/metadata/{ids}/split",
+      "operation_id": "libraryMetadataPutSplit",
+      "summary": "Split a metadata item",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/metadata/{ids}/subtitles",
+      "operation_id": "libraryMetadataPostSubtitles",
+      "summary": "Add subtitles",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/metadata/{ids}/tree",
+      "operation_id": "libraryMetadataGetTree",
+      "summary": "Get metadata items as a tree",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/metadata/{ids}/unmatch",
+      "operation_id": "libraryMetadataPutUnmatch",
+      "summary": "Unmatch a metadata item",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/metadata/{ids}/users/top",
+      "operation_id": "libraryMetadataGetUsersTop",
+      "summary": "Get metadata top users",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/metadata/{ids}/voiceActivity",
+      "operation_id": "libraryMetadataPutVoiceActivity",
+      "summary": "Detect voice activity",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/metadata/{ids}/analyzeLoudness",
+      "operation_id": "libraryMetadataPutAnalyzeLoudness",
+      "summary": "Detect loudness of audio streams",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/library/metadata/{ids}/{element}",
+      "operation_id": "libraryMetadataPostElement",
+      "summary": "Set an item's artwork, theme, etc",
+      "expected_status": 405
+    },
+    {
+      "method": "PUT",
+      "path": "/library/metadata/{ids}/{element}",
+      "operation_id": "libraryMetadataPutElement",
+      "summary": "Set an item's artwork, theme, etc",
+      "expected_status": 405
+    },
+    {
+      "method": "DELETE",
+      "path": "/library/metadata/{ids}/{element}",
+      "operation_id": "libraryMetadataDeleteElement",
+      "summary": "Delete an item's artwork, theme, etc",
+      "expected_status": 405
+    },
+    {
+      "method": "GET",
+      "path": "/library/metadata/{ids}/{element}/{timestamp}",
+      "operation_id": "libraryMetadataGetElement",
+      "summary": "Get an item's artwork, theme, etc",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/metadata/augmentations/{augmentationId}",
+      "operation_id": "libraryGetMetadataAugmentationsAugmentation",
+      "summary": "Get augmentation status",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/optimize",
+      "operation_id": "libraryPutOptimize",
+      "summary": "Optimize the Database",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/parts/{partId}",
+      "operation_id": "libraryPutPartsPart",
+      "summary": "Set stream selection",
+      "expected_status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/library/parts/{partId}/indexes/{index}",
+      "operation_id": "libraryGetPartsPartIndexesIndex",
+      "summary": "Get BIF index for a part",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/parts/{partId}/indexes/{index}/{offset}",
+      "operation_id": "libraryGetPartsPartIndexesIndexOffset",
+      "summary": "Get an image from part BIF",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/parts/{partId}/{changestamp}/{filename}",
+      "operation_id": "libraryGetPartsPartChangestampFilename",
+      "summary": "Get a media part",
+      "expected_status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/library/people/{personId}",
+      "operation_id": "libraryGetPeoplePerson",
+      "summary": "Get person details",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/people/{personId}/media",
+      "operation_id": "libraryGetPeoplePersonMedia",
+      "summary": "Get media for a person",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/randomArtwork",
+      "operation_id": "libraryGetRandomArtwork",
+      "summary": "Get random artwork",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/all",
+      "operation_id": "libraryGetSections",
+      "summary": "Get library sections (main Media Provider Only)",
+      "expected_status": 400
+    },
+    {
+      "method": "POST",
+      "path": "/library/sections/all",
+      "operation_id": "libraryPostSection",
+      "summary": "Add a library section",
+      "expected_status": 405
+    },
+    {
+      "method": "DELETE",
+      "path": "/library/sections/all/refresh",
+      "operation_id": "libraryDeleteSectionsAllRefresh",
+      "summary": "Stop refresh",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/prefs",
+      "operation_id": "libraryGetSectionsPrefs",
+      "summary": "Get section prefs",
+      "expected_status": 400
+    },
+    {
+      "method": "POST",
+      "path": "/library/sections/refresh",
+      "operation_id": "libraryPostSectionsRefresh",
+      "summary": "Refresh all sections",
+      "expected_status": 405
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}",
+      "operation_id": "librarySectionGetSection",
+      "summary": "Get a library section by id",
+      "expected_status": 200
+    },
+    {
+      "method": "DELETE",
+      "path": "/library/sections/{sectionId}",
+      "operation_id": "libraryDeleteSection",
+      "summary": "Delete a library section",
+      "expected_status": 405
+    },
+    {
+      "method": "PUT",
+      "path": "/library/sections/{sectionId}",
+      "operation_id": "librarySectionPutSection",
+      "summary": "Edit a library section",
+      "expected_status": 405
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/all",
+      "operation_id": "librarySectionGetAll",
+      "summary": "Get items in the section",
+      "expected_status": 200
+    },
+    {
+      "method": "PUT",
+      "path": "/library/sections/{sectionId}/all",
+      "operation_id": "librarySectionPutAll",
+      "summary": "Set the fields of the filtered items",
+      "expected_status": 405
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/allLeaves",
+      "operation_id": "librarySectionGetAllLeaves",
+      "summary": "Set section leaves",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/arts",
+      "operation_id": "librarySectionGetArts",
+      "summary": "Set section artwork",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/albums",
+      "operation_id": "librarySectionGetAlbums",
+      "summary": "Set section albums",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/sections/{sectionId}/analyze",
+      "operation_id": "librarySectionPutAnalyze",
+      "summary": "Analyze a section",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/autocomplete",
+      "operation_id": "librarySectionGetAutocomplete",
+      "summary": "Get autocompletions for search",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/categories",
+      "operation_id": "librarySectionGetCategories",
+      "summary": "Set section categories",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/cluster",
+      "operation_id": "librarySectionGetCluster",
+      "summary": "Set section clusters",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/collections",
+      "operation_id": "librarySectionGetCollections",
+      "summary": "Get collections in a section",
+      "expected_status": 200
+    },
+    {
+      "method": "DELETE",
+      "path": "/library/sections/{sectionId}/collection/{collectionId}",
+      "operation_id": "librarySectionDeleteCollectionCollection",
+      "summary": "Delete a collection",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/common",
+      "operation_id": "librarySectionGetCommon",
+      "summary": "Get common fields for items",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/composite/{updatedAt}",
+      "operation_id": "librarySectionGetComposite",
+      "summary": "Get a section composite image",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/computePath",
+      "operation_id": "librarySectionGetComputePath",
+      "summary": "Similar tracks to transition from one to another",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/library/sections/{sectionId}/emptyTrash",
+      "operation_id": "librarySectionPutEmptyTrash",
+      "summary": "Empty section trash",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/audioLayout",
+      "operation_id": "librarySectionGetAudioLayouts",
+      "summary": "Get audio layouts in a section",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/videoCodec",
+      "operation_id": "librarySectionGetVideoCodecs",
+      "summary": "Get video codecs in a section",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/audioCodec",
+      "operation_id": "librarySectionGetAudioCodecs",
+      "summary": "Get audio codecs in a section",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/subtitleCodec",
+      "operation_id": "librarySectionGetSubtitleCodecs",
+      "summary": "Get subtitle codecs in a section",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/filters",
+      "operation_id": "librarySectionGetFilters",
+      "summary": "Get section filters",
+      "expected_status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/firstCharacters",
+      "operation_id": "librarySectionGetFirstCharaters",
+      "summary": "Get list of first characters",
+      "expected_status": 200
+    },
+    {
+      "method": "DELETE",
+      "path": "/library/sections/{sectionId}/indexes",
+      "operation_id": "librarySectionDeleteIndexes",
+      "summary": "Delete section indexes",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/library/sections/{sectionId}/intros",
+      "operation_id": "librarySectionDeleteIntros",
+      "summary": "Delete section intro markers",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/location",
+      "operation_id": "librarySectionGetLocations",
+      "summary": "Get all folder locations",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/nearest",
+      "operation_id": "librarySectionGetNearest",
+      "summary": "The nearest audio tracks",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/moment",
+      "operation_id": "librarySectionGetMoment",
+      "summary": "Set section moments",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/prefs",
+      "operation_id": "librarySectionGetPrefs",
+      "summary": "Get section prefs",
+      "expected_status": 200
+    },
+    {
+      "method": "PUT",
+      "path": "/library/sections/{sectionId}/prefs",
+      "operation_id": "librarySectionPutPrefs",
+      "summary": "Set section prefs",
+      "expected_status": 200
+    },
+    {
+      "method": "POST",
+      "path": "/library/sections/{sectionId}/refresh",
+      "operation_id": "librarySectionPostRefresh",
+      "summary": "Refresh section",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/library/sections/{sectionId}/refresh",
+      "operation_id": "librarySectionDeleteRefresh",
+      "summary": "Cancel section refresh",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/sections/{sectionId}/sorts",
+      "operation_id": "librarySectionGetSorts",
+      "summary": "Get a section sorts",
+      "expected_status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/library/streams/{streamId}.{ext}",
+      "operation_id": "libraryGetStreamsStream",
+      "summary": "Get a stream",
+      "expected_status": 200
+    },
+    {
+      "method": "PUT",
+      "path": "/library/streams/{streamId}.{ext}",
+      "operation_id": "libraryPutStreamsStream",
+      "summary": "Set a stream offset",
+      "expected_status": 405
+    },
+    {
+      "method": "DELETE",
+      "path": "/library/streams/{streamId}.{ext}",
+      "operation_id": "libraryDeleteStreamsStream",
+      "summary": "Delete a stream",
+      "expected_status": 405
+    },
+    {
+      "method": "GET",
+      "path": "/library/streams/{streamId}/loudness",
+      "operation_id": "libraryGetStreamsStreamLoudness",
+      "summary": "Get loudness about a stream",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/streams/{streamId}/levels",
+      "operation_id": "libraryGetStreamsStreamLevels",
+      "summary": "Get loudness about a stream in json",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/library/tags",
+      "operation_id": "libraryGetTags",
+      "summary": "Get all library tags of a type",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/livetv/dvrs",
+      "operation_id": "livetvDvrGetSlash",
+      "summary": "Get DVRs",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/livetv/dvrs",
+      "operation_id": "livetvDvrPostSlash",
+      "summary": "Create a DVR",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/livetv/dvrs/{dvrId}",
+      "operation_id": "livetvDvrGetDVR",
+      "summary": "Get a single DVR",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/livetv/dvrs/{dvrId}",
+      "operation_id": "livetvDvrDeleteDVR",
+      "summary": "Delete a single DVR",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/livetv/dvrs/{dvrId}/channels/{channel}/tune",
+      "operation_id": "livetvDvrPostChannelsChannelTune",
+      "summary": "Tune a channel on a DVR",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/livetv/dvrs/{dvrId}/devices/{deviceId}",
+      "operation_id": "livetvDvrPutDvrDevice",
+      "summary": "Add a device to an existing DVR",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/livetv/dvrs/{dvrId}/devices/{deviceId}",
+      "operation_id": "livetvDvrDeleteDvrDevice",
+      "summary": "Remove a device from an existing DVR",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/livetv/dvrs/{dvrId}/lineups",
+      "operation_id": "livetvDvrPutLineup",
+      "summary": "Add a DVR Lineup",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/livetv/dvrs/{dvrId}/lineups",
+      "operation_id": "livetvDvrDeleteLineup",
+      "summary": "Delete a DVR Lineup",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/livetv/dvrs/{dvrId}/prefs",
+      "operation_id": "livetvDvrPutPrefs",
+      "summary": "Set DVR preferences",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/livetv/dvrs/{dvrId}/reloadGuide",
+      "operation_id": "livetvDvrPostReloadGuide",
+      "summary": "Tell a DVR to reload program guide",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/livetv/dvrs/{dvrId}/reloadGuide",
+      "operation_id": "livetvDvrDeleteReloadGuide",
+      "summary": "Tell a DVR to stop reloading program guide",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/livetv/epg/channelmap",
+      "operation_id": "livetvEpgGetChannelmap",
+      "summary": "Compute the best channel map",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/livetv/epg/channels",
+      "operation_id": "livetvEpgGetChannels",
+      "summary": "Get channels for a lineup",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/livetv/epg/countries",
+      "operation_id": "livetvEpgGetCountries",
+      "summary": "Get all countries",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/livetv/epg/countries/{country}/{epgId}/lineups",
+      "operation_id": "livetvEpgGetCountriesCountryLineups",
+      "summary": "Get lineups for a country via postal code",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/livetv/epg/countries/{country}/{epgId}/regions",
+      "operation_id": "livetvEpgGetCountriesCountryRegions",
+      "summary": "Get regions for a country",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/livetv/epg/countries/{country}/{epgId}/regions/{region}/lineups",
+      "operation_id": "livetvEpgGetCountriesCountryRegionsRegionLineups",
+      "summary": "Get lineups for a region",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/livetv/epg/languages",
+      "operation_id": "livetvEpgGetLanguages",
+      "summary": "Get all languages",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/livetv/epg/lineup",
+      "operation_id": "livetvEpgGetLineup",
+      "summary": "Compute the best lineup",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/livetv/epg/lineupchannels",
+      "operation_id": "livetvEpgGetLineupchannels",
+      "summary": "Get the channels for mulitple lineups",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/livetv/sessions",
+      "operation_id": "livetvSessionsGetSlash",
+      "summary": "Get all sessions",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/livetv/sessions/{sessionId}",
+      "operation_id": "livetvSessionsGetSession",
+      "summary": "Get a single session",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/livetv/sessions/{sessionId}/{consumerId}/index.m3u8",
+      "operation_id": "livetvSessionsGetSessionConsumerIndex",
+      "summary": "Get a session playlist index",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/livetv/sessions/{sessionId}/{consumerId}/{segmentId}",
+      "operation_id": "livetvSessionsGetSessionConsumerSegment",
+      "summary": "Get a single session segment",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/log",
+      "operation_id": "logPutSlash",
+      "summary": "Logging a single-line message to the Plex Media Server log",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/log",
+      "operation_id": "logPostSlash",
+      "summary": "Logging a multi-line message to the Plex Media Server log",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/log/networked",
+      "operation_id": "logPostPapertrail",
+      "summary": "Enabling Papertrail",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/media/grabbers",
+      "operation_id": "mediaGrabberGetSlash",
+      "summary": "Get available grabbers",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/media/grabbers/devices",
+      "operation_id": "mediaGrabberGetDevices",
+      "summary": "Get all devices",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/media/grabbers/devices",
+      "operation_id": "mediaGrabberPostDevices",
+      "summary": "Add a device",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/media/grabbers/devices/discover",
+      "operation_id": "mediaGrabberPostDeviceDiscover",
+      "summary": "Tell grabbers to discover devices",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/media/grabbers/devices/{deviceId}",
+      "operation_id": "mediaGrabberDevicesDeviceGetSlash",
+      "summary": "Get device details",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/media/grabbers/devices/{deviceId}",
+      "operation_id": "mediaGrabberDevicesDeviceDeleteSlash",
+      "summary": "Remove a device",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/media/grabbers/devices/{deviceId}",
+      "operation_id": "mediaGrabberDevicesDevicePutSlash",
+      "summary": "Enable or disable a device",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/media/grabbers/devices/{deviceId}/channelmap",
+      "operation_id": "mediaGrabberDevicesDevicePutChannelmap",
+      "summary": "Set a device's channel mapping",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/media/grabbers/devices/{deviceId}/channels",
+      "operation_id": "mediaGrabberDevicesDeviceGetChannels",
+      "summary": "Get a device's channels",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/media/grabbers/devices/{deviceId}/prefs",
+      "operation_id": "mediaGrabberDevicesDevicePutPrefs",
+      "summary": "Set device preferences",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/media/grabbers/devices/{deviceId}/scan",
+      "operation_id": "mediaGrabberDevicesDevicePostScan",
+      "summary": "Tell a device to scan for channels",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/media/grabbers/devices/{deviceId}/scan",
+      "operation_id": "mediaGrabberDeleteDevicesDeviceScan",
+      "summary": "Tell a device to stop scanning for channels",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/media/grabbers/devices/{deviceId}/thumb/{version}",
+      "operation_id": "mediaGrabberDevicesDeviceGetThumbVersion",
+      "summary": "Get device thumb",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/media/grabbers/operations/{operationId}",
+      "operation_id": "mediaGrabberDeleteOperationsOperation",
+      "summary": "Cancel an existing grab",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/media/providers",
+      "operation_id": "getMediaProviders",
+      "summary": "Get the list of available media providers",
+      "expected_status": 200
+    },
+    {
+      "method": "POST",
+      "path": "/media/providers",
+      "operation_id": "postMediaProviders",
+      "summary": "Add a media provider",
+      "expected_status": 405
+    },
+    {
+      "method": "POST",
+      "path": "/media/providers/refresh",
+      "operation_id": "postMediaProvidersRefresh",
+      "summary": "Refresh media providers",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/media/providers/{provider}",
+      "operation_id": "deleteMediaProvider",
+      "summary": "Delete a media provider",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/media/providers/metadata",
+      "operation_id": "getMetadataAgentProviders",
+      "summary": "Get the list of available metadata agent providers",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/media/providers/metadata",
+      "operation_id": "postMetadataAgentProviders",
+      "summary": "Add a metadata agent provider",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/media/providers/metadata/{providerId}",
+      "operation_id": "getMetadataAgentProvider",
+      "summary": "Get a metadata agent provider",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/media/providers/metadata/{providerId}",
+      "operation_id": "putMetadataAgentProvider",
+      "summary": "Modify a metadata agent provider",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/media/providers/metadata/{providerId}",
+      "operation_id": "deleteMetadataAgentProvider",
+      "summary": "Delete a metadata agent provider",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/media/providers/metadata/group",
+      "operation_id": "getMetadataAgentProviderGroups",
+      "summary": "Get the list of available metadata agent provider groups",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/media/providers/metadata/group",
+      "operation_id": "postMetadataAgentProviderGroups",
+      "summary": "Add a metadata agent provider group",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/media/providers/metadata/group/{groupId}",
+      "operation_id": "getMetadataAgentProviderGroup",
+      "summary": "Get a metadata agent provider group",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/media/providers/metadata/group/{groupId}",
+      "operation_id": "putMetadataAgentProviderGroup",
+      "summary": "Modify a metadata agent provider group",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/media/providers/metadata/group/{groupId}",
+      "operation_id": "deleteMetadataAgentProviderGroup",
+      "summary": "Delete a metadata agent provider group",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/media/providers/metadata/group/{groupId}/items/{providerId}",
+      "operation_id": "putMetadataAgentProviderGroupItem",
+      "summary": "Modify a metadata agent provider group's items",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/media/providers/metadata/group/{groupId}/items/{providerId}",
+      "operation_id": "deleteMetadataAgentProviderGroupItem",
+      "summary": "Delete a metadata agent provider group item",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/media/subscriptions",
+      "operation_id": "mediaSubscriptionsGetSlash",
+      "summary": "Get all subscriptions",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/media/subscriptions",
+      "operation_id": "mediaSubscriptionsPostSlash",
+      "summary": "Create a subscription",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/media/subscriptions/process",
+      "operation_id": "mediaSubscriptionsPostProcess",
+      "summary": "Process all subscriptions",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/media/subscriptions/{subscriptionId}",
+      "operation_id": "mediaSubscriptionsGetSubscription",
+      "summary": "Get a single subscription",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/media/subscriptions/{subscriptionId}",
+      "operation_id": "mediaSubscriptionsDeleteSubscription",
+      "summary": "Delete a subscription",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/media/subscriptions/{subscriptionId}",
+      "operation_id": "mediaSubscriptionsPutSubscription",
+      "summary": "Edit a subscription",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/media/subscriptions/{subscriptionId}/move",
+      "operation_id": "mediaSubscriptionsPutSubscriptionMove",
+      "summary": "Re-order a subscription",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/media/subscriptions/scheduled",
+      "operation_id": "mediaSubscriptionsGetScheduled",
+      "summary": "Get all scheduled recordings",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/media/subscriptions/template",
+      "operation_id": "mediaSubscriptionsGetTemplate",
+      "summary": "Get the subscription template",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/photo/:/transcode",
+      "operation_id": "imageTranscode",
+      "summary": "Transcode an image",
+      "expected_status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/playlists",
+      "operation_id": "playlistGetSlash",
+      "summary": "Retrieve Playlists",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/playlists",
+      "operation_id": "playlistPostSlash",
+      "summary": "Create a Playlist",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/playlists/{playlistId}",
+      "operation_id": "playlistGetPlaylist",
+      "summary": "Retrieve Playlist",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/playlists/{playlistId}",
+      "operation_id": "playlistDeletePlaylist",
+      "summary": "Delete a Playlist",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/playlists/{playlistId}",
+      "operation_id": "playlistPutPlaylist",
+      "summary": "Editing a Playlist",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/playlists/{playlistId}/items",
+      "operation_id": "playlistGetItems",
+      "summary": "Retrieve Playlist Contents",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/playlists/{playlistId}/items",
+      "operation_id": "playlistDeleteItems",
+      "summary": "Clearing a playlist",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/playlists/{playlistId}/items",
+      "operation_id": "playlistPutItems",
+      "summary": "Adding to  a Playlist",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/playlists/{playlistId}/items/{generatorId}",
+      "operation_id": "playlistGetItemsGenerator",
+      "summary": "Get a playlist generator",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/playlists/{playlistId}/items/{generatorId}",
+      "operation_id": "playlistDeleteItemsGenerator",
+      "summary": "Delete a Generator",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/playlists/{playlistId}/items/{generatorId}",
+      "operation_id": "playlistPutItemsGenerator",
+      "summary": "Modify a Generator",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/playlists/{playlistId}/items/{generatorId}/items",
+      "operation_id": "playlistGetItemsGeneratorItems",
+      "summary": "Get a playlist generator's items",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/playlists/{playlistId}/items/{generatorId}/{metadataId}/{action}",
+      "operation_id": "playlistPutItemsGeneratorReprocess",
+      "summary": "Reprocess a generator",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/playlists/{playlistId}/items/{playlistItemId}/move",
+      "operation_id": "playlistPutItemsMove",
+      "summary": "Moving items in a playlist",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/playlists/{playlistId}/generators",
+      "operation_id": "playlistGetGenerators",
+      "summary": "Get a playlist's generators",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/playlists/upload",
+      "operation_id": "playlistPostUpload",
+      "summary": "Upload",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/playQueues",
+      "operation_id": "playQueuePostSlash",
+      "summary": "Create a play queue",
+      "expected_status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/playQueues/{playQueueId}",
+      "operation_id": "playQueueQueueGetSlash",
+      "summary": "Retrieve a play queue",
+      "expected_status": 200
+    },
+    {
+      "method": "PUT",
+      "path": "/playQueues/{playQueueId}",
+      "operation_id": "playQueueQueuePutSlash",
+      "summary": "Add a generator or playlist to a play queue",
+      "expected_status": 405
+    },
+    {
+      "method": "DELETE",
+      "path": "/playQueues/{playQueueId}/items",
+      "operation_id": "playQueueQueueDeleteItems",
+      "summary": "Clear a play queue",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/playQueues/{playQueueId}/items/{playQueueItemId}",
+      "operation_id": "playQueueQueueDeleteItemsItem",
+      "summary": "Delete an item from a play queue",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/playQueues/{playQueueId}/items/{playQueueItemId}/move",
+      "operation_id": "playQueueQueuePutItemsMove",
+      "summary": "Move an item in a play queue",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/playQueues/{playQueueId}/reset",
+      "operation_id": "playQueuePlayQueueReset",
+      "summary": "Reset a play queue",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/playQueues/{playQueueId}/shuffle",
+      "operation_id": "playQueueQueuePutItemsShuffle",
+      "summary": "Shuffle a play queue",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/playQueues/{playQueueId}/unshuffle",
+      "operation_id": "playQueueQueuePutItemsUnshuffle",
+      "summary": "Unshuffle a play queue",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/security/resources",
+      "operation_id": "securityGetResources",
+      "summary": "Get Source Connection Information",
+      "expected_status": 200
+    },
+    {
+      "method": "POST",
+      "path": "/security/token",
+      "operation_id": "securityPostToken",
+      "summary": "Get Transient Tokens",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/services/ultrablur/colors",
+      "operation_id": "ultraBlurGetColors",
+      "summary": "Get UltraBlur Colors",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/services/ultrablur/image",
+      "operation_id": "ultraBlurGetImage",
+      "summary": "Get UltraBlur Image",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/status/sessions",
+      "operation_id": "statusGetSlash",
+      "summary": "List Sessions",
+      "expected_status": 200
+    },
+    {
+      "method": "GET",
+      "path": "/status/sessions/background",
+      "operation_id": "statusGetBackground",
+      "summary": "Get background tasks",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/status/sessions/history/all",
+      "operation_id": "statusGetHistoryAll",
+      "summary": "List Playback History",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/status/sessions/history/{historyId}",
+      "operation_id": "statusGetHistory",
+      "summary": "Get Single History Item",
+      "expected_status": 404
+    },
+    {
+      "method": "DELETE",
+      "path": "/status/sessions/history/{historyId}",
+      "operation_id": "statusDeleteHistory",
+      "summary": "Delete Single History Item",
+      "expected_status": 404
+    },
+    {
+      "method": "POST",
+      "path": "/status/sessions/terminate",
+      "operation_id": "statusPostTerminate",
+      "summary": "Terminate a session",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/tv.plex.providers.epg.{identifier}:{deviceId}/lineups/dvr/channels",
+      "operation_id": "mediaProviderEpgChannels",
+      "summary": "Get channels for a lineup",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/tv.plex.providers.epg.{identifier}:{deviceId}/grid",
+      "operation_id": "mediaProviderEpgGrid",
+      "summary": "Get airing information",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/tv.plex.providers.epg.{identifier}:{deviceId}/watchnow",
+      "operation_id": "mediaProviderEpgWatchnow",
+      "summary": "Get hubs",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/tv.plex.providers.epg.{identifier}:{deviceId}/watchnow/all",
+      "operation_id": "mediaProviderEpgWatchnowAll",
+      "summary": "Get currently airing",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/{transcodeType}/:/transcode/universal/decision",
+      "operation_id": "transcodeDecision",
+      "summary": "Make a decision on media playback",
+      "expected_status": 200
+    },
+    {
+      "method": "POST",
+      "path": "/{transcodeType}/:/transcode/universal/fallback",
+      "operation_id": "transcodeFallback",
+      "summary": "Manually trigger a transcoder fallback",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/{transcodeType}/:/transcode/universal/start.*",
+      "operation_id": "transcodeStart",
+      "summary": "Start A Transcoding Session",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/{transcodeType}/:/transcode/universal/subtitles",
+      "operation_id": "transcodeSubtitles",
+      "summary": "Transcode subtitles",
+      "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/updater/status",
+      "operation_id": "updaterGetStatus",
+      "summary": "Querying status of updates",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/updater/check",
+      "operation_id": "updaterPutCheck",
+      "summary": "Checking for updates",
+      "expected_status": 404
+    },
+    {
+      "method": "PUT",
+      "path": "/updater/apply",
+      "operation_id": "updaterPutApply",
+      "summary": "Applying updates",
+      "expected_status": 404
+    }
+  ]
+}

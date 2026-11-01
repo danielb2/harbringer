@@ -4,6 +4,7 @@ use rustls::{pki_types::PrivateKeyDer, ServerConfig};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
+    future::Future,
     io::{BufReader, Write},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
@@ -137,37 +138,51 @@ impl PlexTls {
         }
     }
 
-    pub async fn serve(
+    pub async fn serve_until<F>(
         &self,
         listener: tokio::net::TcpListener,
         app: axum::Router,
-    ) -> std::io::Result<()> {
+        shutdown: F,
+    ) -> std::io::Result<()>
+    where
+        F: Future<Output = ()>,
+    {
+        let mut connections = tokio::task::JoinSet::new();
+        tokio::pin!(shutdown);
         loop {
-            let (stream, remote_addr) = listener.accept().await?;
-            let tls = self.clone();
-            let app = app.clone();
-            tokio::spawn(async move {
-                let stream = stream;
-                let mut first_byte = [0u8; 1];
-                let peek =
-                    tokio::time::timeout(Duration::from_secs(10), stream.peek(&mut first_byte))
-                        .await;
-                let Ok(Ok(1)) = peek else {
-                    return;
-                };
-                if first_byte[0] == 0x16 {
-                    let Some(config) = tls.tls_config() else {
-                        return;
-                    };
-                    match TlsAcceptor::from(config).accept(stream).await {
-                        Ok(tls_stream) => serve_http(tls_stream, app, remote_addr).await,
-                        Err(error) => tracing::debug!(%error, "Plex TLS handshake failed"),
-                    }
-                } else {
-                    serve_http(stream, app, remote_addr).await;
+            tokio::select! {
+                _ = &mut shutdown => break,
+                accepted = listener.accept() => {
+                    let (stream, remote_addr) = accepted?;
+                    let tls = self.clone();
+                    let app = app.clone();
+                    connections.spawn(async move {
+                        let stream = stream;
+                        let mut first_byte = [0u8; 1];
+                        let peek =
+                            tokio::time::timeout(Duration::from_secs(10), stream.peek(&mut first_byte))
+                                .await;
+                        let Ok(Ok(1)) = peek else {
+                            return;
+                        };
+                        if first_byte[0] == 0x16 {
+                            let Some(config) = tls.tls_config() else {
+                                return;
+                            };
+                            match TlsAcceptor::from(config).accept(stream).await {
+                                Ok(tls_stream) => serve_http(tls_stream, app, remote_addr).await,
+                                Err(error) => tracing::debug!(%error, "Plex TLS handshake failed"),
+                            }
+                        } else {
+                            serve_http(stream, app, remote_addr).await;
+                        }
+                    });
                 }
-            });
+                Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            }
         }
+        while connections.join_next().await.is_some() {}
+        Ok(())
     }
 }
 

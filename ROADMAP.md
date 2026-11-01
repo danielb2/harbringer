@@ -6,13 +6,13 @@ An item is complete only after its behavior is implemented and checked against a
 
 ## P0: visible Play button and working playback
 
-- [ ] Show an enabled Play button for playable library items in the official Plex web and macOS clients.
+- [x] Show an enabled Play button for playable library items in the official Plex web and macOS clients.
 - [ ] Press Play and start the actual media file through the advertised Plex part URL.
 - [ ] Verify pause, resume, seeking, playback completion, and saved Resume position in the official clients.
 - [ ] Run the same playback checks in Plezy and record each client's requests and responses.
 - [x] Serve the media part with HTTP range support; an existing media part returned `206 Partial Content` and 1,024 bytes during development verification.
 - [x] Return a direct-play decision from `/video/:/transcode/universal/decision` for an item path.
-- [ ] Confirm that the official client receives and displays the Play control after refreshing Harbringer's item metadata. Keep this open until observed in the client.
+- [x] Confirm that the official client receives and displays the Play control after refreshing Harbringer's item metadata.
 
 The decision endpoint and ranged file route are necessary pieces, not proof that the Play button issue is resolved. Do not move this gate to complete based only on server-side curl checks.
 
@@ -20,7 +20,10 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 
 ### 1. PMS API coverage inventory
 
-- [ ] Build a path-and-method coverage matrix from the current official PMS OpenAPI specification.
+- [x] Check in a path-and-method inventory of all 260 operations in the official PMS OpenAPI 1.2.3 specification.
+- [x] Exercise all 260 documented operations through the production router and assert the current expected HTTP status, including operations not implemented by Harbringer.
+- [x] Keep focused playback success and failure tests for queue creation/retrieval, decision, part delivery, stream selection, subtitles, timeline, and scrobble.
+- [ ] Replace expected 404/405 outcomes one operation at a time with Plex-compatible behavior and response assertions; update the inventory status only with the implementation and regression test.
 - [ ] For every documented operation, record its request parameters, authentication requirements, response schema, current implementation, and client validation status.
 - [ ] Implement every operation needed for full PMS replacement with its documented behavior; do not count empty response placeholders as implemented features.
 - [ ] Make every advertised server capability consistent with actual behavior. Unsupported calls must not be silently represented as successful functionality.
@@ -67,19 +70,18 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 - [ ] Run the protocol/API suite and client smoke checks on every release candidate.
 - [ ] Publish a compatibility report that lists verified behavior and remaining gaps; do not describe the product as a Plex replacement while a P0 gate is open.
 
-## Shared media engine and additional adapters
+## Product scope and follow-on architecture
 
-- [ ] Keep Plex and Jellyfin protocol adapters separate from shared media and file serving.
+- [x] Keep the server protocol surface Plex-only; the built-in web client and Settings pages are Harbringer's own control surface, not another media-server adapter.
 - [ ] Define a seekable media-source interface for local files and future Weaver/Scryer sources.
 - [ ] Add an embeddable Rust library API after the server compatibility gates are met.
-- [ ] Add Audiobookshelf-compatible APIs and assess BookOrbit references after the Plex replacement path is on track.
 
 ## Gap log
 
 ### 2026-11-01
 
 - Plezy search now returns local-library results after `/library/search` was changed to its expected `SearchResult[].Metadata` shape. Latest follow-up adds episodes to parent-show searches and emits `grandparentThumb`/`grandparentArt`; verify those additions in Plezy after its latest connection refresh.
-- The direct-play decision endpoint returned JSON HTTP 200 with a successful decision, and its advertised file part returned HTTP 206 for a byte-range request on the existing port 32400 dev server. The official Plex client still showed no Play button; investigation found the missing `playqueue` provider feature, now advertised. Verify the button and playback in Plex Web/macOS after the dev server reloads; the P0 gate remains open until confirmed.
+- The official Plex client now shows Play after provider discovery advertised the missing `playqueue` feature. It still reports “An error occurred loading items to play.” A live protocol replay confirmed the queue response returns 200 with a string `ratingKey` and matching integer `playQueueSelectedMetadataItemID`; the playback decision returns code 1000 and the media part serves a range with 206. The official client still needs to proceed from queue creation to the decision/part requests; the P0 playback gate remains open.
 - Live item metadata exposed part and external subtitle stream IDs above JavaScript's exact integer limit (2^53−1). These IDs now use deterministic safe-range numbers; on the reloaded `just dev` server, the revised part URL returned HTTP 206 and an advertised external subtitle URL returned HTTP 200 as WebVTT. The official client still needs a metadata refresh and Play-button check.
 - Replaced the sparse “drop-in” checklist with an operation-by-operation PMS API inventory, implementation gates, and an official-client compatibility matrix. JSON remains the Plex API response format.
 
