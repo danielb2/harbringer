@@ -76,6 +76,12 @@ struct ConfigLibrary {
     show_recently_added: bool,
     #[serde(default = "default_true")]
     show_continue_watching: bool,
+    #[serde(default = "default_true")]
+    scan_enabled: bool,
+    #[serde(default = "default_scan_interval_value")]
+    scan_interval_value: u32,
+    #[serde(default = "default_scan_interval_unit")]
+    scan_interval_unit: String,
 }
 
 fn default_bind() -> String {
@@ -86,6 +92,14 @@ fn default_metadata_storage() -> String {
 }
 fn default_true() -> bool {
     true
+}
+
+fn default_scan_interval_value() -> u32 {
+    5
+}
+
+fn default_scan_interval_unit() -> String {
+    "minutes".to_owned()
 }
 
 fn plex_machine_identifier(seed: &str) -> String {
@@ -127,7 +141,8 @@ struct AppState {
     server_name: Arc<RwLock<String>>,
     machine_identifier: Arc<str>,
     root: Arc<PathBuf>,
-    media: Arc<Vec<Media>>,
+    media: Arc<RwLock<Arc<Vec<Media>>>>,
+    inventory_scan_lock: Arc<tokio::sync::Mutex<()>>,
     media_info: Arc<Mutex<HashMap<String, serde_json::Value>>>,
     plex_stream_selections: Arc<Mutex<HashMap<u64, PlexStreamSelection>>>,
     plex_play_queues: Arc<Mutex<HashMap<u64, serde_json::Value>>>,
@@ -135,6 +150,7 @@ struct AppState {
     plex_tls: PlexTls,
 }
 
+#[derive(Clone)]
 struct Media {
     id: String,
     title: String,
@@ -143,6 +159,14 @@ struct Media {
     container: String,
     mime: String,
     metadata_revision: u64,
+}
+
+fn media_snapshot(state: &AppState) -> Arc<Vec<Media>> {
+    state
+        .media
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 struct LocalSecondTimer;
@@ -236,14 +260,24 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
     let mut media = Vec::new();
     for (library_index, library) in config.libraries.iter().enumerate() {
         for folder in &library.folders {
-            let Ok(folder) = tokio::fs::canonicalize(folder).await else {
+            let configured_folder = folder.clone();
+            let Ok(canonical_folder) = tokio::fs::canonicalize(folder).await else {
                 continue;
             };
-            let mut library_media = scan_media(&folder).await?;
+            let mut library_media = scan_media(&canonical_folder).await?;
+            assign_media_ids(
+                &db,
+                library_index + 1,
+                &canonical_folder,
+                &configured_folder,
+                &mut library_media,
+            )?;
             for item in &mut library_media {
-                item.id = format!("{}-{}", library_index + 1, item.id);
+                if let Ok(relative) = item.path.strip_prefix(&canonical_folder) {
+                    item.path = configured_folder.join(relative);
+                }
             }
-            persist_media_records(&db, &folder, &library_media)?;
+            persist_media_records(&db, &configured_folder, &library_media)?;
             media.extend(library_media);
         }
     }
@@ -264,13 +298,16 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
         server_name: Arc::new(RwLock::new(server_name)),
         machine_identifier: Arc::from(machine_identifier),
         root: Arc::new(root),
-        media: Arc::new(media),
+        media: Arc::new(RwLock::new(Arc::new(media))),
+        inventory_scan_lock: Arc::new(tokio::sync::Mutex::new(())),
         media_info: Arc::new(Mutex::new(HashMap::new())),
         plex_stream_selections: Arc::new(Mutex::new(HashMap::new())),
         plex_play_queues: Arc::new(Mutex::new(HashMap::new())),
         next_plex_play_queue_id: Arc::new(AtomicU64::new(1)),
         plex_tls,
     };
+    let scan_state = state.clone();
+    let inventory_scan_task = tokio::spawn(library_scan_scheduler(scan_state));
     let server_tls = state.plex_tls.clone();
     let publication_state = state.clone();
     let publication_task = tokio::spawn(async move {
@@ -369,6 +406,7 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
     }
     gdm_task.abort();
     publication_task.abort();
+    inventory_scan_task.abort();
     Ok(outcome)
 }
 
@@ -406,6 +444,8 @@ fn build_app(state: AppState) -> Router {
         .route("/settings/libraries/:id/delete", post(delete_library))
         .route("/settings/folders", post(add_library_folder))
         .route("/settings/libraries/display", post(update_library_display))
+        .route("/settings/libraries/scan-settings", post(update_library_scan_settings))
+        .route("/settings/scan", post(scan_all_libraries))
         .route("/settings/preferences", post(update_preferences))
         .route("/settings/server-name", post(update_server_name))
         .route("/settings/plex/start", get(start_plex_auth))
@@ -413,6 +453,7 @@ fn build_app(state: AppState) -> Router {
         .route("/settings/plex/callback", get(plex_auth_callback))
         .route("/settings/plex/disconnect", post(disconnect_plex))
         .route("/settings/libraries/:id/scan", post(scan_library_metadata))
+        .route("/settings/libraries/:id/scan-files", post(scan_library_inventory_handler))
         .route("/settings/media/scan", post(scan_media_metadata))
         .route("/settings/browse", get(settings_browse))
         .route("/identity", get(plex_identity))
@@ -692,12 +733,12 @@ fn media_type(path: &PathBuf) -> Option<(&'static str, &'static str)> {
     }
 }
 
-fn find_media<'a>(state: &'a AppState, id: &str) -> Option<&'a Media> {
+fn find_media(state: &AppState, id: &str) -> Option<Media> {
     let public_rating_key = id.parse::<u64>().ok();
-    state
-        .media
+    media_snapshot(state)
         .iter()
         .find(|item| item.id == id || public_rating_key == Some(plex_rating_key(item)))
+        .cloned()
 }
 
 fn persist_media_records(
@@ -719,6 +760,267 @@ fn persist_media_records(
         )?;
     }
     transaction.commit()
+}
+
+fn assign_media_ids(
+    connection: &Connection,
+    library_section: usize,
+    canonical_root: &std::path::Path,
+    configured_root: &std::path::Path,
+    media: &mut [Media],
+) -> Result<(), rusqlite::Error> {
+    const MAX_ITEM_ID: u64 = (1 << 20) - 1;
+
+    let transaction = connection.unchecked_transaction()?;
+    let section = library_section as i64;
+    let id_prefix = format!("{library_section}-");
+    let mut identity_by_path = HashMap::<String, String>::new();
+    let mut legacy_by_path = HashMap::<String, Vec<String>>::new();
+    let mut reserved_keys = std::collections::HashSet::new();
+    let mut assigned_keys = std::collections::HashSet::new();
+    let mut next_id = 1_u64;
+    {
+        let mut statement = transaction.prepare(
+            "SELECT canonical_path, media_key FROM media_identity WHERE library_section = ?1",
+        )?;
+        let rows = statement.query_map([section], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (path, media_key) = row?;
+            if let Some(item_id) = media_key
+                .strip_prefix(&id_prefix)
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                next_id = next_id.max(item_id.saturating_add(1));
+            }
+            reserved_keys.insert(media_key.clone());
+            identity_by_path.insert(path, media_key);
+        }
+    }
+    {
+        let mut statement =
+            transaction.prepare("SELECT media_key, path FROM media WHERE media_key LIKE ?1")?;
+        let rows = statement.query_map([format!("{id_prefix}%")], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (media_key, relative_path) = row?;
+            if let Some(item_id) = media_key
+                .strip_prefix(&id_prefix)
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                next_id = next_id.max(item_id.saturating_add(1));
+            }
+            reserved_keys.insert(media_key.clone());
+            legacy_by_path
+                .entry(relative_path)
+                .or_default()
+                .push(media_key);
+        }
+    }
+    for item in media {
+        let relative_path = item
+            .path
+            .strip_prefix(configured_root)
+            .or_else(|_| item.path.strip_prefix(canonical_root))
+            .unwrap_or(&item.path)
+            .to_path_buf();
+        let canonical_path = canonical_root
+            .join(&relative_path)
+            .to_string_lossy()
+            .into_owned();
+        let legacy_path = relative_path.to_string_lossy().into_owned();
+        let existing_key = identity_by_path.get(&canonical_path).cloned().or_else(|| {
+            legacy_by_path.get(&legacy_path).and_then(|keys| {
+                keys.iter()
+                    .find(|key| {
+                        !assigned_keys.contains(*key)
+                            && !identity_by_path.values().any(|existing| existing == *key)
+                    })
+                    .cloned()
+            })
+        });
+        let id_is_non_numeric = item.id.split_once('-').map_or_else(
+            || item.id.parse::<u64>().is_err(),
+            |(section, item_id)| section.parse::<u64>().is_err() || item_id.parse::<u64>().is_err(),
+        );
+        let current_key = (item.id.starts_with(&id_prefix) || id_is_non_numeric)
+            .then(|| item.id.clone())
+            .filter(|key| !reserved_keys.contains(key) && !assigned_keys.contains(key));
+        let media_key = if let Some(key) = existing_key.or(current_key) {
+            key
+        } else {
+            loop {
+                if next_id > MAX_ITEM_ID {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+                let key = format!("{id_prefix}{next_id}");
+                next_id = next_id.saturating_add(1);
+                if !reserved_keys.contains(&key) && !assigned_keys.contains(&key) {
+                    break key;
+                }
+            }
+        };
+        assigned_keys.insert(media_key.clone());
+        reserved_keys.insert(media_key.clone());
+        item.id.clone_from(&media_key);
+        transaction.execute(
+            "INSERT INTO media_identity (library_section, canonical_path, media_key) VALUES (?1, ?2, ?3)
+             ON CONFLICT(library_section, canonical_path) DO UPDATE SET media_key = excluded.media_key",
+            (section, canonical_path, media_key),
+        )?;
+    }
+    transaction.commit()
+}
+
+fn library_scan_interval(library: &ConfigLibrary) -> Duration {
+    let value = u64::from(library.scan_interval_value.max(1));
+    let seconds = match library.scan_interval_unit.as_str() {
+        "seconds" => value,
+        "hours" => value.saturating_mul(60 * 60),
+        _ => value.saturating_mul(60),
+    };
+    Duration::from_secs(seconds)
+}
+
+async fn scan_library_inventory(state: &AppState, library_id: usize) -> Result<usize, String> {
+    let _scan_guard = state.inventory_scan_lock.lock().await;
+    let library = state
+        .config
+        .lock()
+        .map_err(|_| "Configuration is unavailable".to_owned())?
+        .libraries
+        .get(library_id)
+        .cloned()
+        .ok_or_else(|| "Library does not exist".to_owned())?;
+    let mut roots = Vec::with_capacity(library.folders.len());
+    for configured_root in &library.folders {
+        let canonical_root = tokio::fs::canonicalize(configured_root)
+            .await
+            .map_err(|error| format!("Could not access configured library folder: {error}"))?;
+        roots.push((configured_root.clone(), canonical_root));
+    }
+    let current = media_snapshot(state);
+    let id_prefix = format!("{}-", library_id + 1);
+    let mut existing_ids = HashMap::new();
+    for media in current.iter() {
+        for (root_index, (configured_root, canonical_root)) in roots.iter().enumerate() {
+            let relative = media
+                .path
+                .strip_prefix(configured_root)
+                .or_else(|_| media.path.strip_prefix(canonical_root));
+            if let Ok(relative) = relative {
+                existing_ids.insert((root_index, relative.to_path_buf()), media.id.clone());
+                break;
+            }
+        }
+    }
+    let mut next_id = current
+        .iter()
+        .filter_map(|media| media.id.strip_prefix(&id_prefix)?.parse::<u64>().ok())
+        .max()
+        .unwrap_or_default()
+        .saturating_add(1);
+    let mut scanned_roots = Vec::new();
+    for (root_index, (configured_root, canonical_root)) in roots.iter().enumerate() {
+        let mut media = scan_media(canonical_root)
+            .await
+            .map_err(|error| format!("Could not scan library folder: {error}"))?;
+        for item in &mut media {
+            let relative = item
+                .path
+                .strip_prefix(canonical_root)
+                .map_err(|error| format!("Scanned file escaped its library folder: {error}"))?
+                .to_path_buf();
+            if let Some(id) = existing_ids.get(&(root_index, relative.clone())) {
+                item.id.clone_from(id);
+            } else {
+                item.id = format!("{id_prefix}{next_id}");
+                next_id = next_id.saturating_add(1);
+            }
+            item.path = configured_root.join(relative);
+        }
+        scanned_roots.push((configured_root.clone(), canonical_root.clone(), media));
+    }
+    {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| "Media database is unavailable".to_owned())?;
+        for (configured_root, canonical_root, media) in &mut scanned_roots {
+            assign_media_ids(
+                &connection,
+                library_id + 1,
+                canonical_root,
+                configured_root,
+                media,
+            )
+            .map_err(|error| format!("Could not assign stable media IDs: {error}"))?;
+            persist_media_records(&connection, configured_root, media)
+                .map_err(|error| format!("Could not save scanned media: {error}"))?;
+        }
+    }
+    let scanned = scanned_roots
+        .into_iter()
+        .flat_map(|(_, _, media)| media)
+        .collect::<Vec<_>>();
+    let scanned_count = scanned.len();
+    let belongs_to_library = |media: &Media| {
+        roots.iter().any(|(configured_root, canonical_root)| {
+            media.path.starts_with(configured_root) || media.path.starts_with(canonical_root)
+        })
+    };
+    let insertion_index = current
+        .iter()
+        .position(belongs_to_library)
+        .unwrap_or(current.len());
+    let mut updated = Vec::with_capacity(current.len() + scanned_count);
+    for (index, media) in current.iter().enumerate() {
+        if index == insertion_index {
+            updated.extend(scanned.iter().cloned());
+        }
+        if !belongs_to_library(media) {
+            updated.push(media.clone());
+        }
+    }
+    if insertion_index == current.len() {
+        updated.extend(scanned);
+    }
+    let mut media = state
+        .media
+        .write()
+        .map_err(|_| "Media inventory is unavailable".to_owned())?;
+    *media = Arc::new(updated);
+    Ok(scanned_count)
+}
+
+async fn library_scan_scheduler(state: AppState) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    let mut last_scans = HashMap::<usize, tokio::time::Instant>::new();
+    loop {
+        ticker.tick().await;
+        let libraries = match state.config.lock() {
+            Ok(config) => config.libraries.clone(),
+            Err(_) => continue,
+        };
+        let now = tokio::time::Instant::now();
+        last_scans.retain(|index, _| *index < libraries.len());
+        for (index, library) in libraries.iter().enumerate() {
+            if !library.scan_enabled {
+                last_scans.remove(&index);
+                continue;
+            }
+            let last_scan = last_scans.entry(index).or_insert(now);
+            if now.duration_since(*last_scan) < library_scan_interval(library) {
+                continue;
+            }
+            *last_scan = now;
+            if let Err(error) = scan_library_inventory(&state, index).await {
+                warn!(library = %library.name, %error, "automatic library scan failed");
+            }
+        }
+    }
 }
 
 fn load_config(path: &std::path::Path) -> Result<Config, Box<dyn std::error::Error>> {
@@ -824,6 +1126,12 @@ fn open_database(
              title TEXT NOT NULL,
              metadata_json TEXT,
              matched_at INTEGER
+         );
+         CREATE TABLE IF NOT EXISTS media_identity (
+             library_section INTEGER NOT NULL,
+             canonical_path TEXT NOT NULL,
+             media_key TEXT NOT NULL UNIQUE,
+             PRIMARY KEY (library_section, canonical_path)
          );
          CREATE TABLE IF NOT EXISTS watch_progress (
              user_id TEXT NOT NULL,
@@ -981,6 +1289,14 @@ struct LibraryDisplayForm {
 }
 
 #[derive(Deserialize)]
+struct LibraryScanSettingsForm {
+    library_id: usize,
+    scan_enabled: Option<String>,
+    scan_interval_value: u32,
+    scan_interval_unit: String,
+}
+
+#[derive(Deserialize)]
 struct PreferencesForm {
     metadata_storage: Option<String>,
     #[serde(default)]
@@ -1000,6 +1316,8 @@ struct SettingsQuery {
     metadata_matched: Option<usize>,
     metadata_status: Option<String>,
     server_name_saved: Option<bool>,
+    inventory_scan: Option<usize>,
+    inventory_error: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1224,8 +1542,7 @@ async fn web_watch_action(
                 .map(|component| PathBuf::from(component.as_os_str()));
             show_folder
                 .map(|show_folder| {
-                    state
-                        .media
+                    media_snapshot(&state)
                         .iter()
                         .filter(|item| media_in_library(item, &library_config))
                         .filter_map(|item| {
@@ -1291,7 +1608,7 @@ async fn web_subtitle_selection(
         .plex_stream_selections
         .lock()
         .ok()
-        .and_then(|selections| selections.get(&plex_part_id(media)).copied())
+        .and_then(|selections| selections.get(&plex_part_id(&media)).copied())
         .and_then(|selection| selection.subtitle_stream_id)
         .unwrap_or_default();
     Json(serde_json::json!({ "streamId": stream_id })).into_response()
@@ -1315,7 +1632,7 @@ async fn update_web_subtitle_selection(
         let external = external_subtitle_files(&media.path).await;
         let is_external = external
             .iter()
-            .any(|path| plex_external_subtitle_id(media, path) == update.stream_id);
+            .any(|path| plex_external_subtitle_id(&media, path) == update.stream_id);
         let is_embedded = state
             .media_info
             .lock()
@@ -1345,7 +1662,7 @@ async fn update_web_subtitle_selection(
     }
     if let Ok(mut selections) = state.plex_stream_selections.lock() {
         selections
-            .entry(plex_part_id(media))
+            .entry(plex_part_id(&media))
             .or_default()
             .subtitle_stream_id = Some(update.stream_id);
     } else {
@@ -1354,21 +1671,22 @@ async fn update_web_subtitle_selection(
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn web_media_for_relative<'a>(
-    state: &'a AppState,
+async fn web_media_for_relative(
+    state: &AppState,
     root: &std::path::Path,
     relative: &std::path::Path,
-) -> Option<&'a Media> {
+) -> Option<Media> {
     let path = web_path(state, root, relative).await.ok()?;
     if !path.is_file() {
         return None;
     }
-    for media in state.media.iter() {
+    let media_index = media_snapshot(state);
+    for media in media_index.iter() {
         if tokio::fs::canonicalize(&media.path)
             .await
             .is_ok_and(|candidate| candidate == path)
         {
-            return Some(media);
+            return Some(media.clone());
         }
     }
     None
@@ -2208,6 +2526,9 @@ async fn settings_page(
                         .collect::<Vec<_>>(),
                     library.show_recently_added,
                     library.show_continue_watching,
+                    library.scan_enabled,
+                    library.scan_interval_value,
+                    library.scan_interval_unit.clone(),
                 )
             })
             .collect::<Vec<_>>();
@@ -2219,13 +2540,38 @@ async fn settings_page(
     };
     let list = libraries
         .iter()
-        .map(|(id, name, kind, folders, show_recently_added, show_continue_watching)| {
+        .map(|(id, name, kind, folders, show_recently_added, show_continue_watching, _, _, _)| {
             format!(
                 "<details class=\"library-card\"><summary class=\"library-summary\"><span class=\"library-summary-title\"><strong>{}</strong><span class=\"type-pill\">{}</span></span><span class=\"folder-count\">{} folders</span></summary><div class=\"library-content\"><section class=\"library-folders\" aria-label=\"Folders\"><h4>Folders</h4><ul>{}</ul></section><details class=\"library-add-folder\"><summary>Add folder</summary><form method=\"post\" action=\"/settings/folders\" class=\"inline-form\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><label class=\"sr-only\" for=\"folder-{}\">Folder path</label><input id=\"folder-{}\" name=\"path\" type=\"text\" placeholder=\"/another/folder\" required><button type=\"submit\">Add folder</button></form></details><div class=\"library-tools\"><form method=\"post\" action=\"/settings/libraries/{}/scan\" class=\"inline-form\"><button type=\"submit\">Scan metadata</button><button class=\"button-secondary\" type=\"submit\" formaction=\"/settings/libraries/{}/scan?force=true\">Force rescan</button></form><form method=\"post\" action=\"/settings/libraries/display\" class=\"library-display\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><fieldset><legend>Show on Home</legend><label><input type=\"checkbox\" name=\"show_recently_added\" value=\"true\" {}> Recently Added</label><label><input type=\"checkbox\" name=\"show_continue_watching\" value=\"true\" {}> Continue Watching</label><button class=\"button-secondary\" type=\"submit\">Save Home sections</button></fieldset></form><form method=\"post\" action=\"/settings/libraries/{}/delete\" class=\"library-delete\" onsubmit=\"return confirm('Delete this library from Harbringer? Media files will not be deleted.')\"><button class=\"button-danger\" type=\"submit\">Delete library</button></form></div></div></details>",
                 html(name), html(library_kind_label(kind)), folders.len(), folders.iter().map(|path| format!("<li><code>{}</code></li>", html(path))).collect::<String>(), id, id, id, id, id, id, if *show_recently_added { "checked" } else { "" }, if *show_continue_watching { "checked" } else { "" }, id
             )
         })
         .collect::<String>();
+    let mut list = list;
+    list.insert_str(
+        0,
+        r#"<form class="library-card" method="post" action="/settings/scan"><strong>Scan all libraries</strong><button type="submit">Scan all libraries</button></form>"#,
+    );
+    for (id, name, _, _, _, _, scan_enabled, interval_value, interval_unit) in &libraries {
+        let unit_options = ["seconds", "minutes", "hours"]
+            .into_iter()
+            .map(|unit| {
+                format!(
+                    "<option value=\"{unit}\" {}>{unit}</option>",
+                    if unit == interval_unit {
+                        "selected"
+                    } else {
+                        ""
+                    }
+                )
+            })
+            .collect::<String>();
+        list.push_str(&format!(
+            "<form class=\"library-card library-scan-settings\" method=\"post\" action=\"/settings/libraries/scan-settings\"><input type=\"hidden\" name=\"library_id\" value=\"{id}\"><strong>Automatic scan: {}</strong><label><input type=\"checkbox\" name=\"scan_enabled\" value=\"true\" {}> Enabled</label><label>Every <input type=\"number\" name=\"scan_interval_value\" min=\"1\" value=\"{interval_value}\" required><select name=\"scan_interval_unit\">{unit_options}</select></label><button class=\"button-secondary\" type=\"submit\">Save scan schedule</button></form>",
+            html(name),
+            if *scan_enabled { "checked" } else { "" },
+        ));
+    }
     let error = query
         .error
         .as_deref()
@@ -2236,6 +2582,11 @@ async fn settings_page(
             )
         })
         .unwrap_or_default();
+    let error = if error.is_empty() && query.inventory_error.unwrap_or(false) {
+        "<div class=\"flash-error\" role=\"alert\">One or more libraries could not be scanned. Check the server log for details.</div>".to_owned()
+    } else {
+        error
+    };
     let notice = query
         .metadata_matched
         .map(|count| {
@@ -2255,6 +2606,13 @@ async fn settings_page(
         .or_else(|| {
             query.server_name_saved.map(|_| {
                 "<div class=\"flash-notice\" role=\"status\">Server name saved.</div>".to_owned()
+            })
+        })
+        .or_else(|| {
+            query.inventory_scan.map(|count| {
+                format!(
+                    "<div class=\"flash-notice\" role=\"status\">Scanned all libraries; found {count} media files.</div>"
+                )
             })
         })
         .unwrap_or_default();
@@ -3286,9 +3644,12 @@ fn plex_rating_key(media: &Media) -> u64 {
         .unwrap_or_else(|| plex_safe_numeric_id(&format!("rating-key:{}", media.id)))
 }
 
-fn find_media_part<'a>(state: &'a AppState, id: &str) -> Option<&'a Media> {
+fn find_media_part(state: &AppState, id: &str) -> Option<Media> {
     let id = id.parse::<u64>().ok()?;
-    state.media.iter().find(|media| plex_part_id(media) == id)
+    media_snapshot(state)
+        .iter()
+        .find(|media| plex_part_id(media) == id)
+        .cloned()
 }
 
 fn plex_external_subtitle_id(media: &Media, path: &std::path::Path) -> u64 {
@@ -3948,6 +4309,9 @@ async fn create_library(State(state): State<AppState>, RawForm(raw): RawForm) ->
         folders: canonical_paths,
         show_recently_added: true,
         show_continue_watching: true,
+        scan_enabled: true,
+        scan_interval_value: default_scan_interval_value(),
+        scan_interval_unit: default_scan_interval_unit(),
     });
     if save_config(&state.config_path, &config).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -4003,6 +4367,68 @@ async fn update_library_display(
     Redirect::to("/settings").into_response()
 }
 
+async fn update_library_scan_settings(
+    State(state): State<AppState>,
+    Form(form): Form<LibraryScanSettingsForm>,
+) -> Response {
+    if form.scan_interval_value == 0
+        || !matches!(
+            form.scan_interval_unit.as_str(),
+            "seconds" | "minutes" | "hours"
+        )
+    {
+        return settings_error("Scan intervals need a positive integer and a valid time unit");
+    }
+    let Ok(mut config) = state.config.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Some(library) = config.libraries.get_mut(form.library_id) else {
+        return settings_error("Library does not exist");
+    };
+    library.scan_enabled = form.scan_enabled.is_some();
+    library.scan_interval_value = form.scan_interval_value;
+    library.scan_interval_unit = form.scan_interval_unit;
+    if save_config(&state.config_path, &config).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    Redirect::to("/settings").into_response()
+}
+
+async fn scan_all_libraries(State(state): State<AppState>) -> Response {
+    let library_count = match state.config.lock() {
+        Ok(config) => config.libraries.len(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let mut media_count = 0;
+    let mut failed = false;
+    for library_id in 0..library_count {
+        match scan_library_inventory(&state, library_id).await {
+            Ok(count) => media_count += count,
+            Err(error) => {
+                failed = true;
+                warn!(library_id, %error, "manual library scan failed");
+            }
+        }
+    }
+    Redirect::to(&format!(
+        "/settings?inventory_scan={media_count}&inventory_error={failed}"
+    ))
+    .into_response()
+}
+
+async fn scan_library_inventory_handler(
+    State(state): State<AppState>,
+    Path(library_id): Path<usize>,
+) -> Response {
+    match scan_library_inventory(&state, library_id).await {
+        Ok(count) => Redirect::to(&format!("/settings?inventory_scan={count}")).into_response(),
+        Err(error) => {
+            warn!(library_id, %error, "manual library scan failed");
+            Redirect::to("/settings?inventory_error=true").into_response()
+        }
+    }
+}
+
 async fn delete_library(State(state): State<AppState>, Path(library_id): Path<usize>) -> Response {
     let Ok(mut config) = state.config.lock() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -4050,6 +4476,7 @@ struct WebPath {
     stream: Option<usize>,
     play: Option<String>,
     episode: Option<String>,
+    view: Option<String>,
 }
 
 fn selected_library_root(state: &AppState, library: Option<usize>) -> PathBuf {
@@ -4067,6 +4494,7 @@ async fn home_client(State(state): State<AppState>) -> Response {
     let Ok(config) = state.config.lock().map(|config| config.clone()) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
+    let media_index = media_snapshot(&state);
     let metadata_by_library = config
         .libraries
         .iter()
@@ -4157,7 +4585,7 @@ async fn home_client(State(state): State<AppState>) -> Response {
         .filter(|library| library.kind == "tv")
     {
         for root in &library.folders {
-            for media in state.media.iter() {
+            for media in media_index.iter() {
                 let Ok(relative) = media.path.strip_prefix(root) else {
                     continue;
                 };
@@ -4169,7 +4597,7 @@ async fn home_client(State(state): State<AppState>) -> Response {
     }
     let mut continue_candidates = next_tv_episode_paths(
         &config.libraries,
-        state.media.as_ref(),
+        media_index.as_ref(),
         &watched_paths,
         &hidden_paths,
         &last_activity,
@@ -4192,8 +4620,7 @@ async fn home_client(State(state): State<AppState>) -> Response {
                         return None;
                     }
                     library.folders.iter().find_map(|root| {
-                        state
-                            .media
+                        media_index
                             .iter()
                             .find(|media| {
                                 media
@@ -4228,6 +4655,7 @@ async fn home_client(State(state): State<AppState>) -> Response {
             relative_folder,
             relative_media,
             library_index,
+            true,
         ));
     }
     let continue_watching = if continue_cards.is_empty() {
@@ -4237,7 +4665,7 @@ async fn home_client(State(state): State<AppState>) -> Response {
     };
     let mut recent = String::new();
     let mut recent_count = 0;
-    for media in state.media.iter() {
+    for media in media_index.iter() {
         if recent_count >= 12 {
             break;
         }
@@ -4278,6 +4706,7 @@ async fn home_client(State(state): State<AppState>) -> Response {
             relative_folder,
             relative_media,
             library_index,
+            false,
         ));
         recent_count += 1;
     }
@@ -4404,6 +4833,8 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             .ok()
             .and_then(|config| (!config.libraries.is_empty()).then_some(0));
     }
+    let files_view = query.view.as_deref() == Some("files");
+    let media_index = media_snapshot(&s);
     let relative = match clean_relative_path(query.path.as_deref().unwrap_or("")) {
         Some(path) => path,
         None => return StatusCode::BAD_REQUEST.into_response(),
@@ -4475,7 +4906,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             let database_metadata = if sidecar_mode {
                 None
             } else {
-                s.media
+                media_index
                     .iter()
                     .find(|media| media.path == selected_path)
                     .and_then(|media| {
@@ -4497,7 +4928,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     };
     let mut directories = Vec::new();
     let mut files = Vec::new();
-    if !library_top_level {
+    if !library_top_level || files_view {
         let mut entries = match tokio::fs::read_dir(&directory).await {
             Ok(entries) => entries,
             Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -4515,7 +4946,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             if file_type.is_dir() {
                 directories.push((name, child_relative));
             } else if file_type.is_file()
-                && media_type(&path).is_some()
+                && (files_view || media_type(&path).is_some())
                 && selected_relative
                     .as_deref()
                     .is_none_or(|selected| selected == child_relative)
@@ -4528,7 +4959,24 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     files.sort_by_key(|(name, _, _)| name.to_ascii_lowercase());
 
     let mut items = String::new();
-    items.push_str(&breadcrumb_nav(&relative, query.library));
+    items.push_str(&breadcrumb_nav(&relative, query.library, files_view));
+    let view_library = query.library.unwrap_or_default();
+    let view_path = url_encode(&relative.to_string_lossy());
+    let media_view_href = format!("/?library={view_library}&path={view_path}");
+    let files_view_href = format!("{media_view_href}&view=files");
+    let media_view_style = if files_view {
+        "padding:.45rem .75rem;border-radius:.45rem;color:#cbd5e1;background:#1f2937;text-decoration:none"
+    } else {
+        "padding:.45rem .75rem;border-radius:.45rem;color:#fff;background:#1d4ed8;text-decoration:none"
+    };
+    let files_view_style = if files_view {
+        "padding:.45rem .75rem;border-radius:.45rem;color:#fff;background:#1d4ed8;text-decoration:none"
+    } else {
+        "padding:.45rem .75rem;border-radius:.45rem;color:#cbd5e1;background:#1f2937;text-decoration:none"
+    };
+    items.push_str(&format!(
+        "<nav aria-label=\"Library view\" style=\"display:flex;grid-column:1 / -1;gap:.4rem;margin-bottom:.5rem\"><a data-spa-link href=\"{media_view_href}\" style=\"{media_view_style}\">Media</a><a data-spa-link href=\"{files_view_href}\" style=\"{files_view_style}\">Files</a></nav>"
+    ));
     let sidebar_library = query.library.or_else(|| {
         s.config
             .lock()
@@ -4547,10 +4995,9 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
         .library
         .map(|index| plex_section_metadata(&s, index + 1))
         .unwrap_or_default();
-    if library_top_level {
+    if library_top_level && !files_view {
         if let (Some(library_index), Some(library)) = (query.library, library_config.as_ref()) {
-            let media = s
-                .media
+            let media = media_index
                 .iter()
                 .filter(|item| media_in_library(item, library))
                 .collect::<Vec<_>>();
@@ -4616,6 +5063,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                         library_index,
                         true,
                         "show",
+                        false,
                     ));
                 }
             } else {
@@ -4633,6 +5081,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                         folder,
                         media_path,
                         library_index,
+                        false,
                     ));
                 }
             }
@@ -4641,6 +5090,19 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     }
     for (name, child_relative) in directories {
         has_content = true;
+        if files_view {
+            let href = format!(
+                "/?library={}&path={}&view=files",
+                query.library.unwrap_or_default(),
+                url_encode(&child_relative.to_string_lossy())
+            );
+            folder_cards.push_str(&format!(
+                "<a class=\"file-item\" data-spa-link href=\"{}\" style=\"display:flex;align-items:center;gap:.6rem;padding:.7rem .85rem;border:1px solid #374151;border-radius:.5rem;background:#1f2937;color:inherit;text-decoration:none\">📁 <span>{}</span></a>",
+                html(&href),
+                html(&name)
+            ));
+            continue;
+        }
         let directory = directory.join(&name);
         if library_kind.as_deref() == Some("tv") && parse_tv_season_directory(&name).is_some() {
             let season_number = parse_tv_season_directory(&name).unwrap_or_default();
@@ -4662,8 +5124,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             }
             if episode_count > 0 {
                 let season_path = directory.clone();
-                let season_media = s
-                    .media
+                let season_media = media_index
                     .iter()
                     .filter(|media| media.path.starts_with(&season_path))
                     .collect::<Vec<_>>();
@@ -4689,6 +5150,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                             query.library.unwrap_or_default(),
                             false,
                             "item",
+                            false,
                         )
                     })
                     .unwrap_or_default();
@@ -4724,10 +5186,32 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     }
     for (name, child_relative, path) in files {
         has_content = true;
+        if files_view && selected_relative.is_none() {
+            let row = if media_type(&path).is_some() {
+                let folder = child_relative.parent().unwrap_or(&relative);
+                let href = format!(
+                    "/?library={}&path={}&play={}&view=files",
+                    query.library.unwrap_or_default(),
+                    url_encode(&folder.to_string_lossy()),
+                    url_encode(&child_relative.to_string_lossy())
+                );
+                format!(
+                    "<a class=\"file-item\" data-spa-link href=\"{}\" style=\"display:flex;align-items:center;gap:.6rem;padding:.7rem .85rem;border:1px solid #374151;border-radius:.5rem;background:#1f2937;color:inherit;text-decoration:none\">📄 <span>{}</span></a>",
+                    html(&href),
+                    html(&name)
+                )
+            } else {
+                file_item(&name)
+            };
+            items.push_str(&row);
+            continue;
+        }
         if let Some((_, mime)) = media_type(&path) {
             let matched_media = web_media_for_relative(&s, &library_root, &child_relative).await;
             if tv_season_view && selected_relative.is_none() {
-                let item_metadata = matched_media.and_then(|media| section_metadata.get(&media.id));
+                let item_metadata = matched_media
+                    .as_ref()
+                    .and_then(|media| section_metadata.get(&media.id));
                 let media_path = library_root.join(&child_relative);
                 let (episode_title, episode_number) =
                     tv_episode_card_labels(&library_root, &media_path, item_metadata);
@@ -4745,7 +5229,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                 );
                 let progress = item_metadata.map(media_card_progress).unwrap_or_default();
                 items.push_str(&media_poster_card(
-                    matched_media.map(|media| media.id.as_str()),
+                    matched_media.as_ref().map(|media| media.id.as_str()),
                     &href,
                     &title,
                     episode_number.as_deref(),
@@ -4755,10 +5239,13 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                     library,
                     true,
                     "item",
+                    false,
                 ));
                 continue;
             }
-            let artwork = matched_media.map(|media| media_thumbnail_url(&media.id));
+            let artwork = matched_media
+                .as_ref()
+                .map(|media| media_thumbnail_url(&media.id));
             let artwork = if artwork.is_some() {
                 artwork
             } else if sidecar_mode
@@ -4776,12 +5263,13 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             } else {
                 None
             };
-            let subtitles = if let Some(media) = matched_media {
+            let subtitles = if let Some(media) = matched_media.as_ref() {
                 subtitle_tracks(media, &child_relative, query.library).await
             } else {
                 Vec::new()
             };
             let selected_subtitle = matched_media
+                .as_ref()
                 .and_then(|media| {
                     s.plex_stream_selections
                         .lock()
@@ -4805,7 +5293,11 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     items.push_str(&folder_cards);
     items.push_str(&season_sections);
     if !has_content {
-        items.push_str(r#"<p class="note">No supported media or subfolders here.</p>"#);
+        items.push_str(if files_view {
+            r#"<p class="note">No files or folders here.</p>"#
+        } else {
+            r#"<p class="note">No supported media or subfolders here.</p>"#
+        });
     }
     (
         [(header::CACHE_CONTROL, "no-store")],
@@ -5503,8 +5995,9 @@ async fn episode_info_panel(
         .config
         .lock()
         .is_ok_and(|config| config.metadata_storage == "sidecar");
+    let media_index = media_snapshot(state);
     if !sidecar_mode {
-        let Some(media) = state.media.iter().find(|media| media.path == path) else {
+        let Some(media) = media_index.iter().find(|media| media.path == path) else {
             return String::new();
         };
         let Some((library_id, _)) = media_library(state, media) else {
@@ -5982,7 +6475,7 @@ fn sidebar_nav_with_library_links(
     )
 }
 
-fn breadcrumb_nav(relative: &std::path::Path, library: Option<usize>) -> String {
+fn breadcrumb_nav(relative: &std::path::Path, library: Option<usize>, files_view: bool) -> String {
     if relative.as_os_str().is_empty() {
         return String::new();
     }
@@ -5990,6 +6483,7 @@ fn breadcrumb_nav(relative: &std::path::Path, library: Option<usize>) -> String 
     let prefix = library
         .map(|index| format!("library={index}&"))
         .unwrap_or_default();
+    let view = if files_view { "view=files&" } else { "" };
     let mut current = PathBuf::new();
     for (index, component) in relative.components().enumerate() {
         let Component::Normal(name) = component else {
@@ -6001,8 +6495,9 @@ fn breadcrumb_nav(relative: &std::path::Path, library: Option<usize>) -> String 
             nav.push_str(r#"<span class="breadcrumb-separator">/</span>"#);
         }
         nav.push_str(&format!(
-            r#"<a data-spa-link href="/?{}path={}">{}</a>"#,
+            r#"<a data-spa-link href="/?{}{}path={}">{}</a>"#,
             prefix,
+            view,
             url_encode(&current.to_string_lossy()),
             html(&label)
         ));
@@ -6037,6 +6532,7 @@ fn media_card(
     folder: &std::path::Path,
     media_path: &std::path::Path,
     library: usize,
+    show_remove_from_continue: bool,
 ) -> String {
     let href = format!(
         "/?library={library}&path={}&play={}",
@@ -6092,6 +6588,7 @@ fn media_card(
         library,
         tv,
         "item",
+        show_remove_from_continue,
     )
 }
 
@@ -6146,6 +6643,7 @@ fn media_poster_card(
     library: usize,
     tv_card: bool,
     watch_scope: &str,
+    show_remove_from_continue: bool,
 ) -> String {
     let subtitle = subtitle
         .map(|value| format!("<span class=\"media-card-subtitle\">{}</span>", html(value)))
@@ -6185,7 +6683,10 @@ fn media_poster_card(
     let card_style = "align-self:start;background:rgba(31,41,55,.3);padding:.7rem";
     let card_info_style = " style=\"box-sizing:border-box;height:4rem;padding-top:0;gap:0;grid-template-rows:1rem 1rem 1rem 1rem\"";
     let title_style = " style=\"height:auto;margin:0;white-space:nowrap;text-overflow:ellipsis\"";
-    format!(
+    let remove_action = format!(
+        r#"<button type="button" data-watch-action="remove_from_continue" data-path="{path}" data-library="{library}" data-watch-scope="{watch_scope}" data-watch-key="{watch_key}">Remove from Continue Watching</button>"#
+    );
+    let card = format!(
         r#"<div class="{}" style="{}" data-media-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}"><div class="media-card-artwork"><a class="media-card-poster" data-spa-link href="{}">{}</a><details class="media-card-menu"><summary aria-label="More options" title="More options">⋮</summary><div class="media-card-menu-items"><button type="button" data-watch-action="watched">Mark as watched</button><button type="button" data-watch-action="unwatched" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Mark as unwatched</button><button type="button" data-watch-action="remove_from_continue" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Remove from Continue Watching</button></div></details></div><a class="media-card-info" data-spa-link href="{}"{}><span class="media-card-title" title="{}"{}>{}</span>{}{}{}</a></div>"#,
         card_class,
         card_style,
@@ -6211,7 +6712,12 @@ fn media_poster_card(
         subtitle,
         details,
         media_progress_markup(progress),
-    )
+    );
+    if show_remove_from_continue {
+        card
+    } else {
+        card.replace(&remove_action, "")
+    }
 }
 
 fn media_progress_markup(progress: f64) -> String {
@@ -6666,8 +7172,30 @@ async fn log_not_found(State(state): State<AppState>, req: Request<Body>) -> Res
             plex_product = ?query.get("X-Plex-Product"),
             client_profile = ?query.get("X-Plex-Client-Profile-Name"),
             client_platform = ?query.get("X-Plex-Platform"),
-            "Plex universal stream start requested; serving original file without conversion"
+            "Plex universal stream start requested"
         );
+        if extension.eq_ignore_ascii_case("mpd") {
+            warn!(
+                extension,
+                reason = "transcoding_unavailable",
+                "Plex DASH playback rejected"
+            );
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "DASH transcoding is not supported.",
+            )
+                .into_response();
+        }
+        if extension.eq_ignore_ascii_case("m3u8") {
+            warn!(extension, "HLS playback is not supported");
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                "HLS playback is not supported.",
+            )
+                .into_response();
+        }
         let Some(media) = plex_playback_media_from_query(&state, &query) else {
             warn!(
                 extension,
@@ -6677,7 +7205,7 @@ async fn log_not_found(State(state): State<AppState>, req: Request<Body>) -> Res
             return StatusCode::NOT_FOUND.into_response();
         };
         return plex_protocol_response(
-            stream_file(media, req.method().clone(), req.headers().clone(), false).await,
+            stream_file(&media, req.method().clone(), req.headers().clone(), false).await,
         );
     }
     if req.uri().path() == "/photo/:/transcode" {
@@ -6765,10 +7293,10 @@ fn plex_query_media_id(rating_key: Option<&str>, key: Option<&str>) -> Option<St
         })
 }
 
-fn plex_playback_media_from_query<'a>(
-    state: &'a AppState,
+fn plex_playback_media_from_query(
+    state: &AppState,
     query: &BTreeMap<String, String>,
-) -> Option<&'a Media> {
+) -> Option<Media> {
     let path = query.get("path").or_else(|| query.get("key"));
     path.and_then(|path| {
         let part_path = path
@@ -6792,7 +7320,7 @@ fn plex_playback_media_from_query<'a>(
 
 fn plex_progress_path(state: &AppState, media_id: &str) -> Option<String> {
     let media = find_media(state, media_id)?;
-    let (_, library) = media_library(state, media)?;
+    let (_, library) = media_library(state, &media)?;
     let root = library
         .folders
         .iter()
@@ -6830,7 +7358,7 @@ fn plex_timeline(state: &AppState, query: PlexTimelineQuery) -> Response {
     ).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    StatusCode::OK.into_response()
+    plex_json(serde_json::json!({"MediaContainer": {"size": 0}}))
 }
 
 fn plex_scrobble(state: &AppState, query: PlexScrobbleQuery, watched: bool) -> Response {
@@ -6999,6 +7527,7 @@ async fn root_handler(
         || query.path.is_some()
         || query.play.is_some()
         || query.episode.is_some()
+        || query.view.is_some()
     {
         web_client(State(s), Query(query)).await
     } else {
@@ -7084,9 +7613,6 @@ async fn plex_root(state: &AppState) -> Response {
             "transcoderLyrics": false,
             "transcoderPhoto": false,
             "transcoderSubtitles": false,
-            // Plex Web rejects otherwise playable files when this capability is
-            // false. The universal start endpoint below passes through the
-            // original file; it does not perform video conversion.
             "transcoderVideo": true,
             "updatedAt": updated_at,
             "updater": false,
@@ -7528,10 +8054,11 @@ async fn plex_continue_watching_hub(
         Ok(config) => config.libraries.clone(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
+    let media_index = media_snapshot(&state);
     let mut items = Vec::new();
     for (media_key, position, duration) in progress {
         let found = libraries.iter().enumerate().find_map(|(index, library)| {
-            state.media.iter().find_map(|media| {
+            media_index.iter().find_map(|media| {
                 if !media_in_library(media, library) {
                     return None;
                 }
@@ -7663,6 +8190,7 @@ async fn plex_hubs_response(
     if only_section.is_some_and(|section| section == 0 || section > libraries.len()) {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let media_index = media_snapshot(state);
 
     let mut hubs = Vec::new();
     for (index, library) in libraries.iter().enumerate() {
@@ -7670,8 +8198,7 @@ async fn plex_hubs_response(
         if only_section.is_some_and(|requested| requested != section) {
             continue;
         }
-        let mut media = state
-            .media
+        let mut media = media_index
             .iter()
             .filter(|media| media_in_library(media, library))
             .collect::<Vec<_>>();
@@ -7797,12 +8324,12 @@ async fn plex_recommendation_hub(
             "addedAt:desc",
         ),
     };
+    let media_index = media_snapshot(state);
     let tv_shows = (library.kind == "tv").then(|| {
         plex_tv_show_groups(
             section,
             &library.folders,
-            state
-                .media
+            media_index
                 .iter()
                 .filter(|media| media_in_library(media, library)),
         )
@@ -7872,6 +8399,7 @@ fn plex_section_metadata(state: &AppState, section: usize) -> HashMap<String, se
     let Some(library) = config.libraries.get(section.saturating_sub(1)).cloned() else {
         return metadata;
     };
+    let media_index = media_snapshot(state);
     let sidecar_mode = config.metadata_storage == "sidecar";
     if !sidecar_mode {
         if let Ok(connection) = state.db.lock() {
@@ -7895,8 +8423,7 @@ fn plex_section_metadata(state: &AppState, section: usize) -> HashMap<String, se
         }
     }
 
-    for media in state
-        .media
+    for media in media_index
         .iter()
         .filter(|media| media_in_library(media, &library))
     {
@@ -7955,8 +8482,7 @@ fn plex_section_metadata(state: &AppState, section: usize) -> HashMap<String, se
                         (path, (position, duration, watched, updated_at))
                     })
                     .collect::<HashMap<_, _>>();
-                for media in state
-                    .media
+                for media in media_index
                     .iter()
                     .filter(|media| media_in_library(media, &library))
                 {
@@ -8029,10 +8555,12 @@ fn plex_genre_tokens(metadata: Option<&serde_json::Value>) -> BTreeSet<String> {
 }
 
 fn plex_library_for_metadata(state: &AppState, id: &str) -> Option<(usize, ConfigLibrary)> {
+    let media_index = media_snapshot(state);
     find_media(state, id)
-        .and_then(|media| media_library(state, media))
+        .and_then(|media| media_library(state, &media))
         .or_else(|| {
-            find_plex_tv_location(state, id).map(|(section, library, _, _)| (section, library))
+            find_plex_tv_location(state, media_index.as_ref(), id)
+                .map(|(section, library, _, _)| (section, library))
         })
 }
 
@@ -8049,13 +8577,13 @@ async fn plex_related_hubs(
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(10)
         .min(50);
+    let media_index = media_snapshot(&state);
     let metadata = plex_section_metadata(&state, section);
     let source_groups = (library.kind == "tv").then(|| {
         plex_tv_show_groups(
             section,
             &library.folders,
-            state
-                .media
+            media_index
                 .iter()
                 .filter(|media| media_in_library(media, &library)),
         )
@@ -8071,7 +8599,7 @@ async fn plex_related_hubs(
     });
     let source_media = source_group
         .and_then(|show| show.episodes.first().copied())
-        .or_else(|| find_media(&state, &id));
+        .or_else(|| media_index.iter().find(|media| media.id == id));
     let target_genres = plex_genre_tokens(source_media.and_then(|media| metadata.get(&media.id)));
     let source_group_key = source_group.map(|show| show.rating_key.clone());
 
@@ -8113,8 +8641,7 @@ async fn plex_related_hubs(
         }
         (total, related_items)
     } else {
-        let mut candidates = state
-            .media
+        let mut candidates = media_index
             .iter()
             .filter(|media| media_in_library(media, &library) && media.id != id)
             .map(|media| {
@@ -8311,6 +8838,7 @@ async fn plex_search_items(
         .lock()
         .map(|config| config.libraries.clone())
         .unwrap_or_default();
+    let media_index = media_snapshot(state);
     let mut results = Vec::<(u8, String, serde_json::Value)>::new();
 
     for (index, library) in libraries.iter().enumerate() {
@@ -8323,8 +8851,7 @@ async fn plex_search_items(
             let shows = plex_tv_show_groups(
                 section,
                 &library.folders,
-                state
-                    .media
+                media_index
                     .iter()
                     .filter(|media| media_in_library(media, library)),
             );
@@ -8394,8 +8921,7 @@ async fn plex_search_items(
                 }
             }
         } else if plex_search_type_matches(query, "movie") {
-            for media in state
-                .media
+            for media in media_index
                 .iter()
                 .filter(|media| media_in_library(media, library))
             {
@@ -8705,13 +9231,13 @@ async fn plex_section_first_characters(
         return StatusCode::NOT_FOUND.into_response();
     };
     let metadata = plex_section_metadata(&state, section);
+    let media_index = media_snapshot(&state);
     let mut initials = BTreeSet::new();
     if library.kind == "tv" {
         for show in plex_tv_show_groups(
             section,
             &library.folders,
-            state
-                .media
+            media_index
                 .iter()
                 .filter(|media| media_in_library(media, &library)),
         ) {
@@ -8726,8 +9252,7 @@ async fn plex_section_first_characters(
         }
     } else {
         initials.extend(
-            state
-                .media
+            media_index
                 .iter()
                 .filter(|media| media_in_library(media, &library))
                 .map(|media| plex_first_character(&media.title)),
@@ -8772,6 +9297,7 @@ async fn plex_section_first_character_items(
         return StatusCode::NOT_FOUND.into_response();
     };
     let metadata = plex_section_metadata(&state, section);
+    let media_index = media_snapshot(&state);
     let initial = letter
         .chars()
         .next()
@@ -8782,8 +9308,7 @@ async fn plex_section_first_character_items(
         for show in plex_tv_show_groups(
             section,
             &library.folders,
-            state
-                .media
+            media_index
                 .iter()
                 .filter(|media| media_in_library(media, &library)),
         ) {
@@ -8800,8 +9325,7 @@ async fn plex_section_first_character_items(
             }
         }
     } else {
-        for media in state
-            .media
+        for media in media_index
             .iter()
             .filter(|media| media_in_library(media, &library))
         {
@@ -8861,6 +9385,7 @@ async fn plex_library_all(
         })
     };
     let mut items = Vec::new();
+    let media_index = media_snapshot(&state);
     for (index, library) in config.libraries.iter().enumerate() {
         let section = index + 1;
         let metadata = plex_section_metadata(&state, section);
@@ -8868,8 +9393,7 @@ async fn plex_library_all(
             let shows = plex_tv_show_groups(
                 section,
                 &library.folders,
-                state
-                    .media
+                media_index
                     .iter()
                     .filter(|media| media_in_library(media, library)),
             );
@@ -8918,8 +9442,7 @@ async fn plex_library_all(
                 }
             }
         } else if include_type("1", "movie", true) {
-            for media in state
-                .media
+            for media in media_index
                 .iter()
                 .filter(|media| media_in_library(media, library))
             {
@@ -9047,8 +9570,8 @@ async fn plex_all(
     if library.kind == "tv" {
         return plex_tv_all(&s, section, library, &headers, &query, &uri).await;
     }
-    let mut media = s
-        .media
+    let media_index = media_snapshot(&s);
+    let mut media = media_index
         .iter()
         .filter(|media| media_in_library(media, &library))
         .collect::<Vec<_>>();
@@ -9142,11 +9665,11 @@ async fn plex_tv_all(
     uri: &Uri,
 ) -> Response {
     let metadata = plex_section_metadata(state, section);
+    let media_index = media_snapshot(state);
     let mut shows = plex_tv_show_groups(
         section,
         &library.folders,
-        state
-            .media
+        media_index
             .iter()
             .filter(|media| media_in_library(media, &library)),
     );
@@ -9437,7 +9960,8 @@ fn plex_children_json(
 }
 
 fn find_plex_tv_location<'a>(
-    state: &'a AppState,
+    state: &AppState,
+    media_items: &'a [Media],
     rating_key: &str,
 ) -> Option<(usize, ConfigLibrary, PlexTvShowGroup<'a>, Option<u32>)> {
     let libraries = state.config.lock().ok()?.libraries.clone();
@@ -9449,8 +9973,7 @@ fn find_plex_tv_location<'a>(
         let shows = plex_tv_show_groups(
             section,
             &library.folders,
-            state
-                .media
+            media_items
                 .iter()
                 .filter(|media| media_in_library(media, &library)),
         );
@@ -9479,7 +10002,10 @@ async fn plex_item(
 ) -> Response {
     let wants_children = uri.path().ends_with("/children");
     let include_children = plex_query_value(&uri, "includeChildren") == Some("1");
-    if let Some((section, library, mut show, season)) = find_plex_tv_location(&s, &id) {
+    let media_index = media_snapshot(&s);
+    if let Some((section, library, mut show, season)) =
+        find_plex_tv_location(&s, media_index.as_ref(), &id)
+    {
         let metadata = plex_section_metadata(&s, section);
         if let Some(show_title) = show
             .episodes
@@ -9581,16 +10107,16 @@ async fn plex_item(
     let Some(media) = find_media(&s, &id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((section, library)) = media_library(&s, media) else {
+    let Some((section, library)) = media_library(&s, &media) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let metadata_by_id = plex_section_metadata(&s, section);
-    let mut video = plex_video_json(media, section, &library, metadata_by_id.get(&media.id));
+    let mut video = plex_video_json(&media, section, &library, metadata_by_id.get(&media.id));
     if library.kind == "tv" {
         let groups = plex_tv_show_groups(
             section,
             &library.folders,
-            s.media
+            media_index
                 .iter()
                 .filter(|candidate| media_in_library(candidate, &library)),
         );
@@ -9622,7 +10148,7 @@ async fn plex_item(
             }
         }
     }
-    add_plex_technical_metadata(&s, &mut video, media).await;
+    add_plex_technical_metadata(&s, &mut video, &media).await;
     // Plex for Mac refetches the selected item after creating the queue and
     // bases its playability check on this metadata response as well.
     plex_mark_direct_play(&mut video);
@@ -9969,7 +10495,7 @@ async fn plex_add_collection_item(
     let Some(media) = find_media(&state, &media_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((section, _)) = media_library(&state, media) else {
+    let Some((section, _)) = media_library(&state, &media) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     if collection.section_id != section as i64 {
@@ -9979,7 +10505,7 @@ async fn plex_add_collection_item(
         Ok(config) => config.libraries.clone(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    let media_key = plex_rating_key(media).to_string();
+    let media_key = plex_rating_key(&media).to_string();
     let updated_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
@@ -10035,7 +10561,7 @@ async fn plex_remove_collection_item(
         return StatusCode::NOT_FOUND.into_response();
     }
     let media_key = find_media(&state, &item_id)
-        .map(|media| plex_rating_key(media).to_string())
+        .map(|media| plex_rating_key(&media).to_string())
         .unwrap_or_else(|| item_id.clone());
     let mut result = connection.execute(
         "DELETE FROM collection_items WHERE collection_id = ?1 AND media_key = ?2",
@@ -10380,7 +10906,7 @@ async fn plex_add_playlist_item(
     let Some(media) = find_media(&state, &rating_key) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let rating_key = plex_rating_key(media).to_string();
+    let rating_key = plex_rating_key(&media).to_string();
     let Ok(connection) = state.db.lock() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
@@ -10531,6 +11057,7 @@ fn plex_play_queue_response(
     source_uri: &str,
     items: Vec<serde_json::Value>,
     selected_index: usize,
+    include_direct_play_decision: bool,
 ) -> serde_json::Value {
     let selected = items.get(selected_index);
     let selected_item_id = selected
@@ -10539,14 +11066,7 @@ fn plex_play_queue_response(
         .unwrap_or(serde_json::Value::Null);
     let selected_metadata_item_id = selected
         .and_then(|item| item.get("ratingKey"))
-        .and_then(|rating_key| {
-            rating_key.as_u64().or_else(|| {
-                rating_key
-                    .as_str()
-                    .and_then(|rating_key| rating_key.parse::<u64>().ok())
-            })
-        })
-        .map(serde_json::Value::from)
+        .cloned()
         .unwrap_or(serde_json::Value::Null);
     let media_tag_version = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -10569,8 +11089,44 @@ fn plex_play_queue_response(
             "Metadata": items
         }
     });
-    plex_mark_direct_play_decision(&mut response["MediaContainer"]);
+    if include_direct_play_decision {
+        plex_mark_direct_play_decision(&mut response["MediaContainer"]);
+    }
     response
+}
+
+fn plex_queue_item_without_playback_decision(item: &mut serde_json::Value) {
+    let Some(media) = item
+        .get_mut("Media")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|media| media.first_mut())
+    else {
+        return;
+    };
+    for field in ["protocol", "decision", "selected"] {
+        media[field] = serde_json::Value::Null;
+    }
+    let Some(part) = media
+        .get_mut("Part")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|parts| parts.first_mut())
+    else {
+        return;
+    };
+    for field in ["protocol", "decision", "selected"] {
+        part[field] = serde_json::Value::Null;
+    }
+    if let Some(streams) = part
+        .get_mut("Stream")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for stream in streams {
+            stream["decision"] = serde_json::Value::Null;
+            if stream["streamType"] == 1 || stream["selected"] == false {
+                stream["selected"] = serde_json::Value::Null;
+            }
+        }
+    }
 }
 
 async fn plex_create_play_queue(
@@ -10608,7 +11164,7 @@ async fn plex_create_play_queue(
         );
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((section, library)) = media_library(&state, media) else {
+    let Some((section, library)) = media_library(&state, &media) else {
         warn!(
             rating_key,
             reason = "item_has_no_library",
@@ -10617,12 +11173,14 @@ async fn plex_create_play_queue(
         return StatusCode::NOT_FOUND.into_response();
     };
     let metadata = plex_section_metadata(&state, section);
-    let mut item = plex_video_json(media, section, &library, metadata.get(&media.id));
-    add_plex_technical_metadata(&state, &mut item, media).await;
-    // Harbringer serves original files without transcoding. Include the direct
-    // play selection in the queue item so clients that do not request the
-    // separate universal decision endpoint still see a playable stream.
-    plex_mark_direct_play(&mut item);
+    let mut item = plex_video_json(&media, section, &library, metadata.get(&media.id));
+    add_plex_technical_metadata(&state, &mut item, &media).await;
+    let direct_play = query.get("directPlay").map(String::as_str) != Some("0");
+    if direct_play {
+        plex_mark_direct_play(&mut item);
+    } else {
+        plex_queue_item_without_playback_decision(&mut item);
+    }
     let queue_id = state
         .next_plex_play_queue_id
         .fetch_add(1, Ordering::Relaxed);
@@ -10631,7 +11189,7 @@ async fn plex_create_play_queue(
     let queue_item_id = queue_id;
     item["playQueueItemID"] = serde_json::json!(queue_item_id);
     let library_uuid = plex_library_uuid(&state.machine_identifier, section);
-    let plex_rating_key = plex_rating_key(media).to_string();
+    let plex_rating_key = plex_rating_key(&media).to_string();
     let normalized_source_uri = plex_play_queue_source_uri(&library_uuid, &plex_rating_key);
     let selected_metadata_item_id = plex_rating_key.parse::<u64>().unwrap_or_default();
     info!(
@@ -10643,7 +11201,8 @@ async fn plex_create_play_queue(
         source_uri = %normalized_source_uri,
         "Plex play queue created"
     );
-    let response = plex_play_queue_response(queue_id, &normalized_source_uri, vec![item], 0);
+    let response =
+        plex_play_queue_response(queue_id, &normalized_source_uri, vec![item], 0, direct_play);
     if let Ok(mut queues) = state.plex_play_queues.lock() {
         queues.insert(queue_id, response.clone());
     } else {
@@ -10687,7 +11246,7 @@ async fn plex_playback_decision(
         );
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((section, library)) = media_library(&state, media) else {
+    let Some((section, library)) = media_library(&state, &media) else {
         warn!(
             media_id,
             reason = "item_has_no_library",
@@ -10697,17 +11256,29 @@ async fn plex_playback_decision(
     };
 
     let metadata_by_id = plex_section_metadata(&state, section);
-    let mut video = plex_video_json(media, section, &library, metadata_by_id.get(&media.id));
-    add_plex_technical_metadata(&state, &mut video, media).await;
-    plex_mark_direct_play(&mut video);
+    let mut video = plex_video_json(&media, section, &library, metadata_by_id.get(&media.id));
+    add_plex_technical_metadata(&state, &mut video, &media).await;
     let library_uuid = plex_library_uuid(&state.machine_identifier, section);
-    info!(media_id, section, "Plex direct-play decision returned");
-    plex_json(plex_direct_play_decision_response(
-        video,
+    if query.get("directPlay").map(String::as_str) != Some("0") {
+        plex_mark_direct_play(&mut video);
+        info!(media_id, section, "Plex direct-play decision returned");
+        return plex_json(plex_direct_play_decision_response(
+            video,
+            section,
+            &library,
+            &library_uuid,
+        ));
+    }
+
+    let protocol = query.get("protocol").map(String::as_str).unwrap_or("http");
+    warn!(
+        media_id,
         section,
-        &library,
-        &library_uuid,
-    ))
+        protocol,
+        reason = "transcoding_unavailable",
+        "Plex playback conversion rejected"
+    );
+    StatusCode::NOT_IMPLEMENTED.into_response()
 }
 
 fn plex_direct_play_decision_response(
@@ -10823,13 +11394,13 @@ async fn plex_set_streams(
             })
             || subtitle_paths
                 .iter()
-                .any(|path| plex_external_subtitle_id(media, path) == selected)
+                .any(|path| plex_external_subtitle_id(&media, path) == selected)
     });
     if !audio_valid || !subtitle_valid {
         return StatusCode::BAD_REQUEST.into_response();
     }
     if let Ok(mut selections) = state.plex_stream_selections.lock() {
-        let current = selections.entry(plex_part_id(media)).or_default();
+        let current = selections.entry(plex_part_id(&media)).or_default();
         if selection.audio_stream_id.is_some() {
             current.audio_stream_id = selection.audio_stream_id;
         }
@@ -10855,7 +11426,7 @@ async fn plex_part_file(
         return StatusCode::NOT_FOUND.into_response();
     }
     let download = plex_query_value(&uri, "download") == Some("1");
-    stream_file(media, method, headers, download).await
+    stream_file(&media, method, headers, download).await
 }
 
 async fn plex_stream(
@@ -10866,7 +11437,8 @@ async fn plex_stream(
     let Some((stream_id, extension)) = plex_stream_id_and_format(&stream) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    for media in state.media.iter() {
+    let media_index = media_snapshot(&state);
+    for media in media_index.iter() {
         for subtitle_path in external_subtitle_files(&media.path).await {
             if plex_external_subtitle_id(media, &subtitle_path) != stream_id {
                 continue;
@@ -10992,7 +11564,7 @@ async fn plex_artwork(state: &AppState, id: &str, filename: &str) -> Response {
         );
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((_, library)) = media_library(state, media) else {
+    let Some((_, library)) = media_library(state, &media) else {
         info!(
             media_id = id,
             artwork = filename,
@@ -11041,7 +11613,7 @@ async fn plex_artwork(state: &AppState, id: &str, filename: &str) -> Response {
         }
     }
     if filename == "cover.jpg" {
-        if let Some(bytes) = plex_frame_cover(state, media).await {
+        if let Some(bytes) = plex_frame_cover(state, &media).await {
             return (
                 [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
                 bytes,
@@ -11384,7 +11956,7 @@ async fn stream_for_id(s: AppState, id: String, method: Method, headers: HeaderM
     let Some(media) = find_media(&s, &id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    stream_file(media, method, headers, false).await
+    stream_file(&media, method, headers, false).await
 }
 
 async fn stream_file(

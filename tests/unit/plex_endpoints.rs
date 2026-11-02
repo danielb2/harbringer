@@ -113,6 +113,9 @@ fn fixture() -> Fixture {
         folders: vec![media_dir.clone()],
         show_recently_added: true,
         show_continue_watching: true,
+        scan_enabled: true,
+        scan_interval_value: 5,
+        scan_interval_unit: "minutes".to_owned(),
     };
     let config = Config {
         bind: "127.0.0.1:0".to_owned(),
@@ -143,7 +146,8 @@ fn fixture() -> Fixture {
         server_name: Arc::new(super::RwLock::new("harbringer".to_owned())),
         machine_identifier: Arc::from(machine_identifier),
         root: Arc::new(media_dir),
-        media: Arc::new(vec![media]),
+        media: Arc::new(super::RwLock::new(Arc::new(vec![media]))),
+        inventory_scan_lock: Arc::new(tokio::sync::Mutex::new(())),
         media_info: Arc::new(Mutex::new(HashMap::new())),
         plex_stream_selections: Arc::new(Mutex::new(HashMap::new())),
         plex_play_queues: Arc::new(Mutex::new(HashMap::new())),
@@ -203,6 +207,9 @@ fn tv_fixture() -> Fixture {
             folders: vec![media_dir.clone()],
             show_recently_added: true,
             show_continue_watching: true,
+            scan_enabled: true,
+            scan_interval_value: 5,
+            scan_interval_unit: "minutes".to_owned(),
         }],
         metadata_storage: "sidecar".to_owned(),
         tmdb_bearer_token: None,
@@ -219,7 +226,8 @@ fn tv_fixture() -> Fixture {
         server_name: Arc::new(super::RwLock::new("harbringer".to_owned())),
         machine_identifier: Arc::from(machine_identifier),
         root: Arc::new(media_dir),
-        media: Arc::new(media),
+        media: Arc::new(super::RwLock::new(Arc::new(media))),
+        inventory_scan_lock: Arc::new(tokio::sync::Mutex::new(())),
         media_info: Arc::new(Mutex::new(HashMap::new())),
         plex_stream_selections: Arc::new(Mutex::new(HashMap::new())),
         plex_play_queues: Arc::new(Mutex::new(HashMap::new())),
@@ -311,6 +319,246 @@ async fn settings_indicates_saved_tmdb_token_without_disclosing_it() {
 }
 
 #[tokio::test]
+async fn settings_saves_and_validates_per_library_scan_schedule() {
+    let fixture = fixture();
+    let page = send(&fixture.app, Method::GET, "/settings", Body::empty()).await;
+    let page = to_bytes(page.into_body(), usize::MAX).await.unwrap();
+    let page = String::from_utf8(page.to_vec()).unwrap();
+    assert!(page.contains("name=\"scan_interval_value\" min=\"1\" value=\"5\""));
+    assert!(page.contains("<option value=\"minutes\" selected>minutes</option>"));
+
+    let saved = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/settings/libraries/scan-settings")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "library_id=0&scan_enabled=true&scan_interval_value=2&scan_interval_unit=seconds",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::SEE_OTHER);
+    {
+        let config = fixture.config.lock().unwrap();
+        let library = &config.libraries[0];
+        assert!(library.scan_enabled);
+        assert_eq!(library.scan_interval_value, 2);
+        assert_eq!(library.scan_interval_unit, "seconds");
+        assert_eq!(
+            super::library_scan_interval(library),
+            std::time::Duration::from_secs(2)
+        );
+    }
+
+    let disabled = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/settings/libraries/scan-settings")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "library_id=0&scan_interval_value=1&scan_interval_unit=hours",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), StatusCode::SEE_OTHER);
+    {
+        let config = fixture.config.lock().unwrap();
+        assert!(!config.libraries[0].scan_enabled);
+        assert_eq!(config.libraries[0].scan_interval_unit, "hours");
+    }
+
+    let invalid = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/settings/libraries/scan-settings")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "library_id=0&scan_enabled=true&scan_interval_value=0&scan_interval_unit=minutes",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::SEE_OTHER);
+    let config = fixture.config.lock().unwrap();
+    assert!(!config.libraries[0].scan_enabled);
+    assert_eq!(config.libraries[0].scan_interval_value, 1);
+    assert_eq!(config.libraries[0].scan_interval_unit, "hours");
+}
+
+#[tokio::test]
+async fn manual_scan_updates_web_and_plex_inventory_without_changing_existing_ids() {
+    let fixture = fixture();
+    let media_dir = fixture.root.join("media");
+    std::fs::write(media_dir.join("Added.mp4"), b"new media").unwrap();
+    std::fs::write(media_dir.join("notes.txt"), b"not a video").unwrap();
+
+    let scanned = send(&fixture.app, Method::POST, "/settings/scan", Body::empty()).await;
+    assert_eq!(scanned.status(), StatusCode::SEE_OTHER);
+    let location = scanned.headers()[header::LOCATION].to_str().unwrap();
+    assert!(location.contains("inventory_scan=2"));
+
+    let web = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    let web = to_bytes(web.into_body(), usize::MAX).await.unwrap();
+    let web = String::from_utf8(web.to_vec()).unwrap();
+    assert!(web.contains("Added"));
+
+    let plex = send(
+        &fixture.app,
+        Method::GET,
+        "/library/sections/1/all",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(plex.status(), StatusCode::OK);
+    let plex: serde_json::Value =
+        serde_json::from_slice(&to_bytes(plex.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let items = plex["MediaContainer"]["Metadata"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().any(|item| item["title"] == "Added"));
+    assert_eq!(
+        send(
+            &fixture.app,
+            Method::GET,
+            "/library/metadata/1048577",
+            Body::empty(),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let canonical_root = tokio::fs::canonicalize(&media_dir).await.unwrap();
+    let mut restarted_media = super::scan_media(&canonical_root).await.unwrap();
+    {
+        let connection = fixture.db.lock().unwrap();
+        super::assign_media_ids(
+            &connection,
+            1,
+            &canonical_root,
+            &media_dir,
+            &mut restarted_media,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        restarted_media
+            .iter()
+            .find(|media| media.path.ends_with("Demo.mkv"))
+            .unwrap()
+            .id,
+        "1-1"
+    );
+    assert_eq!(
+        restarted_media
+            .iter()
+            .find(|media| media.path.ends_with("Added.mp4"))
+            .unwrap()
+            .id,
+        "1-2"
+    );
+    assert_eq!(
+        send(
+            &fixture.app,
+            Method::POST,
+            "/playQueues?type=video&uri=%2Flibrary%2Fmetadata%2F1048577",
+            Body::empty(),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &fixture.app,
+            Method::POST,
+            "/playQueues?type=video&uri=%2Flibrary%2Fmetadata%2F1048578",
+            Body::empty(),
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn manual_scan_adds_new_tv_episode_to_plex_inventory() {
+    let fixture = tv_fixture();
+    let season = fixture.root.join("media/Example Show/Season 01");
+    std::fs::write(season.join("Example.Show.S01E03.Added.mkv"), b"new episode").unwrap();
+
+    let scanned = send(&fixture.app, Method::POST, "/settings/scan", Body::empty()).await;
+    assert_eq!(scanned.status(), StatusCode::SEE_OTHER);
+    assert!(scanned.headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .contains("inventory_scan=3"));
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/library/sections/1/all",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let shows = json["MediaContainer"]["Metadata"].as_array().unwrap();
+    assert_eq!(shows.len(), 1);
+    assert_eq!(shows[0]["leafCount"], 3);
+}
+
+#[tokio::test]
+async fn files_view_lists_folders_and_supported_or_unsupported_files() {
+    let fixture = fixture();
+    let archive = fixture.root.join("media/Archive");
+    std::fs::create_dir_all(&archive).unwrap();
+    std::fs::write(archive.join("readme.txt"), b"text file").unwrap();
+
+    let root = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&view=files",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(root.status(), StatusCode::OK);
+    let root = to_bytes(root.into_body(), usize::MAX).await.unwrap();
+    let root = String::from_utf8(root.to_vec()).unwrap();
+    assert!(root.contains("Demo.mkv"));
+    assert!(!root.contains("readme.txt"));
+    assert!(root.contains("Archive"));
+    assert!(root.contains("view=files"));
+    assert!(!root.contains("<div class=\"media-card"));
+
+    let nested = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&path=Archive&view=files",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(nested.status(), StatusCode::OK);
+    let nested = to_bytes(nested.into_body(), usize::MAX).await.unwrap();
+    let nested = String::from_utf8(nested.to_vec()).unwrap();
+    assert!(nested.contains("readme.txt"));
+    assert!(nested.contains("view=files&path=Archive"));
+}
+
+#[tokio::test]
 async fn web_and_plex_clients_share_playback_progress() {
     let fixture = fixture();
     let saved = fixture
@@ -352,6 +600,10 @@ async fn web_and_plex_clients_share_playback_progress() {
     )
     .await;
     assert_eq!(timeline.status(), StatusCode::OK);
+
+    let timeline_body = to_bytes(timeline.into_body(), usize::MAX).await.unwrap();
+    let timeline_json: serde_json::Value = serde_json::from_slice(&timeline_body).unwrap();
+    assert_eq!(timeline_json["MediaContainer"]["size"], 0);
     let progress = send(
         &fixture.app,
         Method::GET,
@@ -934,7 +1186,7 @@ async fn library_media_view_starts_with_flat_poster_cards_and_progress() {
     assert!(body.contains("radial-gradient(ellipse at 75% -20%"));
     assert!(body.contains("data-watch-action=\"unwatched\""));
     assert!(body.contains("data-watch-action=\"watched\""));
-    assert!(body.contains("data-watch-action=\"remove_from_continue\""));
+    assert!(!body.contains("data-watch-action=\"remove_from_continue\""));
     assert!(body.contains("watchAction: action"));
     assert!(body.contains(">0%</span>"));
     assert!(!body.contains("<video class=\"folder-preview-video\""));
@@ -1105,6 +1357,9 @@ fn media_cards_use_the_selected_media_poster_and_path() {
         folders: vec![PathBuf::from("Films")],
         show_recently_added: true,
         show_continue_watching: true,
+        scan_enabled: true,
+        scan_interval_value: 5,
+        scan_interval_unit: "minutes".to_owned(),
     };
     let movie_card = super::media_card(
         &movie,
@@ -1114,7 +1369,20 @@ fn media_cards_use_the_selected_media_poster_and_path() {
         std::path::Path::new("Films"),
         std::path::Path::new("Films/Demo Movie.mkv"),
         0,
+        false,
     );
+    assert!(!movie_card.contains("Remove from Continue Watching"));
+    let continue_card = super::media_card(
+        &movie,
+        &movie_config,
+        Some(&movie_metadata),
+        Path::new("Films"),
+        Path::new("Films"),
+        Path::new("Films/Demo Movie.mkv"),
+        0,
+        true,
+    );
+    assert!(continue_card.contains("Remove from Continue Watching"));
     assert!(movie_card.contains("/library/metadata/1-42/thumb"));
     assert!(movie_card
         .contains("style=\"align-self:start;background:rgba(31,41,55,.3);padding:.7rem\""));
@@ -1148,6 +1416,9 @@ fn media_cards_use_the_selected_media_poster_and_path() {
         folders: vec![PathBuf::from("Shows")],
         show_recently_added: true,
         show_continue_watching: true,
+        scan_enabled: true,
+        scan_interval_value: 5,
+        scan_interval_unit: "minutes".to_owned(),
     };
     let tv_metadata = serde_json::json!({"name":"Example Show"});
     let tv_card = super::media_card(
@@ -1158,6 +1429,7 @@ fn media_cards_use_the_selected_media_poster_and_path() {
         Path::new("Example Show/Season 02"),
         Path::new("Example Show/Season 02/Example.Show.S02E04.mkv"),
         1,
+        false,
     );
     assert!(tv_card.contains(
         "class=\"media-card-title\" title=\"Example Show\" style=\"height:auto;margin:0;white-space:nowrap;text-overflow:ellipsis\">Example Show</span>"
@@ -1186,6 +1458,7 @@ fn media_cards_use_the_selected_media_poster_and_path() {
         Path::new("Example Show/Season 02"),
         Path::new("Example Show/Season 02/Example.Show.S02E04.mkv"),
         1,
+        false,
     );
     assert!(titled_tv_card.contains("class=\"media-card-subtitle\">The Lost Episode</span>"));
 }
@@ -1234,6 +1507,27 @@ fn old_config_filename_migrates_to_the_new_name() {
     assert!(!old_path.exists());
     assert!(new_path.exists());
     std::fs::remove_dir_all(config_dir).unwrap();
+}
+
+#[tokio::test]
+async fn plex_web_dash_start_reports_transcoding_unavailable() {
+    let fixture = fixture();
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/video/:/transcode/universal/start.mpd?protocol=dash&path=%2Flibrary%2Fmetadata%2F1048577",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/plain; charset=utf-8"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(String::from_utf8(body.to_vec())
+        .unwrap()
+        .contains("DASH transcoding is not supported."));
 }
 
 #[tokio::test]
@@ -1336,7 +1630,6 @@ async fn plex_playback_endpoints_cover_success_and_failure_paths() {
     let rating_key = item_json["MediaContainer"]["Metadata"][0]["ratingKey"]
         .as_str()
         .unwrap();
-    let numeric_key = rating_key.parse::<u64>().unwrap();
     assert_eq!(item_json["MediaContainer"]["Metadata"][0]["type"], "movie");
     assert!(
         item_json["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["key"]
@@ -1369,7 +1662,7 @@ async fn plex_playback_endpoints_cover_success_and_failure_paths() {
         .unwrap();
     assert_eq!(
         queue_json["MediaContainer"]["playQueueSelectedMetadataItemID"],
-        numeric_key
+        rating_key
     );
     assert_eq!(
         queue_json["MediaContainer"]["Metadata"][0]["ratingKey"],
@@ -1394,6 +1687,7 @@ async fn plex_playback_endpoints_cover_success_and_failure_paths() {
         .status(),
         StatusCode::OK
     );
+
     assert_eq!(
         send(&fixture.app, Method::GET, "/playQueues/999", Body::empty())
             .await
@@ -1432,7 +1726,7 @@ async fn plex_playback_endpoints_cover_success_and_failure_paths() {
     let decision = send(
         &fixture.app,
         Method::GET,
-        &format!("/video/:/transcode/universal/decision?ratingKey=1-1"),
+        &format!("/video/:/transcode/universal/decision?ratingKey=1-1&directPlay=1"),
         Body::empty(),
     )
     .await;
@@ -1447,6 +1741,15 @@ async fn plex_playback_endpoints_cover_success_and_failure_paths() {
         decision_json["MediaContainer"]["Metadata"][0]["ratingKey"],
         rating_key
     );
+
+    let conversion_decision = send(
+        &fixture.app,
+        Method::GET,
+        "/video/:/transcode/universal/decision?ratingKey=1-1&protocol=dash&directPlay=0&directStream=1&subtitles=auto",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(conversion_decision.status(), StatusCode::NOT_IMPLEMENTED);
     assert_eq!(
         send(
             &fixture.app,
@@ -1468,22 +1771,6 @@ async fn plex_playback_endpoints_cover_success_and_failure_paths() {
         .await
         .status(),
         StatusCode::NOT_FOUND
-    );
-    let passthrough = send(
-        &fixture.app,
-        Method::GET,
-        "/video/:/transcode/universal/start.m3u8?path=%2Flibrary%2Fmetadata%2F1-1",
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(passthrough.status(), StatusCode::OK);
-    assert_eq!(
-        passthrough.headers()[header::CONTENT_TYPE],
-        "video/x-matroska"
-    );
-    assert_eq!(
-        to_bytes(passthrough.into_body(), usize::MAX).await.unwrap(),
-        &b"0123456789abcdef"[..]
     );
 
     let part = send(

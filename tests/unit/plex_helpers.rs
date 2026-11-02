@@ -9,14 +9,15 @@ use super::{
     plex_library_media_container, plex_library_provider_features, plex_mark_direct_play,
     plex_media_id, plex_paged_children, plex_part_id, plex_photo_source, plex_play_queue_response,
     plex_play_queue_source_uri, plex_presence_url, plex_publish_urls, plex_query_media_id,
-    plex_ranked_tv_shows, plex_rating_key, plex_rating_key_from_source, plex_safe_numeric_id,
-    plex_search_hubs, plex_search_rank, plex_search_result_entries, plex_search_type_matches,
-    plex_stream_id, plex_stream_id_and_format, plex_track_label, plex_tv_episode_parents,
-    plex_tv_season_groups, plex_tv_season_json, plex_tv_show_groups, plex_tv_show_json,
-    plex_video_json, plex_video_resolution, render_database_info_panel,
-    sidebar_nav_with_library_links, sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms,
-    technical_tracks, tv_show_title, vtt_to_srt, ConfigLibrary, HeaderMap, HeaderValue, Media,
-    PathBuf, PlexStreamSelection, TvEpisodeInfo, Uri,
+    plex_queue_item_without_playback_decision, plex_ranked_tv_shows, plex_rating_key,
+    plex_rating_key_from_source, plex_safe_numeric_id, plex_search_hubs, plex_search_rank,
+    plex_search_result_entries, plex_search_type_matches, plex_stream_id,
+    plex_stream_id_and_format, plex_track_label, plex_tv_episode_parents, plex_tv_season_groups,
+    plex_tv_season_json, plex_tv_show_groups, plex_tv_show_json, plex_video_json,
+    plex_video_resolution, render_database_info_panel, sidebar_nav_with_library_links,
+    sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms, technical_tracks, tv_show_title,
+    vtt_to_srt, ConfigLibrary, HeaderMap, HeaderValue, Media, PathBuf, PlexStreamSelection,
+    TvEpisodeInfo, Uri,
 };
 #[test]
 fn plex_playback_ids_resolve_rating_keys_and_metadata_paths() {
@@ -96,6 +97,9 @@ fn plex_media_advertises_playable_part_audio_video_and_external_subtitle() {
         folders: Vec::new(),
         show_recently_added: true,
         show_continue_watching: true,
+        scan_enabled: true,
+        scan_interval_value: 5,
+        scan_interval_unit: "minutes".to_owned(),
     };
     let info = serde_json::json!({"media":{"track":[
         {"@type":"General", "Duration":"120.5", "BitRate":"1800000"},
@@ -213,6 +217,9 @@ fn plex_media_infers_average_bitrate_when_media_info_omits_it() {
         folders: Vec::new(),
         show_recently_added: true,
         show_continue_watching: true,
+        scan_enabled: true,
+        scan_interval_value: 5,
+        scan_interval_unit: "minutes".to_owned(),
     };
     let info = serde_json::json!({"media":{"track":[
         {"@type":"General", "Duration":"120.5"},
@@ -381,6 +388,9 @@ fn continue_watching_picks_the_first_unwatched_episode_for_a_show() {
         folders: vec![root],
         show_recently_added: true,
         show_continue_watching: true,
+        scan_enabled: true,
+        scan_interval_value: 5,
+        scan_interval_unit: "minutes".to_owned(),
     };
     let watched = std::collections::HashSet::from([first_path.to_owned()]);
     let hidden = std::collections::HashSet::new();
@@ -582,6 +592,9 @@ fn plex_tv_library_groups_episode_files_under_show_and_season_items() {
         folders: roots,
         show_recently_added: true,
         show_continue_watching: true,
+        scan_enabled: true,
+        scan_interval_value: 5,
+        scan_interval_unit: "minutes".to_owned(),
     };
     let metadata = std::collections::HashMap::from([(
         "3-1".to_owned(),
@@ -806,6 +819,9 @@ fn plex_extras_for_known_media_return_an_empty_json_container() {
         folders: Vec::new(),
         show_recently_added: true,
         show_continue_watching: true,
+        scan_enabled: true,
+        scan_interval_value: 5,
+        scan_interval_unit: "minutes".to_owned(),
     };
     let response = plex_empty_extras_response(&library, 1, "library-uuid");
     assert_eq!(response["MediaContainer"]["size"], 0);
@@ -828,18 +844,35 @@ fn plex_play_queue_source_and_response_follow_pms_shape() {
         ),
         Some("2-42".to_owned())
     );
-    let item = serde_json::json!({
+    let mut item = serde_json::json!({
         "ratingKey": "142",
         "playQueueItemID": 73,
-        "Media": [{"id": 51}]
+        "Media": [{
+            "id": 51,
+            "protocol": "http",
+            "decision": "directplay",
+            "selected": true,
+            "Part": [{
+                "protocol": "http",
+                "decision": "directplay",
+                "selected": true,
+                "Stream": [
+                    {"streamType": 1, "selected": true, "decision": "directplay"},
+                    {"streamType": 2, "selected": true, "decision": "directplay"},
+                    {"streamType": 3, "selected": false, "decision": "directplay"},
+                    {"streamType": 3, "selected": true, "decision": "directplay"}
+                ]
+            }]
+        }]
     });
+    plex_queue_item_without_playback_decision(&mut item);
     let source_uri = plex_play_queue_source_uri("library-id", "142");
-    let queue = plex_play_queue_response(9, &source_uri, vec![item], 0);
+    let queue = plex_play_queue_response(9, &source_uri, vec![item], 0, false);
     assert_eq!(queue["MediaContainer"]["playQueueID"], 9);
     assert_eq!(queue["MediaContainer"]["playQueueSelectedItemID"], 73);
     assert_eq!(
         queue["MediaContainer"]["playQueueSelectedMetadataItemID"],
-        142
+        "142"
     );
     assert_eq!(
         queue["MediaContainer"]["playQueueSourceURI"],
@@ -857,10 +890,22 @@ fn plex_play_queue_source_and_response_follow_pms_shape() {
         .as_u64()
         .is_some());
     assert_eq!(queue["MediaContainer"]["playQueueTotalCount"], 1);
-    assert_eq!(queue["MediaContainer"]["directPlayDecisionCode"], 1000);
-    assert_eq!(queue["MediaContainer"]["generalDecisionCode"], 1000);
-    assert_eq!(
-        queue["MediaContainer"]["generalDecisionText"],
-        "Direct play OK."
-    );
+
+    let media = &queue["MediaContainer"]["Metadata"][0]["Media"][0];
+    assert_eq!(media["protocol"], serde_json::Value::Null);
+    assert_eq!(media["decision"], serde_json::Value::Null);
+    assert_eq!(media["selected"], serde_json::Value::Null);
+    let part = &media["Part"][0];
+    assert_eq!(part["protocol"], serde_json::Value::Null);
+    assert_eq!(part["decision"], serde_json::Value::Null);
+    assert_eq!(part["selected"], serde_json::Value::Null);
+    assert_eq!(part["Stream"][0]["selected"], serde_json::Value::Null);
+    assert_eq!(part["Stream"][1]["selected"], true);
+    assert_eq!(part["Stream"][2]["selected"], serde_json::Value::Null);
+    assert_eq!(part["Stream"][3]["selected"], true);
+    assert_eq!(part["Stream"][0]["decision"], serde_json::Value::Null);
+    assert!(queue["MediaContainer"]
+        .get("directPlayDecisionCode")
+        .is_none());
+    assert!(queue["MediaContainer"].get("generalDecisionCode").is_none());
 }
