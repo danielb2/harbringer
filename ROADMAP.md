@@ -12,6 +12,7 @@ An item is complete only after its behavior is implemented and checked against a
 - [ ] Run the same playback checks in Plezy and record each client's requests and responses.
 - [x] Serve the media part with HTTP range support; an existing media part returned `206 Partial Content` and 1,024 bytes during development verification.
 - [x] Return a direct-play decision from `/video/:/transcode/universal/decision` for an item path.
+- [ ] Complete and verify DASH playback when Plex Web requests `protocol=dash`. A prototype remuxes H.264 Matroska video with optional AAC audio to fMP4 and serves MPD/init/fragment URLs; other video codecs and containers are rejected, other audio is omitted, and real Plex client playback remains unverified.
 - [x] Confirm that the official client receives and displays the Play control after refreshing Harbringer's item metadata.
 
 The decision endpoint and ranged file route are necessary pieces, not proof that the Play button issue is resolved. Do not move this gate to complete based only on server-side curl checks.
@@ -40,6 +41,8 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 ### 3. Library and metadata behavior
 
 - [x] Expose configured libraries as Plex sections and return media metadata with technical tracks and matched metadata.
+- [x] Refresh the shared Plex/web inventory with a Settings scan-all action and per-library automatic scans, enabled by default every five minutes.
+- [x] Provide a built-in Media/Files switch; Files lists visible directories and all visible files, including unsupported formats.
 - [x] Support current title/date/rating sorts, basic recommendations, Plex artwork URLs, external subtitles, and section pagination.
 - [x] Implement Plex title search and confirm Plezy returns local-library results.
 - [ ] Recheck in Plezy that show-title searches also display matching episodes and the show cover after the latest response changes.
@@ -47,7 +50,7 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 - [x] Expose a Plex Continue Watching hub from saved in-progress items and implement its remove action.
 - [x] Support static video collections with persistent create/list and item add/list/remove; smart collections, reordering, and composite artwork remain unsupported.
 - [ ] Complete and validate all client-used hubs, filters, sorting options, collection artwork/reordering, and library navigation; validate playlist and collection behavior in Plex clients.
-- [ ] Replace scan-order IDs with stable media and part IDs; handle moves, renames, removals, rescans, and library updates reliably.
+- [x] Persist media IDs by canonical file path so additions, rescans, and restarts do not change IDs for unchanged files. Moves, renames, and library reordering still need handling.
 - [ ] Complete artwork behavior, including missing-art fallback frames and requested image sizes/formats, using portable in-process Rust libraries.
 - [ ] Verify movie and TV show/season/episode hierarchies and metadata in each official client.
 
@@ -85,11 +88,14 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 
 - Built-in web Continue Watching shows one first-unwatched, unhidden episode per active TV show and sorts movie/show cards by latest watch activity. Plex API first-unwatched episode selection remains unchanged.
 - Provider discovery now advertises universal search, static video playlists and collections, and the Continue Watching hub with its remove action. Playlist, collection, and progress-action behavior have protocol-level tests; smart generators, collection reordering/artwork, and playlist uploads remain unsupported, and Plex Desktop visibility remains unverified.
+- Filesystem scans now replace the shared inventory used by Plex and the web client. Settings can scan all libraries, and each library can use an enabled/disabled interval in seconds, minutes, or hours. New IDs persist by canonical file path; focused tests cover new movie/TV discovery and stable existing keys.
+- The built-in web client now offers raw Files browsing beside poster-based Media views. Its card menu shows “Remove from Continue Watching” only for cards in that section.
+- A saved Plex Web trace requested `protocol=dash` and `/video/:/transcode/universal/start.mpd` for Matroska media. The old handler returned source bytes for a manifest; Plex reported `s4001 (Manifest)`, though its link to browser instability was not confirmed. The handler now has a limited H.264/AAC-to-fMP4 remux path. The user confirmed Plex Desktop playback works again with `transcoderVideo=true`. Plex Web still reports `s4032 (Manifest)`. Logs showed 124,333 keyframe fragments, then 4,469 timed fragments. The MPD uses a one-based `SegmentTemplate` under the MPEG-DASH Full profile, but Plex still requests no init or media segments. Shaka reports `Empty XML source`; the response now sets `Content-Length` and logs the manifest byte count. Client validation is pending.
 
 ### 2026-11-01
 
 - Plezy search now returns local-library results after `/library/search` was changed to its expected `SearchResult[].Metadata` shape. Latest follow-up adds episodes to parent-show searches and emits `grandparentThumb`/`grandparentArt`; verify those additions in Plezy after its latest connection refresh.
-- The official Plex client now shows Play after provider discovery advertised the missing `playqueue` feature. It still reports “An error occurred loading items to play.” A live protocol replay confirmed the queue response returns 200 with a string `ratingKey` and matching integer `playQueueSelectedMetadataItemID`; the playback decision returns code 1000 and the media part serves a range with 206. The official client still needs to proceed from queue creation to the decision/part requests; the P0 playback gate remains open.
+- Plex Desktop playback works on the current restored-capability source. Plex Web still returns `s4032 (Manifest)` for Millennium Actress. Shaka reports `Empty XML source`; the server's MPD requests return HTTP 200, but no init or media requests follow. The current code uses a one-based `SegmentTemplate`, maps segment 1 to the first fragment, keeps truthful `startWithSAP=0`, and sets explicit manifest length. Verify the latest response body in Plex Web.
 - Live item metadata exposed part and external subtitle stream IDs above JavaScript's exact integer limit (2^53−1). These IDs now use deterministic safe-range numbers; on the reloaded `just dev` server, the revised part URL returned HTTP 206 and an advertised external subtitle URL returned HTTP 200 as WebVTT. The official client still needs a metadata refresh and Play-button check.
 - Replaced the sparse “drop-in” checklist with an operation-by-operation PMS API inventory, implementation gates, and an official-client compatibility matrix. JSON remains the Plex API response format.
 - Plex Desktop requested `GET /devices` and `GET /status/sessions/history/all`. Both now return Plex-shaped empty containers instead of 404; `/accounts` was already implemented. Device registration and playback-history persistence remain open compatibility gaps.
@@ -125,10 +131,10 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 - Added web-client watch progress, resume behavior, subtitle selection, and playback controls; Plex account/user authentication and official-client compatibility remain unverified.
 - Added shared media-card actions to mark movies or TV shows watched or unwatched and persist the status.
 - Home’s Continue Watching shelf shows the next unwatched TV episode after an episode is marked watched, unless an episode in the series is already in progress or the next episode is hidden.
-- Added a collapsible shared explorer/sidebar, Home dashboard, Media/Folder library views, and filesystem polling for the built-in web client.
+- Added a collapsible shared explorer/sidebar, Home dashboard, Media/Files library views, and filesystem polling for the built-in web client.
 - Added Plex-aware root negotiation: Plex requests receive XML while ordinary browser requests receive the web client.
 - Shared the Settings page’s radial background gradient with web-client pages, while retaining media banners.
-- Added Settings-based library registration and startup scanning of all saved library directories.
+- Added Settings-based library registration, scan-all, per-library automatic scans, and startup scanning of all saved library directories.
 - Reworked persisted library configuration into named, typed libraries with multiple folders; existing directory records migrate into a Default Library.
 - Replaced `--dir` with `config.toml` configuration and made SQLite the rebuildable cache/state layer beside the TOML file.
 - Added a SQLite state database under the configured library root, with persistent server identity, initial media records, users, watch-progress, and artwork tables.
@@ -136,6 +142,6 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 - Confirmed the current server is not yet discoverable through Plex.tv: it lacks persistent identity, PIN authentication, claim exchange, and resource publication.
 - Added the Plex.tv PIN linking flow in Settings and persist the returned account token; the server deliberately remains unclaimed until the claim exchange and resource publication steps are implemented.
 - Confirmed Plex.tv authentication/discovery must precede real Plezy and official-client validation; direct URL/token connections remain only a development shortcut.
-- Confirmed the current media model still assigns IDs from scan order; stable identities independent of renames remain outstanding.
+- Media IDs now persist across additions, rescans, and restarts for unchanged paths. Stable identity across moves, renames, and library reordering remains outstanding.
 - Recorded metadata matching, artwork, presentation, and per-user watch progress as required product behavior.
 - Checks run: `cargo test`, `cargo fmt`, `just --fmt --check`, and `git diff --check`.

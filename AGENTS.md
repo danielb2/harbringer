@@ -1,12 +1,12 @@
 # mplex
 
-Project guidance for `mplex`: a Rust implementation of a fully functional Plex Media Server replacement. The goal is compatibility with Plex's documented PMS API and real Plex clients, including Plex Web and Plex Desktop. This is past the MVP stage.
+Project guidance for `mplex`: the target is a 100% drop-in replacement for Plex's official Media Server. This includes documented PMS APIs and matching behavior in official Plex clients, including every client-visible capability and item menu. This is past the MVP stage; treat full compatibility as the goal, not a single-route or single-action milestone.
 
 ## Essential rules
 
 - Read relevant code and current Plex request traces before changing behavior.
 - Keep the protocol surface Plex-only. Do not add Jellyfin routes or mix adapters.
-- Implement Plex behavior against the PMS documentation and validate it with route tests and client playback where available.
+- Implement Plex behavior against the official PMS documentation, current request traces, and a reference PMS or compatible implementation where available. Validate client-visible behavior, including the full item menus, against Plex clients; do not infer parity from route tests alone.
 - Playback is a core requirement: support direct play, direct stream/remux, and transcoding when a Plex client requires it.
 - Media inspection, remuxing, decoding, encoding, and transcoding must use portable in-process Rust libraries. Do not depend on installed commands such as `ffmpeg` or `ffprobe`.
 - Keep platform support in mind when selecting media libraries and features. Do not make one operating system's hardware decoder mandatory.
@@ -14,12 +14,14 @@ Project guidance for `mplex`: a Rust implementation of a fully functional Plex M
 - Keep shared file handling and media logic reusable. Avoid duplicated protocol responses, route behavior, or UI implementations.
 - Add or update tests for behavior changes, including success and failure paths. Keep the Plex endpoint inventory and route tests in sync with the official API documentation.
 - Do not commit secrets, generated artifacts, or changes unless explicitly asked.
+- When asked to commit, use the commit subject as a concise summary; include a detailed body when useful to explain the change, rationale, and validation. The subject is not a substitute for the body.
 
 ## Commands
 
 - Build: `cargo build`
 - Test: `cargo test`
 - Run: `cargo run`
+- Restart the running server with `SIGHUP`; do not use `SIGTERM`.
 
 ## Structure
 
