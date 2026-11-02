@@ -11,7 +11,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{any, get, post, put},
+    routing::{any, delete, get, post, put},
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -418,15 +418,22 @@ fn build_app(state: AppState) -> Router {
         .route("/identity", get(plex_identity))
         .route("/myplex/account", get(plex_myplex_account))
         .route("/accounts", get(plex_accounts))
+        .route("/devices", get(plex_devices))
         .route("/accounts/:id", get(plex_account))
         .route("/activities", get(plex_activities))
         .route("/status/sessions", get(plex_sessions))
+        .route("/status/sessions/history/all", get(plex_session_history))
         .route("/servers", get(plex_servers))
         .route("/media/providers", get(plex_media_providers))
         .route("/security/resources", get(plex_security_resources))
         .route("/hubs", get(plex_global_hubs))
         .route("/hubs/promoted", get(plex_global_hubs))
+        .route("/hubs/continueWatching", get(plex_continue_watching_hub))
         .route("/hubs/search", get(plex_hub_search))
+        .route(
+            "/actions/removeFromContinueWatching",
+            put(plex_remove_from_continue_watching),
+        )
         .route("/hubs/sections/:section", get(plex_section_hubs))
         .route("/hubs/metadata/:id/related", get(plex_related_hubs))
         .route(
@@ -440,6 +447,18 @@ fn build_app(state: AppState) -> Router {
             get(plex_section_collections),
         )
         .route(
+            "/library/collections",
+            get(plex_collections).post(plex_create_collection),
+        )
+        .route(
+            "/library/collections/:id/items",
+            get(plex_collection_items).put(plex_add_collection_item),
+        )
+        .route(
+            "/library/collections/:id/items/:item_id",
+            put(plex_remove_collection_item),
+        )
+        .route(
             "/library/sections/:section/prefs",
             get(plex_section_prefs).put(plex_section_prefs),
         )
@@ -449,6 +468,7 @@ fn build_app(state: AppState) -> Router {
         .route("/library/sections/:section/firstCharacter/:letter", get(plex_section_first_character_items))
         .route("/library/sections/:section/firstCharacters", get(plex_section_first_characters))
         .route("/library/search", get(plex_library_search))
+        .route("/library/all", get(plex_library_all))
         .route("/library/sections/:section/all", get(plex_all))
         .route("/library/metadata/:id", get(plex_item))
         .route("/library/metadata/:id/children", get(plex_item))
@@ -460,6 +480,27 @@ fn build_app(state: AppState) -> Router {
         .route("/library/streams/:stream", get(plex_stream))
         .route("/playQueues", post(plex_create_play_queue))
         .route("/playQueues/:id", get(plex_get_play_queue))
+        .route("/playlists", get(plex_playlists).post(plex_create_playlist))
+        .route(
+            "/playlists/:id",
+            get(plex_get_playlist)
+                .put(plex_update_playlist)
+                .delete(plex_delete_playlist),
+        )
+        .route(
+            "/playlists/:id/items",
+            get(plex_playlist_items)
+                .put(plex_add_playlist_item)
+                .delete(plex_clear_playlist_items),
+        )
+        .route(
+            "/playlists/:id/items/:item_id",
+            delete(plex_delete_playlist_item),
+        )
+        .route(
+            "/playlists/:id/items/:item_id/move",
+            put(plex_move_playlist_item),
+        )
         .route("/library/metadata/:id/thumb", get(plex_thumb))
         .route("/library/metadata/:id/art", get(plex_art))
         .route("/media/:id", any(stream_media))
@@ -819,7 +860,38 @@ fn open_database(
              library_id INTEGER NOT NULL REFERENCES library_groups(id) ON DELETE CASCADE,
              path TEXT NOT NULL UNIQUE,
              added_at INTEGER NOT NULL
-         );",
+         );
+         CREATE TABLE IF NOT EXISTS playlists (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             title TEXT NOT NULL,
+             playlist_type TEXT NOT NULL,
+             smart INTEGER NOT NULL DEFAULT 0,
+             added_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS playlist_items (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             playlist_id INTEGER NOT NULL,
+             media_key TEXT NOT NULL,
+             position INTEGER NOT NULL,
+             added_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS collections (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             title TEXT NOT NULL,
+             section_id INTEGER NOT NULL,
+             added_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS collection_items (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             collection_id INTEGER NOT NULL,
+             media_key TEXT NOT NULL,
+             position INTEGER NOT NULL,
+             added_at INTEGER NOT NULL
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS collection_items_collection_media
+             ON collection_items(collection_id, media_key);",
     )?;
     let _ = connection.execute(
         "ALTER TABLE server_identity ADD COLUMN plex_last_error TEXT",
@@ -4034,69 +4106,80 @@ async fn home_client(State(state): State<AppState>) -> Response {
             )
         ));
     }
-    let (continue_watching, watched_paths, in_progress_paths, hidden_paths) = state
+    let (continue_watching, watched_paths, hidden_paths, last_activity) = state
         .db
         .lock()
         .ok()
         .and_then(|connection| {
-            let mut statement = connection.prepare("SELECT media_key, position_ms, duration_ms FROM watch_progress WHERE user_id = ?1 AND watched = 0 AND hidden_from_continue = 0 AND position_ms > 0 ORDER BY updated_at DESC LIMIT 12").ok()?;
-            let rows = statement
-                .query_map([USER_ID], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                    ))
-                })
-                .ok()?;
-            let continue_watching = rows.filter_map(Result::ok).collect::<Vec<_>>();
             let mut statement = connection
-                .prepare("SELECT media_key, position_ms, watched, hidden_from_continue FROM watch_progress WHERE user_id = ?1")
+                .prepare("SELECT media_key, watched, hidden_from_continue, updated_at FROM watch_progress WHERE user_id = ?1")
                 .ok()?;
             let rows = statement
                 .query_map([USER_ID], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
+                        row.get::<_, bool>(1)?,
                         row.get::<_, bool>(2)?,
-                        row.get::<_, bool>(3)?,
+                        row.get::<_, i64>(3)?,
                     ))
                 })
                 .ok()?;
+            let mut continue_watching = Vec::new();
             let mut watched_paths = std::collections::HashSet::new();
             let mut hidden_paths = std::collections::HashSet::new();
-            let mut in_progress_paths = std::collections::HashSet::new();
+            let mut last_activity = std::collections::HashMap::new();
             for row in rows.filter_map(Result::ok) {
-                let (path, position_ms, watched, hidden) = row;
+                let (path, watched, hidden, updated_at) = row;
                 if watched {
                     watched_paths.insert(path.clone());
-                } else if position_ms > 0 {
-                    in_progress_paths.insert(path.clone());
                 }
                 if hidden {
                     hidden_paths.insert(path);
+                    continue;
+                }
+                last_activity.insert(path.clone(), updated_at);
+                if !watched {
+                    continue_watching.push((path, updated_at));
                 }
             }
             Some((
                 continue_watching,
                 watched_paths,
-                in_progress_paths,
                 hidden_paths,
+                last_activity,
             ))
         })
         .unwrap_or_default();
-    let mut continue_paths = next_tv_episode_paths(
+    let mut tv_episode_paths = std::collections::HashSet::new();
+    for library in config
+        .libraries
+        .iter()
+        .filter(|library| library.kind == "tv")
+    {
+        for root in &library.folders {
+            for media in state.media.iter() {
+                let Ok(relative) = media.path.strip_prefix(root) else {
+                    continue;
+                };
+                if tv_episode_info(root, &media.path).is_some() {
+                    tv_episode_paths.insert(relative.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    let mut continue_candidates = next_tv_episode_paths(
         &config.libraries,
         state.media.as_ref(),
         &watched_paths,
-        &in_progress_paths,
         &hidden_paths,
+        &last_activity,
     );
-    for (path, _, _) in continue_watching {
-        if continue_paths.len() < 12 && !continue_paths.contains(&path) {
-            continue_paths.push(path);
+    for (path, updated_at) in continue_watching {
+        if !tv_episode_paths.contains(&path) {
+            continue_candidates.push((path, updated_at));
         }
     }
+    let continue_paths = ordered_continue_paths(continue_candidates);
     let mut continue_cards = String::new();
     for path in continue_paths {
         let Some((library_index, root, media)) =
@@ -4211,9 +4294,9 @@ fn next_tv_episode_paths(
     libraries: &[ConfigLibrary],
     media_items: &[Media],
     watched_paths: &std::collections::HashSet<String>,
-    in_progress_paths: &std::collections::HashSet<String>,
     hidden_paths: &std::collections::HashSet<String>,
-) -> Vec<String> {
+    last_activity: &std::collections::HashMap<String, i64>,
+) -> Vec<(String, i64)> {
     let mut next_paths = Vec::new();
     for library in libraries
         .iter()
@@ -4242,35 +4325,41 @@ fn next_tv_episode_paths(
             }
             for mut episodes in shows.into_values() {
                 episodes.sort_by_key(|(_, (season, episode, _))| (*season, *episode));
-                let latest_watched = episodes
+                let Some(show_activity) = episodes
                     .iter()
-                    .filter(|(path, _)| watched_paths.contains(path))
-                    .map(|(_, (season, _, last_episode))| (*season, *last_episode))
-                    .max();
-                let Some(latest_watched) = latest_watched else {
+                    .filter_map(|(path, _)| last_activity.get(path))
+                    .copied()
+                    .max()
+                else {
                     continue;
                 };
-                if episodes
-                    .iter()
-                    .any(|(path, _)| in_progress_paths.contains(path))
-                {
-                    continue;
-                }
                 if let Some((path, _)) = episodes
                     .iter()
-                    .filter(|(path, (season, episode, _))| {
-                        !watched_paths.contains(path)
-                            && !hidden_paths.contains(path)
-                            && (*season, *episode) > latest_watched
+                    .filter(|(path, _)| {
+                        !watched_paths.contains(path) && !hidden_paths.contains(path)
                     })
                     .min_by_key(|(_, (season, episode, _))| (*season, *episode))
                 {
-                    next_paths.push(path.clone());
+                    next_paths.push((path.clone(), show_activity));
                 }
             }
         }
     }
     next_paths
+}
+
+fn ordered_continue_paths(mut candidates: Vec<(String, i64)>) -> Vec<String> {
+    candidates.sort_by(|(left_path, left_time), (right_path, right_time)| {
+        right_time
+            .cmp(left_time)
+            .then_with(|| left_path.cmp(right_path))
+    });
+    let mut seen = std::collections::HashSet::new();
+    candidates
+        .into_iter()
+        .filter_map(|(path, _)| seen.insert(path.clone()).then_some(path))
+        .take(12)
+        .collect()
 }
 
 async fn library_artwork(library: &ConfigLibrary, index: usize) -> Option<(String, String)> {
@@ -4484,7 +4573,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                     let representative_metadata = section_metadata.get(&representative.id);
                     let (episode_title, episode_number) = tv_episode_card_labels(
                         &library_root,
-                        representative,
+                        &representative.path,
                         representative_metadata,
                     );
                     let Some(representative_path) =
@@ -4497,7 +4586,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                         url_encode(&show_path.to_string_lossy())
                     );
                     folder_cards.push_str(&media_poster_card(
-                        &representative.id,
+                        Some(&representative.id),
                         &href,
                         &show.title,
                         episode_title.as_deref(),
@@ -4569,7 +4658,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                     .first()
                     .map(|representative| {
                         media_poster_card(
-                            &representative.id,
+                            Some(&representative.id),
                             &format!(
                                 "/?library={}&path={}",
                                 query.library.unwrap_or_default(),
@@ -4622,23 +4711,39 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     for (name, child_relative, path) in files {
         has_content = true;
         if let Some((_, mime)) = media_type(&path) {
+            let matched_media = web_media_for_relative(&s, &library_root, &child_relative).await;
             if tv_season_view && selected_relative.is_none() {
-                let progress = s
-                    .media
-                    .iter()
-                    .find(|media| media.path == path)
-                    .and_then(|media| section_metadata.get(&media.id))
-                    .map(media_card_progress)
-                    .unwrap_or_default();
-                items.push_str(&tv_episode_card(
-                    &name,
-                    &child_relative,
-                    query.library,
+                let item_metadata = matched_media.and_then(|media| section_metadata.get(&media.id));
+                let media_path = library_root.join(&child_relative);
+                let (episode_title, episode_number) =
+                    tv_episode_card_labels(&library_root, &media_path, item_metadata);
+                let title = episode_title.unwrap_or_else(|| tv_episode_display_name(&name));
+                let show_title = child_relative
+                    .components()
+                    .next()
+                    .map(|component| component.as_os_str().to_string_lossy().into_owned());
+                let folder = child_relative.parent().unwrap_or(std::path::Path::new(""));
+                let library = query.library.unwrap_or_default();
+                let href = format!(
+                    "/?library={library}&path={}&episode={}",
+                    url_encode(&folder.to_string_lossy()),
+                    url_encode(&child_relative.to_string_lossy())
+                );
+                let progress = item_metadata.map(media_card_progress).unwrap_or_default();
+                items.push_str(&media_poster_card(
+                    matched_media.map(|media| media.id.as_str()),
+                    &href,
+                    &title,
+                    episode_number.as_deref(),
+                    show_title.as_deref(),
                     progress,
+                    &child_relative,
+                    library,
+                    true,
+                    "item",
                 ));
                 continue;
             }
-            let matched_media = web_media_for_relative(&s, &library_root, &child_relative).await;
             let artwork = matched_media.map(|media| media_thumbnail_url(&media.id));
             let artwork = if artwork.is_some() {
                 artwork
@@ -4729,6 +4834,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     .media-card-artwork {{ position: relative; }}
     .media-card-poster, .media-card-poster img {{ display: block; width: 100%; aspect-ratio: 2 / 3; }}
     .media-card-poster img {{ object-fit: cover; border-radius: .35rem; background: #111827; }}
+    .media-card-placeholder {{ display: grid; width: 100%; height: 100%; place-items: center; border-radius: .35rem; color: #bfdbfe; background: linear-gradient(135deg, #1e3a8a, #312e81 55%, #111827); font-size: 2rem; }}
     .media-card-info {{ display: grid; gap: .12rem; padding: .55rem 0 0; color: inherit; text-align: center; text-decoration: none; }}
     .media-card-title {{ display: block; height: 2.4em; overflow: hidden; margin: .25rem 0 .15rem; font-size: .8rem; font-weight: 500; line-height: 1.2; }}
     .media-card-tv .media-card-title {{ height: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
@@ -4746,13 +4852,6 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     .tv-season {{ min-width: 0; }}
     .tv-season h2 {{ margin: .75rem 0 .6rem; }}
     .tv-season-card {{ width: 100%; max-width: 100%; }}
-    .tv-season .media-list {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); align-items: start; gap: 1rem; }}
-    .tv-episode-card {{ display: grid; grid-template-columns: 5rem minmax(0, 1fr) auto; align-items: center; gap: 1rem; grid-column: 1 / -1; padding: .9rem 1rem; color: inherit; text-decoration: none; border: 1px solid #374151; border-radius: .65rem; background: #1f2937; }}
-    .tv-episode-card:hover {{ border-color: #60a5fa; background: #24344d; }}
-    .tv-episode-number {{ color: #93c5fd; font-weight: 700; }}
-    .tv-episode-title {{ overflow-wrap: anywhere; }}
-    .tv-episode-action {{ color: #93c5fd; white-space: nowrap; }}
-    .tv-episode-card .media-card-progress-row {{ grid-column: 1 / -1; }}
     .breadcrumb {{ grid-column: 1 / -1; }}
     article, .folder-card {{ width: 100%; box-sizing: border-box; }}
     article {{ grid-column: span 4; min-width: 0; }}
@@ -5666,42 +5765,6 @@ fn strip_ass_tags(value: &str) -> String {
     output
 }
 
-fn tv_episode_card(
-    name: &str,
-    relative: &std::path::Path,
-    library: Option<usize>,
-    progress: f64,
-) -> String {
-    let library_query = library
-        .map(|index| format!("library={index}&"))
-        .unwrap_or_default();
-    let path = url_encode(&relative.to_string_lossy());
-    let folder = relative.parent().unwrap_or(std::path::Path::new(""));
-    format!(
-        r#"<a class="tv-episode-card" data-spa-link href="/?{}path={}&episode={}"><span class="tv-episode-number">{}</span><span class="tv-episode-title">{}</span><span class="tv-episode-action">▶ Play episode</span>{}</a>"#,
-        library_query,
-        url_encode(&folder.to_string_lossy()),
-        path,
-        html(&tv_episode_number(name)),
-        html(&tv_episode_display_name(name)),
-        media_progress_markup(progress),
-    )
-}
-
-fn tv_episode_number(name: &str) -> String {
-    let stem = std::path::Path::new(name)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or(name);
-    parse_tv_episode_marker(stem)
-        .map(|(_, (episode, episode_end), _)| {
-            episode_end
-                .map(|end| format!("E{episode:02}–E{end:02}"))
-                .unwrap_or_else(|| format!("E{episode:02}"))
-        })
-        .unwrap_or_else(|| "Episode".to_owned())
-}
-
 fn tv_episode_display_name(name: &str) -> String {
     let stem = std::path::Path::new(name)
         .file_stem()
@@ -5992,7 +6055,7 @@ fn media_card(
             .to_owned()
     };
     let (subtitle, details) = if tv {
-        tv_episode_card_labels(root, media, metadata)
+        tv_episode_card_labels(root, &media.path, metadata)
     } else {
         metadata
             .and_then(|item| item.get("release_date"))
@@ -6005,7 +6068,7 @@ fn media_card(
     };
     let progress = metadata.map(media_card_progress).unwrap_or_default();
     media_poster_card(
-        &media.id,
+        Some(&media.id),
         &href,
         &title,
         subtitle.as_deref(),
@@ -6020,10 +6083,10 @@ fn media_card(
 
 fn tv_episode_card_labels(
     root: &std::path::Path,
-    media: &Media,
+    media_path: &std::path::Path,
     metadata: Option<&serde_json::Value>,
 ) -> (Option<String>, Option<String>) {
-    let episode = tv_episode_info(&root.to_path_buf(), &media.path);
+    let episode = tv_episode_info(&root.to_path_buf(), media_path);
     let episode_title = episode
         .as_ref()
         .and_then(|episode| episode.episode_title.clone())
@@ -6059,7 +6122,7 @@ fn release_year(date: &str) -> Option<u32> {
 }
 
 fn media_poster_card(
-    media_id: &str,
+    media_id: Option<&str>,
     href: &str,
     title: &str,
     subtitle: Option<&str>,
@@ -6076,14 +6139,27 @@ fn media_poster_card(
     let details = details
         .map(|value| format!("<span class=\"media-card-details\">{}</span>", html(value)))
         .unwrap_or_default();
+    let poster = media_id
+        .map(|id| {
+            format!(
+                r#"<img src="{}" alt="Poster for {}" loading="lazy">"#,
+                html(&media_thumbnail_url(id)),
+                html(title)
+            )
+        })
+        .unwrap_or_else(|| {
+            format!(
+                r#"<div class="media-card-placeholder" role="img" aria-label="No poster for {}">▶</div>"#,
+                html(title)
+            )
+        });
     let path = html(&media_path.to_string_lossy());
-    let watch_key = if tv_card {
-        let show_path = media_path
+    let watch_key = if watch_scope == "show" {
+        media_path
             .components()
             .next()
             .map(|component| html(&component.as_os_str().to_string_lossy()))
-            .unwrap_or_else(|| path.clone());
-        show_path
+            .unwrap_or_else(|| path.clone())
     } else {
         path.clone()
     };
@@ -6092,16 +6168,19 @@ fn media_poster_card(
     } else {
         "media-card"
     };
+    let card_style = "align-self:start;background:rgba(31,41,55,.3);padding:.7rem";
+    let card_info_style = " style=\"box-sizing:border-box;height:4rem;padding-top:0;gap:0;grid-template-rows:1rem 1rem 1rem 1rem\"";
+    let title_style = " style=\"height:auto;margin:0;white-space:nowrap;text-overflow:ellipsis\"";
     format!(
-        r#"<div class="{}" data-media-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}"><div class="media-card-artwork"><a class="media-card-poster" data-spa-link href="{}"><img src="{}" alt="Poster for {}" loading="lazy"></a><details class="media-card-menu"><summary aria-label="More options" title="More options">⋮</summary><div class="media-card-menu-items"><button type="button" data-watch-action="watched">Mark as watched</button><button type="button" data-watch-action="unwatched" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Mark as unwatched</button><button type="button" data-watch-action="remove_from_continue" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Remove from Continue Watching</button></div></details></div><a class="media-card-info" data-spa-link href="{}"><span class="media-card-title" title="{}">{}</span>{}{}{}</a></div>"#,
+        r#"<div class="{}" style="{}" data-media-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}"><div class="media-card-artwork"><a class="media-card-poster" data-spa-link href="{}">{}</a><details class="media-card-menu"><summary aria-label="More options" title="More options">⋮</summary><div class="media-card-menu-items"><button type="button" data-watch-action="watched">Mark as watched</button><button type="button" data-watch-action="unwatched" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Mark as unwatched</button><button type="button" data-watch-action="remove_from_continue" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Remove from Continue Watching</button></div></details></div><a class="media-card-info" data-spa-link href="{}"{}><span class="media-card-title" title="{}"{}>{}</span>{}{}{}</a></div>"#,
         card_class,
+        card_style,
         path,
         library,
         watch_scope,
         watch_key,
         html(href),
-        html(&media_thumbnail_url(media_id)),
-        html(title),
+        poster,
         path,
         library,
         watch_scope,
@@ -6111,7 +6190,9 @@ fn media_poster_card(
         watch_scope,
         watch_key,
         html(href),
+        card_info_style,
         html(title),
+        title_style,
         html(title),
         subtitle,
         details,
@@ -6123,7 +6204,7 @@ fn media_progress_markup(progress: f64) -> String {
     let progress = progress.clamp(0.0, 1.0);
     let percent = (progress * 100.0).round() as u32;
     format!(
-        r#"<div class="media-card-progress-row" style="display:flex;align-items:center;gap:.45rem"><div class="media-card-progress" role="progressbar" aria-label="Playback progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{percent}" style="flex:1;height:5px;margin:0"><span style="width:{:.2}%"></span></div><span class="media-card-percent" style="flex:0 0 auto;color:#9ca3af;font-size:.68rem;line-height:1">{percent}%</span></div>"#,
+        r#"<div class="media-card-progress-row" style="display:flex;align-items:center;gap:.45rem;grid-row:4;height:1rem"><div class="media-card-progress" role="progressbar" aria-label="Playback progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{percent}" style="flex:1;height:5px;margin:0"><span style="width:{:.2}%"></span></div><span class="media-card-percent" style="flex:0 0 auto;color:#9ca3af;font-size:.68rem;line-height:1">{percent}%</span></div>"#,
         progress * 100.0
     )
 }
@@ -6213,7 +6294,7 @@ document.addEventListener("click", async event => {
         progress?.setAttribute("aria-valuenow", percentValue);
         if (fill) fill.style.width = `${percentValue}%`;
         if (percent) percent.textContent = `${percentValue}%`;
-        if (item.closest(".continue-grid")) item.remove();
+        if (action === "watched" && item.closest(".continue-grid")) item.remove();
       });
     } else if (action === "remove_from_continue") {
       document.querySelectorAll(".continue-grid .media-card").forEach(item => {
@@ -6460,7 +6541,7 @@ async fn web_stream(
         mime: mime.to_owned(),
         metadata_revision: 0,
     };
-    stream_file(&media, method, headers).await
+    stream_file(&media, method, headers, false).await
 }
 
 async fn web_path(
@@ -6582,7 +6663,7 @@ async fn log_not_found(State(state): State<AppState>, req: Request<Body>) -> Res
             return StatusCode::NOT_FOUND.into_response();
         };
         return plex_protocol_response(
-            stream_file(media, req.method().clone(), req.headers().clone()).await,
+            stream_file(media, req.method().clone(), req.headers().clone(), false).await,
         );
     }
     if req.uri().path() == "/photo/:/transcode" {
@@ -6768,6 +6849,35 @@ fn plex_scrobble(state: &AppState, query: PlexScrobbleQuery, watched: bool) -> R
         StatusCode::INTERNAL_SERVER_ERROR.into_response()
     } else {
         StatusCode::OK.into_response()
+    }
+}
+
+async fn plex_remove_from_continue_watching(
+    State(state): State<AppState>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let Some(media_id) = plex_query_media_id(
+        query.get("ratingKey").map(String::as_str),
+        query.get("key").map(String::as_str),
+    ) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(path) = plex_progress_path(&state, &media_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    match connection.execute(
+        "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at) VALUES (?1, ?2, 0, NULL, 0, 1, ?3) ON CONFLICT(user_id, media_key) DO UPDATE SET hidden_from_continue = 1, updated_at = excluded.updated_at",
+        (USER_ID, path, updated_at),
+    ) {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -7142,6 +7252,27 @@ async fn plex_sessions() -> Response {
     plex_json(serde_json::json!({"MediaContainer": {"size": 0}}))
 }
 
+async fn plex_devices() -> Response {
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": 0,
+            "identifier": "com.plexapp.system.devices",
+            "Device": []
+        }
+    }))
+}
+
+async fn plex_session_history() -> Response {
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": 0,
+            "totalSize": 0,
+            "offset": 0,
+            "Metadata": []
+        }
+    }))
+}
+
 fn plex_prefs(state: &AppState) -> Response {
     let settings = serde_json::json!([
         {"id":"FriendlyName","label":"Friendly name","summary":"Other computers on your network see this server under this name.","type":"text","default":"harbringer","value":server_name(state),"hidden":false,"advanced":false,"group":"general"},
@@ -7296,9 +7427,40 @@ fn plex_library_provider_features(directories: Vec<serde_json::Value>) -> Vec<se
         serde_json::json!({"key": "/library/metadata", "type": "metadata"}),
         serde_json::json!({"key": "/hubs/promoted", "type": "promoted"}),
         serde_json::json!({
+            "key": "/library/collections",
+            "type": "collection"
+        }),
+        serde_json::json!({
+            "key": "/hubs/continueWatching",
+            "type": "continuewatching"
+        }),
+        serde_json::json!({
+            "key": "/actions",
+            "type": "actions",
+            "Action": [{
+                "id": "removeFromContinueWatching",
+                "key": "/actions/removeFromContinueWatching"
+            }]
+        }),
+        serde_json::json!({
+            "key": "/library/search",
+            "type": "universalsearch"
+        }),
+        serde_json::json!({
+            "key": "/playlists",
+            "type": "playlist",
+            "flavor": "universal"
+        }),
+        serde_json::json!({
             "key": "/playQueues",
             "type": "playqueue",
             "flavor": "universal"
+        }),
+        serde_json::json!({
+            "key": "/:/timeline",
+            "type": "timeline",
+            "scrobbleKey": "/:/scrobble",
+            "unscrobbleKey": "/:/unscrobble"
         }),
     ]
 }
@@ -7312,6 +7474,102 @@ async fn plex_global_hubs(
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
     plex_hubs_response(&state, None, query.get("count"), None).await
+}
+
+async fn plex_continue_watching_hub(
+    State(state): State<AppState>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let count = query
+        .get("count")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(10)
+        .clamp(1, 50);
+    let progress = {
+        let Ok(connection) = state.db.lock() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        let mut statement = match connection.prepare(
+            "SELECT media_key, position_ms, duration_ms FROM watch_progress WHERE user_id = ?1 AND watched = 0 AND hidden_from_continue = 0 AND position_ms > 0 ORDER BY updated_at DESC, media_key",
+        ) {
+            Ok(statement) => statement,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let rows = match statement.query_map([USER_ID], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        match rows.collect::<rusqlite::Result<Vec<_>>>() {
+            Ok(progress) => progress,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    };
+    let libraries = match state.config.lock() {
+        Ok(config) => config.libraries.clone(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let mut items = Vec::new();
+    for (media_key, position, duration) in progress {
+        let found = libraries.iter().enumerate().find_map(|(index, library)| {
+            state.media.iter().find_map(|media| {
+                if !media_in_library(media, library) {
+                    return None;
+                }
+                let root = library
+                    .folders
+                    .iter()
+                    .find(|folder| media.path.starts_with(folder))?;
+                let relative = media.path.strip_prefix(root).ok()?;
+                (relative.to_string_lossy() == media_key).then_some((
+                    media.id.clone(),
+                    position,
+                    duration,
+                    index + 1,
+                ))
+            })
+        });
+        if let Some(item) = found {
+            items.push(item);
+        }
+    }
+    let total_size = items.len();
+    let mut metadata = Vec::new();
+    for (media_id, position, duration, _) in items.into_iter().take(count) {
+        if let Some(mut item) = plex_metadata_item_json(&state, &media_id).await {
+            item["viewOffset"] = serde_json::json!(position);
+            if let Some(duration) = duration {
+                item["duration"] = serde_json::json!(duration);
+            }
+            metadata.push(item);
+        }
+    }
+    let hub = serde_json::json!({
+        "key": "/hubs/continueWatching",
+        "hubKey": "/hubs/continueWatching",
+        "title": "Continue Watching",
+        "type": "mixed",
+        "hubIdentifier": "home.continueWatching",
+        "context": "home.continueWatching",
+        "size": metadata.len(),
+        "more": total_size > count,
+        "style": "shelf",
+        "promoted": true,
+        "Metadata": metadata
+    });
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": 1,
+            "identifier": "com.plexapp.plugins.library",
+            "allowSync": false,
+            "Hub": [hub]
+        }
+    }))
 }
 
 fn plex_notification_response(upgrade: WebSocketUpgrade) -> Response {
@@ -7709,7 +7967,10 @@ fn plex_section_metadata(state: &AppState, section: usize) -> HashMap<String, se
                     if let Some(object) = item.as_object_mut() {
                         object.insert("mplex_view_offset".to_owned(), serde_json::json!(position));
                         object.insert("mplex_view_count".to_owned(), serde_json::json!(i64::from(*watched)));
-                        object.insert("mplex_last_viewed_at".to_owned(), serde_json::json!(updated_at));
+                        object.insert(
+                            "mplex_last_viewed_at".to_owned(),
+                            serde_json::json!(if *watched { *updated_at } else { 0 }),
+                        );
                         if let Some(duration) = duration {
                             object.insert("mplex_duration".to_owned(), serde_json::json!(duration));
                         }
@@ -8054,6 +8315,7 @@ async fn plex_search_items(
                     .filter(|media| media_in_library(media, library)),
             );
             for show in shows {
+                let show_guid = plex_tv_show_guid(&show, &metadata);
                 let representative = show.episodes.first().copied();
                 let show_metadata = representative.and_then(|media| metadata.get(&media.id));
                 let show_title = show_metadata
@@ -8112,7 +8374,7 @@ async fn plex_search_items(
                         .map(|episode| episode.episode)
                         .unwrap_or(media_index as u32 + 1);
                     let mut item = plex_video_json(media, section, library, episode_metadata);
-                    plex_tv_episode_parents(&mut item, &show, season, episode);
+                    plex_tv_episode_parents(&mut item, &show, season, episode, &show_guid);
                     add_plex_technical_metadata(state, &mut item, media).await;
                     results.push((rank, episode_title.to_lowercase(), item));
                 }
@@ -8157,6 +8419,23 @@ async fn plex_search_items(
         .take(limit)
         .map(|(_, _, item)| item)
         .collect()
+}
+
+fn plex_metadata_guid(media_type: &str, rating_key: &str) -> String {
+    format!("com.plexapp.plugins.library://{media_type}/{rating_key}")
+}
+
+fn plex_tv_show_guid(
+    show: &PlexTvShowGroup<'_>,
+    metadata: &HashMap<String, serde_json::Value>,
+) -> String {
+    show.episodes
+        .first()
+        .and_then(|episode| metadata.get(&episode.id))
+        .and_then(|metadata| metadata.get("id"))
+        .and_then(serde_json::Value::as_i64)
+        .map(|id| format!("tmdb://tv/{id}"))
+        .unwrap_or_else(|| plex_metadata_guid("show", &show.rating_key))
 }
 
 async fn plex_library_search(
@@ -8302,29 +8581,37 @@ async fn plex_section_collections(
     State(state): State<AppState>,
     Path(section): Path<usize>,
 ) -> Response {
-    let Some(library) = state
-        .config
-        .lock()
-        .ok()
-        .and_then(|config| config.libraries.get(section.saturating_sub(1)).cloned())
-    else {
-        return StatusCode::NOT_FOUND.into_response();
+    let libraries = match state.config.lock() {
+        Ok(config) => config.libraries.clone(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    plex_json(serde_json::json!({
-        "MediaContainer": {
-            "size": 0,
-            "totalSize": 0,
-            "offset": 0,
-            "identifier": "com.plexapp.plugins.library",
-            "librarySectionID": section,
-            "librarySectionTitle": library.name,
-            "librarySectionUUID": plex_library_uuid(&state.machine_identifier, section),
-            "title1": library.name,
-            "title2": "Collections",
-            "viewGroup": plex_kind(&library.kind),
-            "Metadata": []
-        }
-    }))
+    if section == 0 || section > libraries.len() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let library = &libraries[section - 1];
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(mut collections) = plex_collection_records(&connection) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    collections.retain(|collection| collection.section_id == section as i64);
+    let Ok(mut body) = plex_collection_container(
+        &connection,
+        &collections,
+        &libraries,
+        &state.machine_identifier,
+    ) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    body["MediaContainer"]["librarySectionID"] = serde_json::json!(section);
+    body["MediaContainer"]["librarySectionTitle"] = serde_json::json!(library.name);
+    body["MediaContainer"]["librarySectionUUID"] =
+        serde_json::json!(plex_library_uuid(&state.machine_identifier, section));
+    body["MediaContainer"]["title1"] = serde_json::json!(library.name);
+    body["MediaContainer"]["title2"] = serde_json::json!("Collections");
+    body["MediaContainer"]["viewGroup"] = serde_json::json!(plex_kind(&library.kind));
+    plex_json(body)
 }
 
 async fn plex_section_sorts(State(state): State<AppState>, Path(section): Path<usize>) -> Response {
@@ -8531,6 +8818,192 @@ async fn plex_section_first_character_items(
     container["Metadata"] = serde_json::json!(items);
     container["viewGroup"] = serde_json::json!(plex_kind(&library.kind));
     let mut response = plex_json(serde_json::json!({"MediaContainer": container}));
+    response.headers_mut().insert(
+        "X-Plex-Container-Start",
+        HeaderValue::from_str(&offset.to_string()).expect("numeric header value"),
+    );
+    response.headers_mut().insert(
+        "X-Plex-Container-Total-Size",
+        HeaderValue::from_str(&total.to_string()).expect("numeric header value"),
+    );
+    response
+}
+
+async fn plex_library_all(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<BTreeMap<String, String>>,
+    uri: Uri,
+) -> Response {
+    let Ok(config) = state.config.lock().map(|config| config.clone()) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let type_filter = query.get("type").map(String::as_str);
+    let include_type = |numeric: &str, name: &str, default: bool| {
+        type_filter.map_or(default, |filter| {
+            filter
+                .split(',')
+                .any(|value| value.trim() == numeric || value.trim() == name)
+        })
+    };
+    let mut items = Vec::new();
+    for (index, library) in config.libraries.iter().enumerate() {
+        let section = index + 1;
+        let metadata = plex_section_metadata(&state, section);
+        if library.kind == "tv" {
+            let shows = plex_tv_show_groups(
+                section,
+                &library.folders,
+                state
+                    .media
+                    .iter()
+                    .filter(|media| media_in_library(media, library)),
+            );
+            for show in shows {
+                let show_guid = plex_tv_show_guid(&show, &metadata);
+                if include_type("2", "show", true) {
+                    items.push(plex_tv_show_json(&show, section, library, &metadata));
+                }
+                let seasons = plex_tv_season_groups(&show, &library.folders);
+                if include_type("3", "season", false) {
+                    for (season, episodes) in &seasons {
+                        items.push(plex_tv_season_json(
+                            &show,
+                            *season,
+                            section,
+                            library,
+                            &metadata,
+                            episodes.len(),
+                        ));
+                    }
+                }
+                if include_type("4", "episode", false) {
+                    for (index, episode) in show.episodes.iter().enumerate() {
+                        let episode_info = library
+                            .folders
+                            .iter()
+                            .find(|root| episode.path.starts_with(root))
+                            .and_then(|root| tv_episode_info(root, &episode.path));
+                        let season = episode_info.as_ref().map(|info| info.season).unwrap_or(1);
+                        let episode_number = episode_info
+                            .as_ref()
+                            .map(|info| info.episode)
+                            .unwrap_or(index as u32 + 1);
+                        let mut item =
+                            plex_video_json(episode, section, library, metadata.get(&episode.id));
+                        plex_tv_episode_parents(
+                            &mut item,
+                            &show,
+                            season,
+                            episode_number,
+                            &show_guid,
+                        );
+                        add_plex_technical_metadata(&state, &mut item, episode).await;
+                        items.push(item);
+                    }
+                }
+            }
+        } else if include_type("1", "movie", true) {
+            for media in state
+                .media
+                .iter()
+                .filter(|media| media_in_library(media, library))
+            {
+                let mut item = plex_video_json(media, section, library, metadata.get(&media.id));
+                add_plex_technical_metadata(&state, &mut item, media).await;
+                items.push(item);
+            }
+        }
+    }
+
+    if let Some(title_filter) = query.get("title") {
+        let exact = title_filter.starts_with('=');
+        let title_filter = title_filter
+            .strip_prefix('=')
+            .unwrap_or(title_filter)
+            .to_lowercase();
+        items.retain(|item| {
+            item.get("title")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|title| {
+                    let title = title.to_lowercase();
+                    if exact {
+                        title == title_filter
+                    } else {
+                        title.contains(&title_filter)
+                    }
+                })
+        });
+    }
+
+    let requested_sort = query
+        .get("sort")
+        .map(|sort| sort.split(',').next().unwrap_or_default())
+        .unwrap_or_default();
+    let mut sort_parts = requested_sort.split(':');
+    let sort_key = sort_parts.next().unwrap_or_default();
+    let descending = sort_parts.next() == Some("desc");
+    items.sort_by(|left, right| {
+        let ordering = match sort_key {
+            "duration" | "addedAt" | "rating" | "audienceRating" => left
+                .get(sort_key)
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or_default()
+                .partial_cmp(
+                    &right
+                        .get(sort_key)
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or_default(),
+                )
+                .unwrap_or(std::cmp::Ordering::Equal),
+            _ => left
+                .get("titleSort")
+                .or_else(|| left.get("title"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_lowercase()
+                .cmp(
+                    &right
+                        .get("titleSort")
+                        .or_else(|| right.get("title"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_lowercase(),
+                ),
+        };
+        if descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    });
+
+    let total = items.len();
+    let (offset, end) = plex_container_page(&headers, &uri)
+        .map(|(requested_offset, requested_size)| {
+            let offset = requested_offset.min(total);
+            (offset, offset.saturating_add(requested_size).min(total))
+        })
+        .unwrap_or((0, total));
+    let metadata = items
+        .into_iter()
+        .skip(offset)
+        .take(end.saturating_sub(offset))
+        .collect::<Vec<_>>();
+    let count = metadata.len();
+    let mut response = plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": count,
+            "totalSize": total,
+            "offset": offset,
+            "allowSync": false,
+            "identifier": "com.plexapp.plugins.library",
+            "content": "secondary",
+            "title1": "Library",
+            "title2": "All",
+            "Metadata": metadata
+        }
+    }));
     response.headers_mut().insert(
         "X-Plex-Container-Start",
         HeaderValue::from_str(&offset.to_string()).expect("numeric header value"),
@@ -8769,12 +9242,7 @@ fn plex_tv_show_json(
         })
         .count();
     item["viewedLeafCount"] = serde_json::json!(viewed_episodes);
-    if let Some(tmdb_id) = item_metadata
-        .and_then(|metadata| metadata.get("id"))
-        .and_then(serde_json::Value::as_i64)
-    {
-        item["guid"] = serde_json::json!(format!("tmdb://tv/{tmdb_id}"));
-    }
+    item["guid"] = serde_json::json!(plex_tv_show_guid(show, metadata));
     if let Some(object) = item.as_object_mut() {
         object.remove("Media");
         object.remove("duration");
@@ -8820,6 +9288,8 @@ fn plex_tv_season_json(
     };
     item["ratingKey"] = serde_json::json!(season_key);
     item["key"] = serde_json::json!(format!("/library/metadata/{season_key}/children"));
+    item["guid"] = serde_json::json!(plex_metadata_guid("season", &season_key));
+    item["parentGuid"] = serde_json::json!(plex_tv_show_guid(show, metadata));
     item["type"] = serde_json::json!("season");
     item["title"] = serde_json::json!(title);
     item["titleSort"] = serde_json::json!(title.to_lowercase());
@@ -8848,8 +9318,11 @@ fn plex_tv_episode_parents(
     show: &PlexTvShowGroup<'_>,
     season: u32,
     episode: u32,
+    show_guid: &str,
 ) {
     let season_key = plex_tv_season_key(&show.rating_key, season);
+    item["parentGuid"] = serde_json::json!(plex_metadata_guid("season", &season_key));
+    item["grandparentGuid"] = serde_json::json!(show_guid);
     item["grandparentRatingKey"] = serde_json::json!(show.rating_key);
     item["grandparentKey"] = serde_json::json!(format!("/library/metadata/{}", show.rating_key));
     item["grandparentTitle"] = serde_json::json!(show.title);
@@ -9003,6 +9476,7 @@ async fn plex_item(
         {
             show.title = show_title.to_owned();
         }
+        let show_guid = plex_tv_show_guid(&show, &metadata);
         let uuid = plex_library_uuid(&s.machine_identifier, section);
         if let Some(season) = season {
             let season_episodes = plex_tv_season_groups(&show, &library.folders)
@@ -9018,7 +9492,7 @@ async fn plex_item(
                     .map(|episode| episode.episode)
                     .unwrap_or(index as u32 + 1);
                 let mut item = plex_video_json(media, section, &library, metadata.get(&media.id));
-                plex_tv_episode_parents(&mut item, &show, season, episode_number);
+                plex_tv_episode_parents(&mut item, &show, season, episode_number, &show_guid);
                 add_plex_technical_metadata(&s, &mut item, media).await;
                 episodes.push(item);
             }
@@ -9123,7 +9597,8 @@ async fn plex_item(
                 .as_ref()
                 .map(|episode| episode.episode)
                 .unwrap_or(1);
-            plex_tv_episode_parents(&mut video, &show, season, episode);
+            let show_guid = plex_tv_show_guid(&show, &metadata_by_id);
+            plex_tv_episode_parents(&mut video, &show, season, episode, &show_guid);
             if let Some(show_title) = metadata_by_id
                 .get(&media.id)
                 .and_then(|metadata| metadata.get("name"))
@@ -9195,6 +9670,841 @@ fn plex_rating_key_from_source(source: &str) -> Option<String> {
         .split('/')
         .next()?;
     (!id.is_empty()).then(|| id.to_owned())
+}
+
+#[derive(Clone)]
+struct PlexPlaylistRecord {
+    id: i64,
+    title: String,
+    playlist_type: String,
+    smart: bool,
+    added_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Clone)]
+struct PlexCollectionRecord {
+    id: i64,
+    title: String,
+    section_id: i64,
+    added_at: i64,
+    updated_at: i64,
+}
+
+fn plex_collection_record(
+    connection: &Connection,
+    id: i64,
+) -> rusqlite::Result<PlexCollectionRecord> {
+    connection.query_row(
+        "SELECT id, title, section_id, added_at, updated_at FROM collections WHERE id = ?1",
+        [id],
+        |row| {
+            Ok(PlexCollectionRecord {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                section_id: row.get(2)?,
+                added_at: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        },
+    )
+}
+
+fn plex_collection_records(connection: &Connection) -> rusqlite::Result<Vec<PlexCollectionRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT id, title, section_id, added_at, updated_at FROM collections ORDER BY title COLLATE NOCASE, id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(PlexCollectionRecord {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            section_id: row.get(2)?,
+            added_at: row.get(3)?,
+            updated_at: row.get(4)?,
+        })
+    })?;
+    rows.collect()
+}
+
+fn plex_collection_summary(
+    connection: &Connection,
+    collection: &PlexCollectionRecord,
+    libraries: &[ConfigLibrary],
+    machine_identifier: &str,
+) -> rusqlite::Result<serde_json::Value> {
+    let item_count = connection.query_row(
+        "SELECT COUNT(*) FROM collection_items WHERE collection_id = ?1",
+        [collection.id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let mut summary = serde_json::json!({
+        "ratingKey": collection.id.to_string(),
+        "key": format!("/library/collections/{}/items", collection.id),
+        "type": "collection",
+        "title": collection.title,
+        "titleSort": collection.title.to_lowercase(),
+        "summary": "",
+        "smart": false,
+        "childCount": item_count,
+        "leafCount": item_count,
+        "addedAt": collection.added_at,
+        "updatedAt": collection.updated_at
+    });
+    if let Ok(section) = usize::try_from(collection.section_id) {
+        if let Some(library) = section
+            .checked_sub(1)
+            .and_then(|index| libraries.get(index))
+        {
+            summary["librarySectionID"] = serde_json::json!(section);
+            summary["librarySectionTitle"] = serde_json::json!(library.name);
+            summary["librarySectionUUID"] =
+                serde_json::json!(plex_library_uuid(machine_identifier, section));
+            summary["librarySectionKey"] =
+                serde_json::json!(format!("/library/sections/{section}"));
+        }
+    }
+    Ok(summary)
+}
+
+fn plex_collection_container(
+    connection: &Connection,
+    collections: &[PlexCollectionRecord],
+    libraries: &[ConfigLibrary],
+    machine_identifier: &str,
+) -> rusqlite::Result<serde_json::Value> {
+    let metadata = collections
+        .iter()
+        .map(|collection| {
+            plex_collection_summary(connection, collection, libraries, machine_identifier)
+        })
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(serde_json::json!({
+        "MediaContainer": {
+            "size": metadata.len(),
+            "totalSize": metadata.len(),
+            "offset": 0,
+            "identifier": "com.plexapp.plugins.library",
+            "Metadata": metadata
+        }
+    }))
+}
+
+async fn plex_collections(
+    State(state): State<AppState>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let libraries = match state.config.lock() {
+        Ok(config) => config.libraries.clone(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let requested_section = match query.get("sectionId") {
+        Some(value) => match value.parse::<usize>() {
+            Ok(section) if section > 0 && section <= libraries.len() => Some(section as i64),
+            Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None => None,
+    };
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(mut collections) = plex_collection_records(&connection) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if let Some(section) = requested_section {
+        collections.retain(|collection| collection.section_id == section);
+    }
+    match plex_collection_container(
+        &connection,
+        &collections,
+        &libraries,
+        &state.machine_identifier,
+    ) {
+        Ok(body) => plex_json(body),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn plex_create_collection(
+    State(state): State<AppState>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let Some(title) = query
+        .get("title")
+        .map(|title| title.trim())
+        .filter(|title| !title.is_empty())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if query
+        .get("smart")
+        .is_some_and(|smart| !matches!(smart.as_str(), "0" | "false"))
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let libraries = match state.config.lock() {
+        Ok(config) => config.libraries.clone(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let section = match query.get("sectionId") {
+        Some(value) => match value.parse::<usize>() {
+            Ok(section) if section > 0 && section <= libraries.len() => section,
+            Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None if !libraries.is_empty() => 1,
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if connection
+        .execute(
+            "INSERT INTO collections (title, section_id, added_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
+            (title, section as i64, updated_at),
+        )
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let Ok(collection) = plex_collection_record(&connection, connection.last_insert_rowid()) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(body) = plex_collection_container(
+        &connection,
+        &[collection],
+        &libraries,
+        &state.machine_identifier,
+    ) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let mut response = plex_json(body);
+    *response.status_mut() = StatusCode::CREATED;
+    response
+}
+
+async fn plex_collection_items(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    let entries = {
+        let Ok(connection) = state.db.lock() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        if plex_collection_record(&connection, id).is_err() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        let mut statement = match connection.prepare(
+            "SELECT id, media_key FROM collection_items WHERE collection_id = ?1 ORDER BY position, id",
+        ) {
+            Ok(statement) => statement,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let rows = match statement.query_map([id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        match rows.collect::<rusqlite::Result<Vec<_>>>() {
+            Ok(entries) => entries,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    };
+    let mut metadata = Vec::new();
+    for (item_id, media_key) in entries {
+        if let Some(mut item) = plex_metadata_item_json(&state, &media_key).await {
+            item["collectionItemID"] = serde_json::json!(item_id);
+            metadata.push(item);
+        }
+    }
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": metadata.len(),
+            "totalSize": metadata.len(),
+            "offset": 0,
+            "identifier": "com.plexapp.plugins.library",
+            "Metadata": metadata
+        }
+    }))
+}
+
+async fn plex_add_collection_item(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let collection = {
+        let Ok(connection) = state.db.lock() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        match plex_collection_record(&connection, id) {
+            Ok(collection) => collection,
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        }
+    };
+    let Some(source) = query.get("uri").or_else(|| query.get("key")) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(media_id) = plex_rating_key_from_source(source)
+        .or_else(|| source.parse::<u64>().ok().map(|key| key.to_string()))
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(media) = find_media(&state, &media_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some((section, _)) = media_library(&state, media) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if collection.section_id != section as i64 {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let libraries = match state.config.lock() {
+        Ok(config) => config.libraries.clone(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let media_key = plex_rating_key(media).to_string();
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let next_position = match connection.query_row(
+        "SELECT COALESCE(MAX(position), -1) + 1 FROM collection_items WHERE collection_id = ?1",
+        [id],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(position) => position,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if connection
+        .execute(
+            "INSERT OR IGNORE INTO collection_items (collection_id, media_key, position, added_at) VALUES (?1, ?2, ?3, ?4)",
+            (id, media_key, next_position, updated_at),
+        )
+        .and_then(|_| {
+            connection.execute(
+                "UPDATE collections SET updated_at = ?1 WHERE id = ?2",
+                (updated_at, id),
+            )
+        })
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let Ok(collection) = plex_collection_record(&connection, id) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    match plex_collection_container(
+        &connection,
+        &[collection],
+        &libraries,
+        &state.machine_identifier,
+    ) {
+        Ok(body) => plex_json(body),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn plex_remove_collection_item(
+    State(state): State<AppState>,
+    Path((id, item_id)): Path<(i64, String)>,
+) -> Response {
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if plex_collection_record(&connection, id).is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let media_key = find_media(&state, &item_id)
+        .map(|media| plex_rating_key(media).to_string())
+        .unwrap_or_else(|| item_id.clone());
+    let mut result = connection.execute(
+        "DELETE FROM collection_items WHERE collection_id = ?1 AND media_key = ?2",
+        (id, &media_key),
+    );
+    if matches!(result, Ok(0)) {
+        if let Ok(item_id) = item_id.parse::<i64>() {
+            result = connection.execute(
+                "DELETE FROM collection_items WHERE collection_id = ?1 AND id = ?2",
+                (id, item_id),
+            );
+        }
+    }
+    match result {
+        Ok(0) => StatusCode::NOT_FOUND.into_response(),
+        Ok(_) => {
+            let updated_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or_default();
+            if connection
+                .execute(
+                    "UPDATE collections SET updated_at = ?1 WHERE id = ?2",
+                    (updated_at, id),
+                )
+                .is_err()
+            {
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            } else {
+                StatusCode::OK.into_response()
+            }
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+fn plex_playlist_record(connection: &Connection, id: i64) -> rusqlite::Result<PlexPlaylistRecord> {
+    connection.query_row(
+        "SELECT id, title, playlist_type, smart, added_at, updated_at FROM playlists WHERE id = ?1",
+        [id],
+        |row| {
+            Ok(PlexPlaylistRecord {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                playlist_type: row.get(2)?,
+                smart: row.get(3)?,
+                added_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        },
+    )
+}
+
+fn plex_playlist_records(connection: &Connection) -> rusqlite::Result<Vec<PlexPlaylistRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT id, title, playlist_type, smart, added_at, updated_at FROM playlists ORDER BY title COLLATE NOCASE, id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(PlexPlaylistRecord {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            playlist_type: row.get(2)?,
+            smart: row.get(3)?,
+            added_at: row.get(4)?,
+            updated_at: row.get(5)?,
+        })
+    })?;
+    rows.collect()
+}
+
+fn plex_playlist_summary(
+    connection: &Connection,
+    playlist: &PlexPlaylistRecord,
+) -> rusqlite::Result<serde_json::Value> {
+    let leaf_count = connection.query_row(
+        "SELECT COUNT(*) FROM playlist_items WHERE playlist_id = ?1",
+        [playlist.id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(serde_json::json!({
+        "ratingKey": playlist.id.to_string(),
+        "key": format!("/playlists/{}", playlist.id),
+        "type": "playlist",
+        "title": playlist.title,
+        "titleSort": playlist.title.to_lowercase(),
+        "playlistType": playlist.playlist_type,
+        "smart": playlist.smart,
+        "leafCount": leaf_count,
+        "childCount": leaf_count,
+        "addedAt": playlist.added_at,
+        "updatedAt": playlist.updated_at
+    }))
+}
+
+fn plex_playlist_container(
+    connection: &Connection,
+    playlists: &[PlexPlaylistRecord],
+) -> rusqlite::Result<serde_json::Value> {
+    let metadata = playlists
+        .iter()
+        .map(|playlist| plex_playlist_summary(connection, playlist))
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(serde_json::json!({
+        "MediaContainer": {
+            "size": metadata.len(),
+            "totalSize": metadata.len(),
+            "identifier": "com.plexapp.plugins.library",
+            "Metadata": metadata
+        }
+    }))
+}
+
+async fn plex_playlists(
+    State(state): State<AppState>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(mut playlists) = plex_playlist_records(&connection) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if let Some(playlist_type) = query.get("playlistType") {
+        playlists.retain(|playlist| &playlist.playlist_type == playlist_type);
+    }
+    if let Some(smart) = query.get("smart") {
+        let wants_smart = matches!(smart.as_str(), "1" | "true");
+        playlists.retain(|playlist| playlist.smart == wants_smart);
+    }
+    match plex_playlist_container(&connection, &playlists) {
+        Ok(body) => plex_json(body),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn plex_create_playlist(
+    State(state): State<AppState>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let Some(title) = query
+        .get("title")
+        .map(|title| title.trim())
+        .filter(|title| !title.is_empty())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let playlist_type = query
+        .get("playlistType")
+        .or_else(|| query.get("type"))
+        .map(String::as_str)
+        .unwrap_or("video");
+    if playlist_type != "video"
+        || query
+            .get("smart")
+            .is_some_and(|smart| !matches!(smart.as_str(), "0" | "false"))
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if connection
+        .execute(
+            "INSERT INTO playlists (title, playlist_type, smart, added_at, updated_at) VALUES (?1, 'video', 0, ?2, ?2)",
+            (title, updated_at),
+        )
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let playlist_id = connection.last_insert_rowid();
+    let Ok(playlist) = plex_playlist_record(&connection, playlist_id) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(body) = plex_playlist_container(&connection, &[playlist]) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let mut response = plex_json(body);
+    *response.status_mut() = StatusCode::CREATED;
+    response
+}
+
+async fn plex_get_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(playlist) = plex_playlist_record(&connection, id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match plex_playlist_container(&connection, &[playlist]) {
+        Ok(body) => plex_json(body),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn plex_update_playlist(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if plex_playlist_record(&connection, id).is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(title) = query
+        .get("title")
+        .map(|title| title.trim())
+        .filter(|title| !title.is_empty())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let updated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    if connection
+        .execute(
+            "UPDATE playlists SET title = ?1, updated_at = ?2 WHERE id = ?3",
+            (title, updated_at, id),
+        )
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let Ok(playlist) = plex_playlist_record(&connection, id) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    match plex_playlist_container(&connection, &[playlist]) {
+        Ok(body) => plex_json(body),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn plex_delete_playlist(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if plex_playlist_record(&connection, id).is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if connection
+        .execute("DELETE FROM playlist_items WHERE playlist_id = ?1", [id])
+        .and_then(|_| connection.execute("DELETE FROM playlists WHERE id = ?1", [id]))
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn plex_metadata_item_json(state: &AppState, rating_key: &str) -> Option<serde_json::Value> {
+    let uri = Uri::try_from(format!("/library/metadata/{rating_key}")).ok()?;
+    let response = plex_item(
+        State(state.clone()),
+        Path(rating_key.to_owned()),
+        HeaderMap::new(),
+        uri,
+    )
+    .await;
+    if response.status() != StatusCode::OK {
+        return None;
+    }
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .ok()?;
+    serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()?
+        .pointer("/MediaContainer/Metadata/0")
+        .cloned()
+}
+
+async fn plex_playlist_items(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    let entries = {
+        let Ok(connection) = state.db.lock() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        if plex_playlist_record(&connection, id).is_err() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        let mut statement = match connection.prepare(
+            "SELECT id, media_key FROM playlist_items WHERE playlist_id = ?1 ORDER BY position, id",
+        ) {
+            Ok(statement) => statement,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let rows = match statement.query_map([id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        match rows.collect::<rusqlite::Result<Vec<_>>>() {
+            Ok(entries) => entries,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    };
+    let mut metadata = Vec::new();
+    for (item_id, rating_key) in entries {
+        if let Some(mut item) = plex_metadata_item_json(&state, &rating_key).await {
+            item["playlistItemID"] = serde_json::json!(item_id);
+            metadata.push(item);
+        }
+    }
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": metadata.len(),
+            "totalSize": metadata.len(),
+            "offset": 0,
+            "identifier": "com.plexapp.plugins.library",
+            "Metadata": metadata
+        }
+    }))
+}
+
+async fn plex_add_playlist_item(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    {
+        let Ok(connection) = state.db.lock() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        if plex_playlist_record(&connection, id).is_err() {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    }
+    let Some(source) = query.get("uri").or_else(|| query.get("key")) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(rating_key) = plex_rating_key_from_source(source)
+        .or_else(|| source.parse::<u64>().ok().map(|key| key.to_string()))
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(media) = find_media(&state, &rating_key) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let rating_key = plex_rating_key(media).to_string();
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let next_position = match connection.query_row(
+        "SELECT COALESCE(MAX(position), -1) + 1 FROM playlist_items WHERE playlist_id = ?1",
+        [id],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(position) => position,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let added_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    if connection
+        .execute(
+            "INSERT INTO playlist_items (playlist_id, media_key, position, added_at) VALUES (?1, ?2, ?3, ?4)",
+            (id, rating_key, next_position, added_at),
+        )
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let Ok(playlist) = plex_playlist_record(&connection, id) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    match plex_playlist_container(&connection, &[playlist]) {
+        Ok(body) => plex_json(body),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn plex_clear_playlist_items(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if plex_playlist_record(&connection, id).is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let result = if let Some(item_id) = query.get("playlistItemID") {
+        let Ok(item_id) = item_id.parse::<i64>() else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        connection.execute(
+            "DELETE FROM playlist_items WHERE id = ?1 AND playlist_id = ?2",
+            (item_id, id),
+        )
+    } else {
+        connection.execute("DELETE FROM playlist_items WHERE playlist_id = ?1", [id])
+    };
+    match result {
+        Ok(0) if query.contains_key("playlistItemID") => StatusCode::NOT_FOUND.into_response(),
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn plex_delete_playlist_item(
+    State(state): State<AppState>,
+    Path((playlist_id, item_id)): Path<(i64, i64)>,
+) -> Response {
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if plex_playlist_record(&connection, playlist_id).is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match connection.execute(
+        "DELETE FROM playlist_items WHERE playlist_id = ?1 AND id = ?2",
+        (playlist_id, item_id),
+    ) {
+        Ok(0) => StatusCode::NOT_FOUND.into_response(),
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn plex_move_playlist_item(
+    State(state): State<AppState>,
+    Path((playlist_id, item_id)): Path<(i64, i64)>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if plex_playlist_record(&connection, playlist_id).is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let mut statement = match connection
+        .prepare("SELECT id FROM playlist_items WHERE playlist_id = ?1 ORDER BY position, id")
+    {
+        Ok(statement) => statement,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let rows = match statement.query_map([playlist_id], |row| row.get::<_, i64>(0)) {
+        Ok(rows) => rows,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let mut item_ids = match rows.collect::<rusqlite::Result<Vec<_>>>() {
+        Ok(item_ids) => item_ids,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let Some(current_index) = item_ids.iter().position(|id| *id == item_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let after = match query.get("after") {
+        Some(after) => match after.parse::<i64>() {
+            Ok(after) => after,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None => -1,
+    };
+    item_ids.remove(current_index);
+    let insertion_index = if after < 0 {
+        0
+    } else if let Some(index) = item_ids.iter().position(|id| *id == after) {
+        index + 1
+    } else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    item_ids.insert(insertion_index, item_id);
+    for (position, item_id) in item_ids.iter().enumerate() {
+        if connection
+            .execute(
+                "UPDATE playlist_items SET position = ?1 WHERE id = ?2 AND playlist_id = ?3",
+                (position as i64, item_id, playlist_id),
+            )
+            .is_err()
+        {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 fn plex_play_queue_source_uri(library_uuid: &str, rating_key: &str) -> String {
@@ -9519,6 +10829,7 @@ async fn plex_set_streams(
 async fn plex_part_file(
     State(state): State<AppState>,
     Path((id, part_path)): Path<(String, String)>,
+    uri: Uri,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
@@ -9529,7 +10840,8 @@ async fn plex_part_file(
     if part_path.rsplit('/').next() != Some(expected.as_str()) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    stream_file(media, method, headers).await
+    let download = plex_query_value(&uri, "download") == Some("1");
+    stream_file(media, method, headers, download).await
 }
 
 async fn plex_stream(
@@ -9834,6 +11146,7 @@ fn plex_video_json(
         "ratingKey": rating_key,
         "key": format!("/library/metadata/{rating_key}"),
         "type": media_type,
+        "guid": plex_metadata_guid(media_type, &rating_key),
         "title": title,
         "thumb": format!("/library/metadata/{rating_key}/thumb"),
         "art": format!("/library/metadata/{rating_key}/art"),
@@ -10057,10 +11370,15 @@ async fn stream_for_id(s: AppState, id: String, method: Method, headers: HeaderM
     let Some(media) = find_media(&s, &id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    stream_file(media, method, headers).await
+    stream_file(media, method, headers, false).await
 }
 
-async fn stream_file(media: &Media, method: Method, headers: HeaderMap) -> Response {
+async fn stream_file(
+    media: &Media,
+    method: Method,
+    headers: HeaderMap,
+    download: bool,
+) -> Response {
     let range = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
     let (start, end) = match parse_range(range, media.size) {
         Ok(value) => value,
@@ -10084,6 +11402,39 @@ async fn stream_file(media: &Media, method: Method, headers: HeaderMap) -> Respo
         HeaderValue::from_str(&length.to_string()).unwrap(),
     );
     response_headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if download {
+        let filename = media
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| std::borrow::Cow::Borrowed("media"));
+        let fallback = filename
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, ' ' | '.' | '-' | '_') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let encoded = filename
+            .as_bytes()
+            .iter()
+            .map(|byte| {
+                if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'.' | b'_') {
+                    char::from(*byte).to_string()
+                } else {
+                    format!("%{byte:02X}")
+                }
+            })
+            .collect::<String>();
+        let value = format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}");
+        response_headers.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_str(&value).unwrap(),
+        );
+    }
     if range.is_some() {
         response_headers.insert(
             header::CONTENT_RANGE,

@@ -365,6 +365,93 @@ async fn web_and_plex_clients_share_playback_progress() {
 }
 
 #[tokio::test]
+async fn plex_continue_watching_hub_tracks_progress_and_remove_action() {
+    let fixture = fixture();
+    let empty = send(
+        &fixture.app,
+        Method::GET,
+        "/hubs/continueWatching",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(empty.status(), StatusCode::OK);
+    let empty: serde_json::Value =
+        serde_json::from_slice(&to_bytes(empty.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        empty["MediaContainer"]["Hub"][0]["Metadata"],
+        serde_json::json!([])
+    );
+
+    let timeline = send(
+        &fixture.app,
+        Method::GET,
+        "/:/timeline?ratingKey=1-1&time=4000&duration=10000",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(timeline.status(), StatusCode::OK);
+
+    let hub = send(
+        &fixture.app,
+        Method::GET,
+        "/hubs/continueWatching",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(hub.status(), StatusCode::OK);
+    let hub: serde_json::Value =
+        serde_json::from_slice(&to_bytes(hub.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(hub["MediaContainer"]["Hub"][0]["size"], 1);
+    assert_eq!(
+        hub["MediaContainer"]["Hub"][0]["Metadata"][0]["ratingKey"],
+        "1048577"
+    );
+    assert_eq!(
+        hub["MediaContainer"]["Hub"][0]["Metadata"][0]["viewOffset"],
+        4000
+    );
+
+    let removed = send(
+        &fixture.app,
+        Method::PUT,
+        "/actions/removeFromContinueWatching?ratingKey=1-1",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(removed.status(), StatusCode::OK);
+    let hub = send(
+        &fixture.app,
+        Method::GET,
+        "/hubs/continueWatching",
+        Body::empty(),
+    )
+    .await;
+    let hub: serde_json::Value =
+        serde_json::from_slice(&to_bytes(hub.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        hub["MediaContainer"]["Hub"][0]["Metadata"],
+        serde_json::json!([])
+    );
+
+    let missing_key = send(
+        &fixture.app,
+        Method::PUT,
+        "/actions/removeFromContinueWatching",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(missing_key.status(), StatusCode::BAD_REQUEST);
+    let missing_media = send(
+        &fixture.app,
+        Method::PUT,
+        "/actions/removeFromContinueWatching?ratingKey=missing",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(missing_media.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn watch_card_actions_change_and_hide_continue_progress() {
     let fixture = fixture();
     let saved = fixture
@@ -524,6 +611,225 @@ async fn marking_a_tv_episode_watched_shows_the_next_episode_in_continue_watchin
 }
 
 #[tokio::test]
+async fn continue_watching_shows_only_the_first_unwatched_episode_per_show() {
+    let fixture = tv_fixture();
+    for (path, position_ms) in [
+        (
+            "Example Show/Season 01/Example.Show.S01E01.Pilot.mkv",
+            2_000,
+        ),
+        ("Example Show/Season 01/Example.Show.S01E02.Next.mkv", 1_000),
+    ] {
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/web/progress")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "path": path,
+                            "position_ms": position_ms,
+                            "duration_ms": 10_000,
+                            "watched": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    let home = send(&fixture.app, Method::GET, "/", Body::empty()).await;
+    let home = String::from_utf8(
+        to_bytes(home.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let continue_cards = home
+        .split("class=\"continue-grid\">")
+        .nth(1)
+        .unwrap()
+        .split("</section>")
+        .next()
+        .unwrap();
+
+    assert!(continue_cards.contains("Example.Show.S01E01.Pilot.mkv"));
+    assert!(!continue_cards.contains("Example.Show.S01E02.Next.mkv"));
+    assert_eq!(continue_cards.matches("class=\"media-card ").count(), 1);
+}
+
+#[tokio::test]
+async fn plex_episode_metadata_includes_guid_ancestry_and_watch_state() {
+    let fixture = tv_fixture();
+    let listing = send(
+        &fixture.app,
+        Method::GET,
+        "/library/all?type=4",
+        Body::empty(),
+    )
+    .await;
+    let listing: serde_json::Value =
+        serde_json::from_slice(&to_bytes(listing.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let episode = &listing["MediaContainer"]["Metadata"][0];
+    let rating_key = episode["ratingKey"].as_str().unwrap();
+    let show_key = episode["grandparentRatingKey"].as_str().unwrap();
+    let season_key = episode["parentRatingKey"].as_str().unwrap();
+    assert_eq!(episode["type"], "episode");
+    assert!(episode["guid"]
+        .as_str()
+        .unwrap()
+        .starts_with("com.plexapp.plugins.library://episode/"));
+    assert!(episode["parentGuid"]
+        .as_str()
+        .unwrap()
+        .starts_with("com.plexapp.plugins.library://season/"));
+    assert!(episode["grandparentGuid"].is_string());
+
+    let show = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/library/metadata/{show_key}"),
+        Body::empty(),
+    )
+    .await;
+    let show: serde_json::Value =
+        serde_json::from_slice(&to_bytes(show.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        show["MediaContainer"]["Metadata"][0]["guid"],
+        episode["grandparentGuid"]
+    );
+
+    let season = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/library/metadata/{season_key}"),
+        Body::empty(),
+    )
+    .await;
+    let season: serde_json::Value =
+        serde_json::from_slice(&to_bytes(season.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        season["MediaContainer"]["Metadata"][0]["guid"],
+        episode["parentGuid"]
+    );
+
+    let watched = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/:/scrobble?ratingKey={rating_key}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(watched.status(), StatusCode::OK);
+    let metadata = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/library/metadata/{rating_key}"),
+        Body::empty(),
+    )
+    .await;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(metadata["MediaContainer"]["Metadata"][0]["viewCount"], 1);
+
+    let unwatched = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/:/unscrobble?ratingKey={rating_key}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(unwatched.status(), StatusCode::OK);
+    let metadata = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/library/metadata/{rating_key}"),
+        Body::empty(),
+    )
+    .await;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(metadata["MediaContainer"]["Metadata"][0]["viewCount"], 0);
+    assert_eq!(metadata["MediaContainer"]["Metadata"][0]["lastViewedAt"], 0);
+}
+
+#[tokio::test]
+async fn marking_a_continue_watching_episode_unwatched_keeps_it_at_zero_progress() {
+    let fixture = tv_fixture();
+    let path = "Example Show/Season 01/Example.Show.S01E01.Pilot.mkv";
+    let saved = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/web/progress")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"path":"{path}","position_ms":2500,"duration_ms":10000,"watched":false}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::NO_CONTENT);
+
+    let unwatched = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/web/watch-action")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"path":"{path}","library":0,"action":"unwatched"}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unwatched.status(), StatusCode::NO_CONTENT);
+
+    let progress = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/web/progress?path={}", path.replace(' ', "%20")),
+        Body::empty(),
+    )
+    .await;
+    let progress: serde_json::Value =
+        serde_json::from_slice(&to_bytes(progress.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(progress["positionMs"], 0);
+    assert_eq!(progress["watched"], false);
+
+    let home = send(&fixture.app, Method::GET, "/", Body::empty()).await;
+    let home = String::from_utf8(
+        to_bytes(home.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let continue_cards = home
+        .split("class=\"continue-grid\">")
+        .nth(1)
+        .unwrap()
+        .split("</div>")
+        .next()
+        .unwrap();
+    assert!(continue_cards.contains("Example.Show.S01E01.Pilot.mkv"));
+    assert!(home.contains("aria-valuenow=\"0\""));
+}
+
+#[tokio::test]
 async fn web_and_plex_clients_share_subtitle_selection() {
     let fixture = fixture();
     let update = fixture
@@ -636,6 +942,47 @@ async fn library_media_view_starts_with_flat_poster_cards_and_progress() {
 }
 
 #[tokio::test]
+async fn tv_season_navigation_renders_episode_poster_cards() {
+    let fixture = tv_fixture();
+    let unindexed_episode = fixture
+        .root
+        .join("media/Example Show/Season 01/Example.Show.S01E03.New.mkv");
+    std::fs::write(&unindexed_episode, b"0123456789abcdef").unwrap();
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&path=Example%20Show%2FSeason%2001",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert!(body.contains("class=\"media-card media-card-tv\""));
+    assert!(body.contains("Poster for Pilot"));
+    assert!(body.contains("class=\"media-card-title\" title=\"Pilot\""));
+    assert!(body.contains("class=\"media-card-subtitle\">S1 · E1</span>"));
+    assert!(body.contains("class=\"media-card-details\">Example Show</span>"));
+    assert!(body.contains(
+        "data-watch-scope=\"item\" data-watch-key=\"Example Show/Season 01/Example.Show.S01E01.Pilot.mkv\""
+    ));
+    assert!(body.contains(
+        "href=\"/?library=0&amp;path=Example%20Show%2FSeason%2001&amp;episode=Example%20Show%2FSeason%2001%2FExample.Show.S01E01.Pilot.mkv\""
+    ));
+    assert!(body.contains(
+        "class=\"media-card-placeholder\" role=\"img\" aria-label=\"No poster for New\""
+    ));
+    assert!(!body.contains("tv-episode-card"));
+}
+
+#[tokio::test]
 async fn database_metadata_renders_in_the_selected_movie_view() {
     let fixture = fixture();
     fixture.config.lock().unwrap().metadata_storage = "database".to_owned();
@@ -715,12 +1062,18 @@ fn media_cards_use_the_selected_media_poster_and_path() {
         0,
     );
     assert!(movie_card.contains("/library/metadata/1-42/thumb"));
+    assert!(movie_card
+        .contains("style=\"align-self:start;background:rgba(31,41,55,.3);padding:.7rem\""));
+    assert!(movie_card.contains(
+        "style=\"box-sizing:border-box;height:4rem;padding-top:0;gap:0;grid-template-rows:1rem 1rem 1rem 1rem\""
+    ));
+    assert!(movie_card.contains("grid-row:4;height:1rem"));
     assert!(movie_card.contains("path=Films&amp;play=Films%2FDemo%20Movie.mkv"));
     assert!(movie_card.contains("Poster for Demo Movie"));
-    assert!(
-        movie_card.contains("class=\"media-card-title\" title=\"Demo Movie\">Demo Movie</span>")
-    );
-    assert!(movie_card.contains("class=\"media-card-subtitle\">2024</span>"));
+    assert!(movie_card.contains(
+        "class=\"media-card-title\" title=\"Demo Movie\" style=\"height:auto;margin:0;white-space:nowrap;text-overflow:ellipsis\">Demo Movie</span>"
+    ));
+    assert!(movie_card.contains("</span><span class=\"media-card-subtitle\">2024</span>"));
     assert!(movie_card.contains("aria-valuenow=\"40\""));
     assert!(!movie_card.contains("% watched"));
     assert!(!movie_card.contains("Continue watching</span>"));
@@ -752,12 +1105,18 @@ fn media_cards_use_the_selected_media_poster_and_path() {
         Path::new("Example Show/Season 02/Example.Show.S02E04.mkv"),
         1,
     );
-    assert!(
-        tv_card.contains("class=\"media-card-title\" title=\"Example Show\">Example Show</span>")
-    );
+    assert!(tv_card.contains(
+        "class=\"media-card-title\" title=\"Example Show\" style=\"height:auto;margin:0;white-space:nowrap;text-overflow:ellipsis\">Example Show</span>"
+    ));
     assert!(tv_card.contains("class=\"media-card-details\">S2 · E4</span>"));
     assert!(tv_card.contains("class=\"media-card media-card-tv\""));
     assert!(tv_card.contains("class=\"media-card-progress\""));
+
+    assert!(tv_card.contains("background:rgba(31,41,55,.3)"));
+    assert!(tv_card.contains(
+        "style=\"box-sizing:border-box;height:4rem;padding-top:0;gap:0;grid-template-rows:1rem 1rem 1rem 1rem\""
+    ));
+    assert!(tv_card.contains("grid-row:4;height:1rem"));
 
     let episode_title = serde_json::json!({
         "name":"Example Show",
@@ -1093,6 +1452,21 @@ async fn plex_playback_endpoints_cover_success_and_failure_paths() {
     .await;
     assert_eq!(part_file.status(), StatusCode::OK);
     assert_eq!(part_file.headers()[header::ACCEPT_RANGES], "bytes");
+    let download = send(
+        &fixture.app,
+        Method::GET,
+        &format!(
+            "/library/parts/{}/{}/file.mkv?download=1",
+            fixture.part_id, fixture.change_stamp
+        ),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(download.status(), StatusCode::OK);
+    assert_eq!(
+        download.headers()[header::CONTENT_DISPOSITION],
+        "attachment; filename=\"Demo.mkv\"; filename*=UTF-8''Demo.mkv"
+    );
     let part_range = fixture
         .app
         .clone()
@@ -1374,15 +1748,22 @@ async fn every_registered_plex_route_has_success_and_failure_cases() {
         (Method::GET, "/identity"),
         (Method::GET, "/myplex/account"),
         (Method::GET, "/accounts"),
+        (Method::GET, "/devices"),
         (Method::GET, "/accounts/1"),
         (Method::GET, "/activities"),
         (Method::GET, "/status/sessions"),
+        (Method::GET, "/status/sessions/history/all"),
         (Method::GET, "/servers"),
         (Method::GET, "/media/providers"),
         (Method::GET, "/security/resources"),
         (Method::GET, "/hubs"),
         (Method::GET, "/hubs/promoted"),
         (Method::GET, "/hubs/search?query=Demo"),
+        (Method::GET, "/hubs/continueWatching"),
+        (
+            Method::PUT,
+            "/actions/removeFromContinueWatching?ratingKey=1-1",
+        ),
         (Method::GET, "/hubs/sections/1"),
         (Method::GET, "/hubs/metadata/1-1/related"),
         (Method::GET, "/hubs/sections/1/recommended"),
@@ -1397,6 +1778,7 @@ async fn every_registered_plex_route_has_success_and_failure_cases() {
         (Method::GET, "/library/sections/1/firstCharacter/D"),
         (Method::GET, "/library/sections/1/firstCharacters"),
         (Method::GET, "/library/search?query=Demo"),
+        (Method::GET, "/library/all"),
         (Method::GET, "/library/sections/1/all"),
         (Method::GET, "/library/metadata/1-1"),
         (Method::GET, "/library/metadata/1-1/children"),
@@ -1423,6 +1805,16 @@ async fn every_registered_plex_route_has_success_and_failure_cases() {
             "/playQueues?type=video&uri=%2Flibrary%2Fmetadata%2F1-1",
         ),
         (Method::GET, "/playQueues/1"),
+        (Method::GET, "/playlists"),
+        (
+            Method::POST,
+            "/playlists?title=Route%20Test&playlistType=video&smart=0",
+        ),
+        (Method::GET, "/library/collections"),
+        (
+            Method::POST,
+            "/library/collections?title=Route%20Collection&sectionId=1&smart=0",
+        ),
         (Method::GET, "/library/metadata/1-1/thumb"),
         (Method::GET, "/library/metadata/1-1/art"),
         (Method::GET, "/media/1-1"),
@@ -1443,9 +1835,16 @@ async fn every_registered_plex_route_has_success_and_failure_cases() {
 
     for (method, uri) in cases {
         let response = send(&fixture.app, method.clone(), uri, Body::empty()).await;
+        let expected_status = if method == Method::POST
+            && (uri.starts_with("/playlists?") || uri.starts_with("/library/collections?"))
+        {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        };
         assert_eq!(
             response.status(),
-            StatusCode::OK,
+            expected_status,
             "{method} {uri} did not dispatch successfully"
         );
         if uri.starts_with("/video/:/") || uri.starts_with("/photo/:/") || uri.starts_with("/:/") {
@@ -1484,6 +1883,366 @@ async fn every_registered_plex_route_has_success_and_failure_cases() {
         .await
         .unwrap();
     assert_eq!(websocket.status(), StatusCode::UPGRADE_REQUIRED);
+}
+
+#[tokio::test]
+async fn plex_desktop_bootstrap_endpoints_return_compatible_containers() {
+    let fixture = fixture();
+
+    let devices = send(&fixture.app, Method::GET, "/devices", Body::empty()).await;
+    assert_eq!(devices.status(), StatusCode::OK);
+    let devices: serde_json::Value =
+        serde_json::from_slice(&to_bytes(devices.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(devices["MediaContainer"]["size"], 0);
+    assert_eq!(devices["MediaContainer"]["Device"], serde_json::json!([]));
+
+    let history = send(
+        &fixture.app,
+        Method::GET,
+        "/status/sessions/history/all",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(history.status(), StatusCode::OK);
+    let history: serde_json::Value =
+        serde_json::from_slice(&to_bytes(history.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(history["MediaContainer"]["size"], 0);
+    assert_eq!(history["MediaContainer"]["totalSize"], 0);
+    assert_eq!(history["MediaContainer"]["offset"], 0);
+    assert_eq!(history["MediaContainer"]["Metadata"], serde_json::json!([]));
+
+    let accounts = send(&fixture.app, Method::GET, "/accounts", Body::empty()).await;
+    assert_eq!(accounts.status(), StatusCode::OK);
+    let accounts: serde_json::Value =
+        serde_json::from_slice(&to_bytes(accounts.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(accounts["MediaContainer"]["Account"][0]["id"], 1);
+}
+
+#[tokio::test]
+async fn static_playlists_support_crud_and_item_management() {
+    let fixture = fixture();
+    let created = send(
+        &fixture.app,
+        Method::POST,
+        "/playlists?title=Favorites&playlistType=video&smart=0",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created: serde_json::Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let playlist_id = created["MediaContainer"]["Metadata"][0]["ratingKey"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        created["MediaContainer"]["Metadata"][0]["playlistType"],
+        "video"
+    );
+    assert_eq!(created["MediaContainer"]["Metadata"][0]["smart"], false);
+
+    let listed = send(
+        &fixture.app,
+        Method::GET,
+        "/playlists?playlistType=video",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed: serde_json::Value =
+        serde_json::from_slice(&to_bytes(listed.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(listed["MediaContainer"]["size"], 1);
+
+    let updated = send(
+        &fixture.app,
+        Method::PUT,
+        &format!("/playlists/{playlist_id}?title=Renamed"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(updated.status(), StatusCode::OK);
+
+    let added = send(
+        &fixture.app,
+        Method::PUT,
+        &format!(
+            "/playlists/{playlist_id}/items?uri=server%3A%2F%2Fmplex-test%2Fcom.plexapp.plugins.library%2Flibrary%2Fmetadata%2F1-1"
+        ),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(added.status(), StatusCode::OK);
+
+    let items = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/playlists/{playlist_id}/items"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(items.status(), StatusCode::OK);
+    let items: serde_json::Value =
+        serde_json::from_slice(&to_bytes(items.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(items["MediaContainer"]["size"], 1);
+    assert_eq!(items["MediaContainer"]["Metadata"][0]["title"], "Demo");
+    let item_id = items["MediaContainer"]["Metadata"][0]["playlistItemID"]
+        .as_i64()
+        .unwrap();
+
+    let moved = send(
+        &fixture.app,
+        Method::PUT,
+        &format!("/playlists/{playlist_id}/items/{item_id}/move?after=-1"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(moved.status(), StatusCode::NO_CONTENT);
+
+    let removed = send(
+        &fixture.app,
+        Method::DELETE,
+        &format!("/playlists/{playlist_id}/items/{item_id}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+    let cleared = send(
+        &fixture.app,
+        Method::DELETE,
+        &format!("/playlists/{playlist_id}/items"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(cleared.status(), StatusCode::NO_CONTENT);
+
+    let deleted = send(
+        &fixture.app,
+        Method::DELETE,
+        &format!("/playlists/{playlist_id}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    let missing = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/playlists/{playlist_id}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let invalid_smart = send(
+        &fixture.app,
+        Method::POST,
+        "/playlists?title=Smart&playlistType=video&smart=1",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(invalid_smart.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn static_collections_support_listing_and_item_management() {
+    let fixture = fixture();
+    let created = send(
+        &fixture.app,
+        Method::POST,
+        "/library/collections?title=Favorites&sectionId=1&smart=0",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created: serde_json::Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let collection_id = created["MediaContainer"]["Metadata"][0]["ratingKey"]
+        .as_str()
+        .unwrap();
+
+    let listed = send(
+        &fixture.app,
+        Method::GET,
+        "/library/collections?sectionId=1",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed: serde_json::Value =
+        serde_json::from_slice(&to_bytes(listed.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(listed["MediaContainer"]["size"], 1);
+
+    let section_collections = send(
+        &fixture.app,
+        Method::GET,
+        "/library/sections/1/collections",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(section_collections.status(), StatusCode::OK);
+    let section_collections: serde_json::Value = serde_json::from_slice(
+        &to_bytes(section_collections.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        section_collections["MediaContainer"]["Metadata"][0]["title"],
+        "Favorites"
+    );
+
+    let added = send(
+        &fixture.app,
+        Method::PUT,
+        &format!(
+            "/library/collections/{collection_id}/items?uri=server%3A%2F%2Fmplex-test%2Fcom.plexapp.plugins.library%2Flibrary%2Fmetadata%2F1-1"
+        ),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(added.status(), StatusCode::OK);
+
+    let duplicate = send(
+        &fixture.app,
+        Method::PUT,
+        &format!(
+            "/library/collections/{collection_id}/items?uri=server%3A%2F%2Fmplex-test%2Fcom.plexapp.plugins.library%2Flibrary%2Fmetadata%2F1-1"
+        ),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(duplicate.status(), StatusCode::OK);
+
+    let items = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/library/collections/{collection_id}/items"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(items.status(), StatusCode::OK);
+    let items: serde_json::Value =
+        serde_json::from_slice(&to_bytes(items.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(items["MediaContainer"]["size"], 1);
+    assert_eq!(items["MediaContainer"]["Metadata"][0]["title"], "Demo");
+    let media_rating_key = items["MediaContainer"]["Metadata"][0]["ratingKey"]
+        .as_str()
+        .unwrap();
+
+    let removed = send(
+        &fixture.app,
+        Method::PUT,
+        &format!("/library/collections/{collection_id}/items/{media_rating_key}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(removed.status(), StatusCode::OK);
+
+    let missing_item = send(
+        &fixture.app,
+        Method::PUT,
+        &format!("/library/collections/{collection_id}/items/{media_rating_key}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(missing_item.status(), StatusCode::NOT_FOUND);
+    let items = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/library/collections/{collection_id}/items"),
+        Body::empty(),
+    )
+    .await;
+    let items: serde_json::Value =
+        serde_json::from_slice(&to_bytes(items.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(items["MediaContainer"]["Metadata"], serde_json::json!([]));
+
+    let smart = send(
+        &fixture.app,
+        Method::POST,
+        "/library/collections?title=Smart&sectionId=1&smart=1",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(smart.status(), StatusCode::BAD_REQUEST);
+    let missing_section = send(
+        &fixture.app,
+        Method::POST,
+        "/library/collections?title=Missing&sectionId=2",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(missing_section.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn plex_library_all_lists_filtered_and_paged_media() {
+    let fixture = fixture();
+
+    let response = send(&fixture.app, Method::GET, "/library/all", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(response["MediaContainer"]["size"], 1);
+    assert_eq!(response["MediaContainer"]["totalSize"], 1);
+    assert_eq!(response["MediaContainer"]["Metadata"][0]["type"], "movie");
+    assert_eq!(response["MediaContainer"]["Metadata"][0]["title"], "Demo");
+
+    let filtered = send(
+        &fixture.app,
+        Method::GET,
+        "/library/all?type=1&title==Demo",
+        Body::empty(),
+    )
+    .await;
+    let filtered: serde_json::Value =
+        serde_json::from_slice(&to_bytes(filtered.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(filtered["MediaContainer"]["size"], 1);
+
+    let episodes = send(
+        &fixture.app,
+        Method::GET,
+        "/library/all?type=4",
+        Body::empty(),
+    )
+    .await;
+    let episodes: serde_json::Value =
+        serde_json::from_slice(&to_bytes(episodes.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(episodes["MediaContainer"]["size"], 0);
+
+    let page = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/library/all")
+                .header("X-Plex-Container-Start", "1")
+                .header("X-Plex-Container-Size", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let page: serde_json::Value =
+        serde_json::from_slice(&to_bytes(page.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(page["MediaContainer"]["size"], 0);
+    assert_eq!(page["MediaContainer"]["offset"], 1);
+    assert_eq!(page["MediaContainer"]["totalSize"], 1);
+
+    let tv_fixture = tv_fixture();
+    for (uri, expected_type, expected_count) in [
+        ("/library/all", "show", 1),
+        ("/library/all?type=3", "season", 1),
+        ("/library/all?type=4", "episode", 2),
+    ] {
+        let response = send(&tv_fixture.app, Method::GET, uri, Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let response: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let items = response["MediaContainer"]["Metadata"].as_array().unwrap();
+        assert_eq!(items.len(), expected_count, "{uri}");
+        assert_eq!(items[0]["type"], expected_type, "{uri}");
+    }
 }
 
 #[tokio::test]

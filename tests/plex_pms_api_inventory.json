@@ -212,7 +212,7 @@
       "path": "/hubs/continueWatching",
       "operation_id": "hubsGetContinueWatching",
       "summary": "Get the continue watching hub",
-      "expected_status": 404
+      "expected_status": 200
     },
     {
       "method": "GET",
@@ -317,7 +317,7 @@
       "path": "/library/all",
       "operation_id": "libraryGetAll",
       "summary": "Get all items in library",
-      "expected_status": 404
+      "expected_status": 200
     },
     {
       "method": "DELETE",
@@ -338,7 +338,7 @@
       "path": "/library/collections",
       "operation_id": "libraryCollectionPostSlash",
       "summary": "Create a collection",
-      "expected_status": 404
+      "expected_status": 400
     },
     {
       "method": "GET",
@@ -1507,14 +1507,14 @@
       "path": "/playlists",
       "operation_id": "playlistGetSlash",
       "summary": "Retrieve Playlists",
-      "expected_status": 404
+      "expected_status": 200
     },
     {
       "method": "POST",
       "path": "/playlists",
       "operation_id": "playlistPostSlash",
       "summary": "Create a Playlist",
-      "expected_status": 404
+      "expected_status": 400
     },
     {
       "method": "GET",
@@ -1563,7 +1563,7 @@
       "path": "/playlists/{playlistId}/items/{generatorId}",
       "operation_id": "playlistGetItemsGenerator",
       "summary": "Get a playlist generator",
-      "expected_status": 404
+      "expected_status": 405
     },
     {
       "method": "DELETE",
@@ -1577,7 +1577,7 @@
       "path": "/playlists/{playlistId}/items/{generatorId}",
       "operation_id": "playlistPutItemsGenerator",
       "summary": "Modify a Generator",
-      "expected_status": 404
+      "expected_status": 405
     },
     {
       "method": "GET",
@@ -1612,7 +1612,7 @@
       "path": "/playlists/upload",
       "operation_id": "playlistPostUpload",
       "summary": "Upload",
-      "expected_status": 404
+      "expected_status": 405
     },
     {
       "method": "POST",
@@ -1724,7 +1724,7 @@
       "path": "/status/sessions/history/all",
       "operation_id": "statusGetHistoryAll",
       "summary": "List Playback History",
-      "expected_status": 404
+      "expected_status": 200
     },
     {
       "method": "GET",

@@ -1,22 +1,22 @@
 use super::{
     apply_plex_technical_metadata, ass_to_vtt, clean_relative_path, contains_hidden_component,
     external_subtitle_content, external_subtitle_language_token, extract_xml_token, html,
-    next_tv_episode_paths, parse_range, parse_sidecar_metadata, parse_tv_episode_marker,
-    parse_tv_season_directory, plex_children_json, plex_codec, plex_connectivity_url,
-    plex_device_announce_query, plex_device_announce_url, plex_direct_play_decision_response,
-    plex_empty_extras_response, plex_external_subtitle_id, plex_genre_tokens, plex_hub_categories,
-    plex_language, plex_library_children_container, plex_library_media_container,
-    plex_library_provider_features, plex_mark_direct_play, plex_media_id, plex_paged_children,
-    plex_part_id, plex_photo_source, plex_play_queue_response, plex_play_queue_source_uri,
-    plex_presence_url, plex_publish_urls, plex_query_media_id, plex_ranked_tv_shows,
-    plex_rating_key, plex_rating_key_from_source, plex_safe_numeric_id, plex_search_hubs,
-    plex_search_rank, plex_search_result_entries, plex_search_type_matches, plex_stream_id,
-    plex_stream_id_and_format, plex_track_label, plex_tv_episode_parents, plex_tv_season_groups,
-    plex_tv_season_json, plex_tv_show_groups, plex_tv_show_json, plex_video_json,
-    plex_video_resolution, render_database_info_panel, sidebar_nav_with_library_links,
-    sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms, technical_tracks, tv_show_title,
-    vtt_to_srt, ConfigLibrary, HeaderMap, HeaderValue, Media, PathBuf, PlexStreamSelection,
-    TvEpisodeInfo, Uri,
+    next_tv_episode_paths, ordered_continue_paths, parse_range, parse_sidecar_metadata,
+    parse_tv_episode_marker, parse_tv_season_directory, plex_children_json, plex_codec,
+    plex_connectivity_url, plex_device_announce_query, plex_device_announce_url,
+    plex_direct_play_decision_response, plex_empty_extras_response, plex_external_subtitle_id,
+    plex_genre_tokens, plex_hub_categories, plex_language, plex_library_children_container,
+    plex_library_media_container, plex_library_provider_features, plex_mark_direct_play,
+    plex_media_id, plex_paged_children, plex_part_id, plex_photo_source, plex_play_queue_response,
+    plex_play_queue_source_uri, plex_presence_url, plex_publish_urls, plex_query_media_id,
+    plex_ranked_tv_shows, plex_rating_key, plex_rating_key_from_source, plex_safe_numeric_id,
+    plex_search_hubs, plex_search_rank, plex_search_result_entries, plex_search_type_matches,
+    plex_stream_id, plex_stream_id_and_format, plex_track_label, plex_tv_episode_parents,
+    plex_tv_season_groups, plex_tv_season_json, plex_tv_show_groups, plex_tv_show_json,
+    plex_video_json, plex_video_resolution, render_database_info_panel,
+    sidebar_nav_with_library_links, sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms,
+    technical_tracks, tv_show_title, vtt_to_srt, ConfigLibrary, HeaderMap, HeaderValue, Media,
+    PathBuf, PlexStreamSelection, TvEpisodeInfo, Uri,
 };
 #[test]
 fn plex_playback_ids_resolve_rating_keys_and_metadata_paths() {
@@ -358,7 +358,7 @@ fn database_metadata_renders_movie_and_episode_information() {
 }
 
 #[test]
-fn continue_watching_picks_the_next_episode_after_a_watched_episode() {
+fn continue_watching_picks_the_first_unwatched_episode_for_a_show() {
     let root = PathBuf::from("/library/tv");
     let first_path = "Example Show/Season 01/Example.Show.S01E01.Pilot.mkv";
     let second_path = "Example Show/Season 01/Example.Show.S01E02.Next.mkv";
@@ -383,28 +383,41 @@ fn continue_watching_picks_the_next_episode_after_a_watched_episode() {
         show_continue_watching: true,
     };
     let watched = std::collections::HashSet::from([first_path.to_owned()]);
-    let in_progress = std::collections::HashSet::new();
     let hidden = std::collections::HashSet::new();
+    let activity = std::collections::HashMap::from([
+        (first_path.to_owned(), 100),
+        (second_path.to_owned(), 200),
+    ]);
     assert_eq!(
-        next_tv_episode_paths(&[library.clone()], &media, &watched, &in_progress, &hidden),
-        vec![second_path.to_owned()]
+        next_tv_episode_paths(&[library.clone()], &media, &watched, &hidden, &activity),
+        vec![(second_path.to_owned(), 200)]
     );
 
-    let in_progress = std::collections::HashSet::from([second_path.to_owned()]);
-    assert!(
-        next_tv_episode_paths(&[library.clone()], &media, &watched, &in_progress, &hidden)
-            .is_empty()
+    let watched = std::collections::HashSet::new();
+    assert_eq!(
+        next_tv_episode_paths(&[library.clone()], &media, &watched, &hidden, &activity),
+        vec![(first_path.to_owned(), 200)]
     );
 
-    let hidden = std::collections::HashSet::from([second_path.to_owned()]);
-    assert!(next_tv_episode_paths(
-        &[library],
-        &media,
-        &watched,
-        &std::collections::HashSet::new(),
-        &hidden
-    )
-    .is_empty());
+    let hidden = std::collections::HashSet::from([first_path.to_owned(), second_path.to_owned()]);
+    assert!(next_tv_episode_paths(&[library], &media, &watched, &hidden, &activity).is_empty());
+}
+
+#[test]
+fn continue_watching_orders_by_activity_and_deduplicates_paths() {
+    assert_eq!(
+        ordered_continue_paths(vec![
+            ("Later path".to_owned(), 200),
+            ("Newest".to_owned(), 300),
+            ("Earlier path".to_owned(), 200),
+            ("Newest".to_owned(), 100),
+        ]),
+        vec![
+            "Newest".to_owned(),
+            "Earlier path".to_owned(),
+            "Later path".to_owned(),
+        ]
+    );
 }
 #[test]
 fn extracts_plex_server_token() {
@@ -579,12 +592,25 @@ fn plex_tv_library_groups_episode_files_under_show_and_season_items() {
     assert_eq!(show_item["childCount"], 1);
     assert_eq!(show_item["leafCount"], 2);
     assert_eq!(show_item["viewedLeafCount"], 1);
+    let show_guid = show_item["guid"].as_str().unwrap().to_owned();
+    assert_eq!(
+        show_guid,
+        format!("com.plexapp.plugins.library://show/{}", show.rating_key)
+    );
     assert!(show_item.get("Media").is_none());
 
     let season_item = plex_tv_season_json(&show, 1, 3, &library, &metadata, 2);
     assert_eq!(season_item["type"], "season");
     assert_eq!(season_item["parentRatingKey"], show.rating_key);
     assert_eq!(season_item["childCount"], 2);
+    assert_eq!(
+        season_item["guid"],
+        format!(
+            "com.plexapp.plugins.library://season/{}-season-1",
+            show.rating_key
+        )
+    );
+    assert_eq!(season_item["parentGuid"], show_guid);
     let seasons_container =
         plex_library_children_container(&library, 3, "tv-uuid", 1, 0, 1, "season");
     let episodes_container =
@@ -592,8 +618,23 @@ fn plex_tv_library_groups_episode_files_under_show_and_season_items() {
     assert_eq!(seasons_container["viewGroup"], "season");
     assert_eq!(episodes_container["viewGroup"], "episode");
     let mut episode_item = plex_video_json(&media[0], 3, &library, None);
-    plex_tv_episode_parents(&mut episode_item, &show, 1, 1);
+    plex_tv_episode_parents(&mut episode_item, &show, 1, 1, &show_guid);
     assert_eq!(episode_item["type"], "episode");
+    assert_eq!(
+        episode_item["guid"],
+        format!(
+            "com.plexapp.plugins.library://episode/{}",
+            plex_rating_key(&media[0])
+        )
+    );
+    assert_eq!(
+        episode_item["parentGuid"],
+        format!(
+            "com.plexapp.plugins.library://season/{}-season-1",
+            show.rating_key
+        )
+    );
+    assert_eq!(episode_item["grandparentGuid"], show_guid);
     assert!(!episode_item["key"].as_str().unwrap().ends_with("/children"));
     assert_eq!(episode_item["parentType"], "season");
     assert_eq!(episode_item["grandparentType"], "show");
@@ -708,6 +749,53 @@ fn plex_provider_advertises_the_universal_playqueue_feature() {
         .expect("playqueue feature is required for Plex Play controls");
     assert_eq!(playqueue["key"], "/playQueues");
     assert_eq!(playqueue["flavor"], "universal");
+}
+
+#[test]
+fn plex_provider_advertises_timeline_scrobble_actions() {
+    let features = plex_library_provider_features(Vec::new());
+    let timeline = features
+        .iter()
+        .find(|feature| feature["type"] == "timeline")
+        .expect("timeline feature is required to expose watch-state actions");
+    assert_eq!(timeline["key"], "/:/timeline");
+    assert_eq!(timeline["scrobbleKey"], "/:/scrobble");
+    assert_eq!(timeline["unscrobbleKey"], "/:/unscrobble");
+
+    let playlist = features
+        .iter()
+        .find(|feature| feature["type"] == "playlist")
+        .expect("implemented static playlists must be advertised");
+    assert_eq!(playlist["key"], "/playlists");
+    assert_eq!(playlist["flavor"], "universal");
+
+    let collections = features
+        .iter()
+        .find(|feature| feature["type"] == "collection")
+        .expect("implemented static collections must be advertised");
+    assert_eq!(collections["key"], "/library/collections");
+
+    let universal_search = features
+        .iter()
+        .find(|feature| feature["type"] == "universalsearch")
+        .expect("the implemented universal search route must be advertised");
+    assert_eq!(universal_search["key"], "/library/search");
+
+    let continue_watching = features
+        .iter()
+        .find(|feature| feature["type"] == "continuewatching")
+        .expect("the implemented Continue Watching hub must be advertised");
+    assert_eq!(continue_watching["key"], "/hubs/continueWatching");
+
+    let actions = features
+        .iter()
+        .find(|feature| feature["type"] == "actions")
+        .expect("implemented item actions must be advertised");
+    assert_eq!(actions["key"], "/actions");
+    assert_eq!(
+        actions["Action"][0]["key"],
+        "/actions/removeFromContinueWatching"
+    );
 }
 
 #[test]

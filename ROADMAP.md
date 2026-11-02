@@ -43,7 +43,10 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 - [x] Support current title/date/rating sorts, basic recommendations, Plex artwork URLs, external subtitles, and section pagination.
 - [x] Implement Plex title search and confirm Plezy returns local-library results.
 - [ ] Recheck in Plezy that show-title searches also display matching episodes and the show cover after the latest response changes.
-- [ ] Complete and validate all client-used hubs, filters, sorting options, collections, playlists, and library navigation.
+- [x] Support persistent static universal video playlists with CRUD and item add/list/remove/reorder; smart generators and uploads remain unsupported.
+- [x] Expose a Plex Continue Watching hub from saved in-progress items and implement its remove action.
+- [x] Support static video collections with persistent create/list and item add/list/remove; smart collections, reordering, and composite artwork remain unsupported.
+- [ ] Complete and validate all client-used hubs, filters, sorting options, collection artwork/reordering, and library navigation; validate playlist and collection behavior in Plex clients.
 - [ ] Replace scan-order IDs with stable media and part IDs; handle moves, renames, removals, rescans, and library updates reliably.
 - [ ] Complete artwork behavior, including missing-art fallback frames and requested image sizes/formats, using portable in-process Rust libraries.
 - [ ] Verify movie and TV show/season/episode hierarchies and metadata in each official client.
@@ -78,12 +81,23 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 
 ## Gap log
 
+### 2026-11-02
+
+- Built-in web Continue Watching shows one first-unwatched, unhidden episode per active TV show and sorts movie/show cards by latest watch activity. Plex API first-unwatched episode selection remains unchanged.
+- Provider discovery now advertises universal search, static video playlists and collections, and the Continue Watching hub with its remove action. Playlist, collection, and progress-action behavior have protocol-level tests; smart generators, collection reordering/artwork, and playlist uploads remain unsupported, and Plex Desktop visibility remains unverified.
+
 ### 2026-11-01
 
 - Plezy search now returns local-library results after `/library/search` was changed to its expected `SearchResult[].Metadata` shape. Latest follow-up adds episodes to parent-show searches and emits `grandparentThumb`/`grandparentArt`; verify those additions in Plezy after its latest connection refresh.
 - The official Plex client now shows Play after provider discovery advertised the missing `playqueue` feature. It still reports “An error occurred loading items to play.” A live protocol replay confirmed the queue response returns 200 with a string `ratingKey` and matching integer `playQueueSelectedMetadataItemID`; the playback decision returns code 1000 and the media part serves a range with 206. The official client still needs to proceed from queue creation to the decision/part requests; the P0 playback gate remains open.
 - Live item metadata exposed part and external subtitle stream IDs above JavaScript's exact integer limit (2^53−1). These IDs now use deterministic safe-range numbers; on the reloaded `just dev` server, the revised part URL returned HTTP 206 and an advertised external subtitle URL returned HTTP 200 as WebVTT. The official client still needs a metadata refresh and Play-button check.
 - Replaced the sparse “drop-in” checklist with an operation-by-operation PMS API inventory, implementation gates, and an official-client compatibility matrix. JSON remains the Plex API response format.
+- Plex Desktop requested `GET /devices` and `GET /status/sessions/history/all`. Both now return Plex-shaped empty containers instead of 404; `/accounts` was already implemented. Device registration and playback-history persistence remain open compatibility gaps.
+- Home card spacing remained incorrect after the earlier alignment change. The shared renderer now applies 70%-transparent backgrounds, equal padding on all edges, and the same fixed four-row info area to every card. Movie titles stay on one line, and the year follows the title directly. User visual validation confirms equal top/bottom spacing and fixed sizing for movie and TV cards.
+- Implemented `GET /library/all` with movie, show, season, and episode type selection, title filtering, sorting, and container pagination. The inventory now expects HTTP 200.
+- Episode responses include `guid`, `parentGuid`, `grandparentGuid`, and watch state. Unscrobbling clears `lastViewedAt`; a regression test covers the zeroed state. Provider discovery advertises timeline/scrobble/unscrobble keys, but Plex Desktop still omits the watch action after reload. `output.log` confirms Plex Desktop requests `/media/providers` after reload, so stale provider discovery is not the cause.
+- Rex's `docs/findings.md` maps Plex Web menu entries to provider features: `manage`, `playlist`, `actions`, `timeline`, and `subscribe`, plus server flags such as `allowMediaDeletion`, `allowSync`, and `backgroundProcessing`. Harbringer now advertises content/search/metadata/promoted/collection/playlist/playqueue/timeline/continuewatching/actions/universalsearch. Sharing, deletion, sync, and background processing remain disabled. The Rex findings are Web-specific, not proof of Plex Desktop behavior. Harbringer already advertises the `download` protocol; part downloads return attachment headers for `download=1`, but managed sync/download is unsupported. Watchlist, Share, and More Ways to Watch remain unexplained by the reference map.
+- Full Plex Desktop context-menu parity remains open; do not advertise menu actions without implementing their routes and behavior.
 
 ### 2026-10-31
 
@@ -103,7 +117,7 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 - Added Plex GDM LAN discovery responses and announcements; broader official-client validation remains outstanding.
 - Settings now supports reconnecting an already connected Plex account without first disconnecting.
 - Added Plex `thumb` and `art` routes for media entries with cached sidecar artwork; broader artwork coverage and client validation remain outstanding.
-- Implemented the TV browsing hierarchy: show overview, season cards with compact episode-count badges, season artwork/descriptions, selectable episode cards, and one-player episode detail views with episode descriptions.
+- Implemented the TV browsing hierarchy: show overview, season cards with compact episode-count badges, season artwork/descriptions, episode poster cards with per-episode watch controls, and episode detail views with descriptions.
 - Added Plex-style TV naming support for `Season 01`, `season.01`, `Specials`, `s01e01`, and multi-episode markers such as `s02e18-e19`.
 - Added TMDB season artwork and season metadata caching under each season’s `.mplex` directory.
 - Added movie/show/TV metadata matching, sidecar metadata storage, artwork download, per-media rematching, force rescans, and ffprobe technical metadata caching.
