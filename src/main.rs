@@ -4460,6 +4460,13 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     } else {
         String::new()
     };
+    let tv_season_view = library_kind.as_deref() == Some("tv")
+        && relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(parse_tv_season_directory)
+            .is_some();
+
     let info_panel = if let Some(selected_relative) = selected_relative.as_deref() {
         if tv_episode_info(&library_root, &library_root.join(selected_relative)).is_some() {
             episode_info_panel(&s, &library_root, selected_relative).await
@@ -4483,7 +4490,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             )
             .await
         }
-    } else if sidecar_mode {
+    } else if sidecar_mode || tv_season_view {
         media_info_panel(&directory, None).await
     } else {
         String::new()
@@ -4569,13 +4576,26 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                     let Some(show_path) = show_path else {
                         continue;
                     };
+
                     let progress = average_media_progress(&show.episodes, &section_metadata);
-                    let representative_metadata = section_metadata.get(&representative.id);
-                    let (episode_title, episode_number) = tv_episode_card_labels(
-                        &library_root,
-                        &representative.path,
-                        representative_metadata,
+                    let season_count = show
+                        .episodes
+                        .iter()
+                        .filter_map(|episode| {
+                            episode
+                                .path
+                                .parent()
+                                .and_then(std::path::Path::file_name)
+                                .and_then(|name| name.to_str())
+                                .and_then(parse_tv_season_directory)
+                        })
+                        .collect::<BTreeSet<_>>()
+                        .len();
+                    let season_label = format!(
+                        "{season_count} season{}",
+                        if season_count == 1 { "" } else { "s" }
                     );
+
                     let Some(representative_path) =
                         representative.path.strip_prefix(&library_root).ok()
                     else {
@@ -4589,8 +4609,8 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                         Some(&representative.id),
                         &href,
                         &show.title,
-                        episode_title.as_deref(),
-                        episode_number.as_deref(),
+                        Some(&season_label),
+                        None,
                         progress,
                         representative_path,
                         library_index,
@@ -4619,12 +4639,6 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             has_content = !folder_cards.is_empty();
         }
     }
-    let tv_season_view = library_kind.as_deref() == Some("tv")
-        && relative
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(parse_tv_season_directory)
-            .is_some();
     for (name, child_relative) in directories {
         has_content = true;
         let directory = directory.join(&name);

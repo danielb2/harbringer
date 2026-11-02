@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Show each TV show’s poster, truncated name, and season count, and show season descriptions when available in the web client.
+- Reflection: show cards keep the show title, count distinct season folders, and pluralize the label. Season views reuse the metadata sidecar panel, including in database mode, and omit it when no description is available. Added route tests for show titles/counts and season descriptions with and without metadata. Focused TV endpoint test passes; `cargo test` (67 passed) and `git diff --check` passed.
+
 - Implement static video playlists and collections, Continue Watching removal, and the in-progress hub; advertise only implemented capabilities.
 - Reflection: persist playlist/collection state, cover playlist CRUD and item add/list/remove/reorder plus collection create/list/add/remove, and hide in-progress items through the Plex action. Keep smart features and unsupported collection operations unadvertised. Update the PMS inventory and add success/failure tests. Plex Desktop behavior remains unverified. `cargo fmt`, focused playlist/collection/hub/action/provider/route tests, the 260-operation inventory test, all 65 tests, `cargo build`, `cargo fmt --check`, and `git diff --check` passed.
 

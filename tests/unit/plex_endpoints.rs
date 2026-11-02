@@ -948,6 +948,15 @@ async fn tv_season_navigation_renders_episode_poster_cards() {
         .root
         .join("media/Example Show/Season 01/Example.Show.S01E03.New.mkv");
     std::fs::write(&unindexed_episode, b"0123456789abcdef").unwrap();
+    let season_info = fixture
+        .root
+        .join("media/Example Show/Season 01/.mplex/info.toml");
+    std::fs::create_dir_all(season_info.parent().unwrap()).unwrap();
+    std::fs::write(
+        &season_info,
+        "title = \"Season One\"\ndescription = \"A season description\"\n",
+    )
+    .unwrap();
 
     let response = send(
         &fixture.app,
@@ -966,6 +975,8 @@ async fn tv_season_navigation_renders_episode_poster_cards() {
     .unwrap();
 
     assert!(body.contains("class=\"media-card media-card-tv\""));
+    assert!(body.contains("A season description"));
+
     assert!(body.contains("Poster for Pilot"));
     assert!(body.contains("class=\"media-card-title\" title=\"Pilot\""));
     assert!(body.contains("class=\"media-card-subtitle\">S1 · E1</span>"));
@@ -980,6 +991,49 @@ async fn tv_season_navigation_renders_episode_poster_cards() {
         "class=\"media-card-placeholder\" role=\"img\" aria-label=\"No poster for New\""
     ));
     assert!(!body.contains("tv-episode-card"));
+}
+
+#[tokio::test]
+async fn tv_show_cards_display_the_season_count() {
+    let fixture = tv_fixture();
+    let response = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert!(body.contains(
+        "class=\"media-card-title\" title=\"Example Show\" style=\"height:auto;margin:0;white-space:nowrap;text-overflow:ellipsis\">Example Show</span>"
+    ));
+
+    assert!(body.contains("class=\"media-card-subtitle\">1 season</span>"));
+    assert!(!body.contains("class=\"metadata-panel\""));
+}
+
+#[tokio::test]
+async fn tv_season_without_description_has_no_empty_metadata_panel() {
+    let fixture = tv_fixture();
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&path=Example%20Show%2FSeason%2001",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert!(!body.contains("class=\"metadata-panel\""));
 }
 
 #[tokio::test]
