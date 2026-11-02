@@ -6872,6 +6872,8 @@ fn render_toml_details(table: &toml::map::Map<String, toml::Value>) -> String {
             key.as_str() != "metadata_json"
                 && key.as_str() != "description"
                 && key.as_str() != "technical"
+                && key.as_str() != "path"
+                && key.as_str() != "media_path"
         })
         .map(|(key, value)| {
             let rendered = match value {

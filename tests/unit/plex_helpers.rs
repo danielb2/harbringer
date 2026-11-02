@@ -14,9 +14,10 @@ use super::{
     plex_search_result_entries, plex_search_type_matches, plex_stream_id,
     plex_stream_id_and_format, plex_track_label, plex_tv_episode_parents, plex_tv_season_groups,
     plex_tv_season_json, plex_tv_show_groups, plex_tv_show_json, plex_video_json,
-    plex_video_resolution, render_database_info_panel, sidebar_nav_with_library_links,
-    sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms, technical_tracks, tv_show_title,
-    vtt_to_srt, ConfigLibrary, HeaderMap, HeaderValue, Media, PathBuf, PlexStreamSelection,
+    plex_video_resolution, render_database_info_panel, render_toml_details,
+    sidebar_nav_with_library_links, sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms,
+    technical_tracks, tv_show_title, vtt_to_srt, ConfigLibrary, HeaderMap, HeaderValue, Media,
+    PathBuf, PlexStreamSelection,
     TvEpisodeInfo, Uri,
 };
 #[test]
@@ -426,6 +427,19 @@ fn database_metadata_renders_movie_and_episode_information() {
     assert!(episode_panel.contains("Episode summary"));
     assert!(episode_panel.contains("season</strong><span>1"));
     assert!(!episode_panel.contains("Series summary"));
+}
+
+
+#[test]
+fn overview_details_hide_media_path() {
+    let details = "title = \"ThunderCats\"\nmedia_path = \"ThunderCats/season.01/ThunderCats.s01e01.Exodus.mkv\"\n\nruntime = 42"
+        .parse::<toml::Value>()
+        .unwrap();
+    let rendered = render_toml_details(details.as_table().unwrap());
+    assert!(rendered.contains("ThunderCats"));
+    assert!(rendered.contains("42"));
+    assert!(!rendered.contains("media path"));
+    assert!(!rendered.contains("ThunderCats/season.01/ThunderCats.s01e01.Exodus.mkv"));
 }
 
 #[test]

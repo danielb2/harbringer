@@ -1,6 +1,9 @@
 # Changelog
 
 ## Unreleased
+- Hide filesystem paths from TV show overview details.
+- Reflection: show overview sidecar details exposed the `media_path` field as an episode-file location. Filter that field in the shared detail renderer and add a regression test with the reported ThunderCats path. Formatting and tests could not run because shell startup tried to write Fish state outside the sandbox.
+
 
 - Add a limited pure-Rust DASH remux path and restore Plex video-transcoder capability advertisement.
 - Reflection: stashing the current changes restored Plex Desktop playback, so `transcoderVideo=true` is retained; the exact cause was not isolated. Plex Web requests DASH, so add H.264 Matroska remuxing with optional AAC audio and range-backed fMP4 delivery while preserving original part streaming. Logs showed 124,333 keyframe fragments, then 4,469 timed fragments, but no init or media-segment requests. The prior live-profile/`SegmentList` mismatch was corrected with one-based `SegmentTemplate` URLs and the MPEG-DASH Full profile; `startWithSAP=0` avoids claiming random-access boundaries that the timed muxer does not guarantee. Two-second fragmentation and a 10,000-fragment cap also remain. Shaka reports `Empty XML source`, so the response now sets explicit `Content-Length` and logs manifest bytes. Other video codecs/containers are rejected and HLS is unsupported. Tests cover manifest generation, segment indexing, byte ranges, invalid input, numeric metadata-path lookup, and the fragment limit. Plex Desktop works; Plex Web retry and real-media remux success remain unverified. `cargo fmt --check`, `cargo test` (77 passed), `cargo build`, `cargo build --release`, and `git diff --check` passed. Current dev size is 52,084,936 bytes, 2,403,680 above the earlier 49,681,256-byte build; release size is 16,626,880 bytes. This total delta is not isolated to oxideav.
