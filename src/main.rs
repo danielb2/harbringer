@@ -24,13 +24,14 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    io::{self, Write},
     net::SocketAddr,
     path::{Component, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, RwLock,
+        Arc, Mutex, OnceLock, RwLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -184,11 +185,117 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalSecondTimer {
     }
 }
 
+const MAX_LOG_LINES: usize = 1000;
+const MAX_LOG_LINE_BYTES: usize = 4096;
+static LOG_BUFFER: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+
+#[derive(Clone)]
+struct LogBufferMakeWriter;
+
+struct LogBufferWriter {
+    pending: Vec<u8>,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBufferMakeWriter {
+    type Writer = LogBufferWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogBufferWriter {
+            pending: Vec::new(),
+        }
+    }
+}
+
+impl Write for LogBufferWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        io::stdout().lock().write_all(bytes)?;
+        self.pending.extend_from_slice(bytes);
+        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line = self.pending.drain(..=newline).collect::<Vec<_>>();
+            push_log_line(String::from_utf8_lossy(&line[..line.len() - 1]).into_owned());
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().flush()?;
+        if !self.pending.is_empty() {
+            push_log_line(String::from_utf8_lossy(&std::mem::take(&mut self.pending)).into_owned());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LogBufferWriter {
+    fn drop(&mut self) {
+        if !self.pending.is_empty() {
+            push_log_line(String::from_utf8_lossy(&std::mem::take(&mut self.pending)).into_owned());
+        }
+    }
+}
+
+fn strip_ansi_sequences(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(character) = chars.next() {
+        if character != '\u{1b}' {
+            output.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for sequence_character in chars.by_ref() {
+                    if ('@'..='~').contains(&sequence_character) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(sequence_character) = chars.next() {
+                    if sequence_character == '\u{7}'
+                        || (sequence_character == '\u{1b}' && chars.next() == Some('\\'))
+                    {
+                        break;
+                    }
+                }
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    output
+}
+
+fn push_log_line(line: String) {
+    let line = strip_ansi_sequences(&line)
+        .chars()
+        .take(MAX_LOG_LINE_BYTES)
+        .collect::<String>();
+    let mut logs = LOG_BUFFER
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if logs.len() == MAX_LOG_LINES {
+        logs.pop_front();
+    }
+    logs.push_back(line);
+}
+
+fn recent_log_lines() -> Vec<String> {
+    LOG_BUFFER
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .map(|logs| logs.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_target(false)
+        .with_ansi(false)
         .with_timer(LocalSecondTimer)
+        .with_writer(LogBufferMakeWriter)
         .init();
     let args = Args::parse();
     if run_server(args).await? == RunOutcome::Reload {
@@ -439,8 +546,11 @@ fn build_app(state: AppState) -> Router {
         .route("/web/subtitle", get(web_subtitle))
         .route("/web/artwork", get(web_artwork))
         .route("/web/info", get(web_info))
+        .route("/web/tv-match/search", get(tv_match_search))
+        .route("/web/tv-match/select", post(tv_match_select))
         .route("/settings", get(settings_page))
         .route("/settings/libraries", post(create_library))
+        .route("/settings/libraries/:id/rename", post(rename_library))
         .route("/settings/libraries/:id/delete", post(delete_library))
         .route("/settings/folders", post(add_library_folder))
         .route("/settings/libraries/display", post(update_library_display))
@@ -923,6 +1033,7 @@ async fn scan_library_inventory(state: &AppState, library_id: usize) -> Result<u
         .unwrap_or_default()
         .saturating_add(1);
     let mut scanned_roots = Vec::new();
+    let mut newly_found = Vec::new();
     for (root_index, (configured_root, canonical_root)) in roots.iter().enumerate() {
         let mut media = scan_media(canonical_root)
             .await
@@ -936,6 +1047,9 @@ async fn scan_library_inventory(state: &AppState, library_id: usize) -> Result<u
             if let Some(id) = existing_ids.get(&(root_index, relative.clone())) {
                 item.id.clone_from(id);
             } else {
+                let media_path = configured_root.join(&relative);
+                info!(library = %library.name, path = %media_path.display(), media_kind = %library.kind, container = %item.container, "new media detected");
+                newly_found.push(media_path);
                 item.id = format!("{id_prefix}{next_id}");
                 next_id = next_id.saturating_add(1);
             }
@@ -987,11 +1101,24 @@ async fn scan_library_inventory(state: &AppState, library_id: usize) -> Result<u
     if insertion_index == current.len() {
         updated.extend(scanned);
     }
-    let mut media = state
-        .media
-        .write()
-        .map_err(|_| "Media inventory is unavailable".to_owned())?;
-    *media = Arc::new(updated);
+    {
+        let mut media = state
+            .media
+            .write()
+            .map_err(|_| "Media inventory is unavailable".to_owned())?;
+        *media = Arc::new(updated);
+    }
+    drop(_scan_guard);
+    if !newly_found.is_empty() {
+        info!(library = %library.name, count = newly_found.len(), "automatic metadata detection started");
+        let response = scan_library_metadata(
+            State(state.clone()),
+            Path(library_id),
+            Query(ScanQuery { force: Some(false) }),
+        )
+        .await;
+        info!(library = %library.name, status = %response.status(), "automatic metadata detection finished");
+    }
     Ok(scanned_count)
 }
 
@@ -1289,6 +1416,11 @@ struct LibraryDisplayForm {
 }
 
 #[derive(Deserialize)]
+struct RenameLibraryForm {
+    name: String,
+}
+
+#[derive(Deserialize)]
 struct LibraryScanSettingsForm {
     library_id: usize,
     scan_enabled: Option<String>,
@@ -1318,6 +1450,8 @@ struct SettingsQuery {
     server_name_saved: Option<bool>,
     inventory_scan: Option<usize>,
     inventory_error: Option<bool>,
+    tab: Option<String>,
+    library_renamed: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1404,6 +1538,20 @@ fn plex_device_jwt(signing_key: &SigningKey, kid: &str, client_id: &str) -> Stri
 #[derive(Deserialize, Default)]
 struct ScanQuery {
     force: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct TvMatchSearchQuery {
+    library: usize,
+    path: String,
+    query: String,
+}
+
+#[derive(Deserialize)]
+struct TvMatchSelection {
+    library: usize,
+    path: String,
+    tmdb_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -2540,38 +2688,71 @@ async fn settings_page(
     };
     let list = libraries
         .iter()
-        .map(|(id, name, kind, folders, show_recently_added, show_continue_watching, _, _, _)| {
-            format!(
-                "<details class=\"library-card\"><summary class=\"library-summary\"><span class=\"library-summary-title\"><strong>{}</strong><span class=\"type-pill\">{}</span></span><span class=\"folder-count\">{} folders</span></summary><div class=\"library-content\"><section class=\"library-folders\" aria-label=\"Folders\"><h4>Folders</h4><ul>{}</ul></section><details class=\"library-add-folder\"><summary>Add folder</summary><form method=\"post\" action=\"/settings/folders\" class=\"inline-form\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><label class=\"sr-only\" for=\"folder-{}\">Folder path</label><input id=\"folder-{}\" name=\"path\" type=\"text\" placeholder=\"/another/folder\" required><button type=\"submit\">Add folder</button></form></details><div class=\"library-tools\"><form method=\"post\" action=\"/settings/libraries/{}/scan\" class=\"inline-form\"><button type=\"submit\">Scan metadata</button><button class=\"button-secondary\" type=\"submit\" formaction=\"/settings/libraries/{}/scan?force=true\">Force rescan</button></form><form method=\"post\" action=\"/settings/libraries/display\" class=\"library-display\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><fieldset><legend>Show on Home</legend><label><input type=\"checkbox\" name=\"show_recently_added\" value=\"true\" {}> Recently Added</label><label><input type=\"checkbox\" name=\"show_continue_watching\" value=\"true\" {}> Continue Watching</label><button class=\"button-secondary\" type=\"submit\">Save Home sections</button></fieldset></form><form method=\"post\" action=\"/settings/libraries/{}/delete\" class=\"library-delete\" onsubmit=\"return confirm('Delete this library from Harbringer? Media files will not be deleted.')\"><button class=\"button-danger\" type=\"submit\">Delete library</button></form></div></div></details>",
-                html(name), html(library_kind_label(kind)), folders.len(), folders.iter().map(|path| format!("<li><code>{}</code></li>", html(path))).collect::<String>(), id, id, id, id, id, id, if *show_recently_added { "checked" } else { "" }, if *show_continue_watching { "checked" } else { "" }, id
-            )
-        })
+        .map(
+            |(
+                id,
+                name,
+                kind,
+                folders,
+                show_recently_added,
+                show_continue_watching,
+                scan_enabled,
+                interval_value,
+                interval_unit,
+            )| {
+                let unit_options = ["seconds", "minutes", "hours"]
+                    .into_iter()
+                    .map(|unit| {
+                        format!(
+                            "<option value=\"{unit}\" {}>{unit}</option>",
+                            if unit == interval_unit {
+                                "selected"
+                            } else {
+                                ""
+                            }
+                        )
+                    })
+                    .collect::<String>();
+                let scan_settings = format!(
+                    "<form class=\"library-scan-settings\" method=\"post\" action=\"/settings/libraries/scan-settings\"><input type=\"hidden\" name=\"library_id\" value=\"{id}\"><strong>Automatic scan</strong><label><input type=\"checkbox\" name=\"scan_enabled\" value=\"true\" {}> Enabled</label><label>Every <input type=\"number\" name=\"scan_interval_value\" min=\"1\" value=\"{interval_value}\" required><select name=\"scan_interval_unit\">{unit_options}</select></label><button class=\"button-secondary\" type=\"submit\">Save scan schedule</button></form>",
+                    if *scan_enabled { "checked" } else { "" },
+                );
+                let rename_form = format!(
+                    "<form class=\"library-rename\" style=\"display:flex;flex-wrap:wrap;align-items:end;gap:.55rem;margin-top:1rem;padding-top:1rem;border-top:1px solid #26354a;grid-column:1/-1\" method=\"post\" action=\"/settings/libraries/{id}/rename\"><label for=\"library-name-{id}\">Library name</label><input id=\"library-name-{id}\" name=\"name\" type=\"text\" value=\"{}\" maxlength=\"64\" required><button class=\"button-secondary\" type=\"submit\">Save name</button></form>",
+                    html(name)
+                );
+                let card = format!(
+                    "<details class=\"library-card\"><summary class=\"library-summary\"><span class=\"library-summary-title\"><strong>{}</strong><span class=\"type-pill\">{}</span></span><span class=\"folder-count\">{} folders</span></summary><div class=\"library-content\"><section class=\"library-folders\" aria-label=\"Folders\"><h4>Folders</h4><ul>{}</ul></section><details class=\"library-add-folder\"><summary>Add folder</summary><form method=\"post\" action=\"/settings/folders\" class=\"inline-form\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><label class=\"sr-only\" for=\"folder-{}\">Folder path</label><input id=\"folder-{}\" name=\"path\" type=\"text\" placeholder=\"/another/folder\" required><button type=\"submit\">Add folder</button></form></details><div class=\"library-tools\"><form method=\"post\" action=\"/settings/libraries/{}/scan\" class=\"inline-form\"><button type=\"submit\">Scan metadata</button><button class=\"button-secondary\" type=\"submit\" formaction=\"/settings/libraries/{}/scan?force=true\">Force rescan</button></form>{}<form method=\"post\" action=\"/settings/libraries/display\" class=\"library-display\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><fieldset><legend>Show on Home</legend><label><input type=\"checkbox\" name=\"show_recently_added\" value=\"true\" {}> Recently Added</label><label><input type=\"checkbox\" name=\"show_continue_watching\" value=\"true\" {}> Continue Watching</label><button class=\"button-secondary\" type=\"submit\">Save Home sections</button></fieldset></form><form method=\"post\" action=\"/settings/libraries/{}/delete\" class=\"library-delete\" onsubmit=\"return confirm('Delete this library from Harbringer? Media files will not be deleted.')\"><button class=\"button-danger\" type=\"submit\">Delete library</button></form></div></div></details>",
+                    html(name),
+                    html(library_kind_label(kind)),
+                    folders.len(),
+                    folders
+                        .iter()
+                        .map(|path| format!("<li><code>{}</code></li>", html(path)))
+                        .collect::<String>(),
+                    id,
+                    id,
+                    id,
+                    id,
+                    id,
+                    scan_settings,
+                    id,
+                    if *show_recently_added { "checked" } else { "" },
+                    if *show_continue_watching { "checked" } else { "" },
+                    id,
+                );
+                card.replace(
+                    "</div></div></details>",
+                    &format!("{rename_form}</div></div></details>"),
+                )
+            },
+        )
         .collect::<String>();
     let mut list = list;
     list.insert_str(
         0,
         r#"<form class="library-card" method="post" action="/settings/scan"><strong>Scan all libraries</strong><button type="submit">Scan all libraries</button></form>"#,
     );
-    for (id, name, _, _, _, _, scan_enabled, interval_value, interval_unit) in &libraries {
-        let unit_options = ["seconds", "minutes", "hours"]
-            .into_iter()
-            .map(|unit| {
-                format!(
-                    "<option value=\"{unit}\" {}>{unit}</option>",
-                    if unit == interval_unit {
-                        "selected"
-                    } else {
-                        ""
-                    }
-                )
-            })
-            .collect::<String>();
-        list.push_str(&format!(
-            "<form class=\"library-card library-scan-settings\" method=\"post\" action=\"/settings/libraries/scan-settings\"><input type=\"hidden\" name=\"library_id\" value=\"{id}\"><strong>Automatic scan: {}</strong><label><input type=\"checkbox\" name=\"scan_enabled\" value=\"true\" {}> Enabled</label><label>Every <input type=\"number\" name=\"scan_interval_value\" min=\"1\" value=\"{interval_value}\" required><select name=\"scan_interval_unit\">{unit_options}</select></label><button class=\"button-secondary\" type=\"submit\">Save scan schedule</button></form>",
-            html(name),
-            if *scan_enabled { "checked" } else { "" },
-        ));
-    }
     let error = query
         .error
         .as_deref()
@@ -2615,7 +2796,39 @@ async fn settings_page(
                 )
             })
         })
+        .or_else(|| {
+            query.library_renamed.filter(|saved| *saved).map(|_| {
+                "<div class=\"flash-notice\" role=\"status\">Library name saved.</div>".to_owned()
+            })
+        })
         .unwrap_or_default();
+    let logs_active = query.tab.as_deref() == Some("logs");
+    let settings_stack_style = if logs_active {
+        " style=\"display:none\""
+    } else {
+        ""
+    };
+    let log_lines = recent_log_lines();
+    let logs_content = if logs_active {
+        let output = if log_lines.is_empty() {
+            "<p class=\"note\">No log entries yet.</p>".to_owned()
+        } else {
+            format!(
+                "<pre class=\"settings-logs\">{}</pre>",
+                html(&log_lines.join("\n"))
+            )
+        };
+        format!(
+            "<section class=\"settings-card\" aria-labelledby=\"logs-heading\"><div class=\"section-heading\"><div><h2 id=\"logs-heading\">Logs</h2><p class=\"section-description\">Recent server and request events. The server keeps up to 1000 entries in memory.</p></div><a class=\"button-link button-secondary\" href=\"/settings?tab=logs\">Refresh</a></div>{output}</section>"
+        )
+    } else {
+        String::new()
+    };
+    let notice = format!(
+        "<nav class=\"settings-tabs\" aria-label=\"Settings sections\"><a class=\"{}\" href=\"/settings\">Libraries</a><a class=\"{}\" href=\"/settings?tab=logs\">Logs</a></nav>{notice}",
+        if logs_active { "" } else { "active" },
+        if logs_active { "active" } else { "" },
+    );
     let current_server_name = html(&server_name(&state));
     let tmdb_token_status = if tmdb_token_saved {
         "<p class=\"credential-status is-saved\"><span class=\"status-dot\"></span>TMDB token is saved. Leave the field blank to keep it, or enter a new token to replace it.</p>"
@@ -2685,14 +2898,16 @@ button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: 
 .library-list {{ display: grid; gap: .85rem; margin: 1.2rem 0 0; padding: 0; list-style: none; }} .library-card {{ min-width: 0; padding: 1.05rem; border: 1px solid #2c3a50; border-radius: .8rem; background: rgba(10, 17, 30, .46); }} .library-heading {{ display: flex; align-items: center; justify-content: space-between; gap: 1rem; }} .library-heading > div {{ display: flex; flex-wrap: wrap; align-items: center; gap: .65rem; }} .type-pill {{ padding: .28rem .55rem; border: 1px solid #354a68; border-radius: 999px; color: #b9cee9; background: #17243a; font-size: .72rem; font-weight: 700; }} .library-folders {{ margin-top: 1.15rem; }} .library-folders ul {{ display: grid; gap: .45rem; margin: 0; padding: 0; list-style: none; }} .library-folders li {{ min-width: 0; margin: 0; padding: .6rem .7rem; overflow-wrap: anywhere; border-radius: .48rem; background: #0d1727; }} .library-folders code {{ overflow-wrap: anywhere; }} .library-add-folder, .add-library {{ margin-top: .8rem; }} .add-library {{ margin: 0; }} .add-library .settings-form {{ margin-top: 1rem; }} summary {{ display: inline-flex; align-items: center; gap: .5rem; padding: .48rem .68rem; border: 1px solid #394a63; border-radius: .55rem; color: #bfcee2; background: #172337; font-size: .82rem; font-weight: 650; cursor: pointer; list-style: none; }} summary::before {{ content: "+"; color: #83b4ff; font-size: 1rem; }} details[open] summary::before {{ content: "−"; }} summary::-webkit-details-marker {{ display: none; }} .inline-form {{ display: flex; flex-wrap: wrap; align-items: end; gap: .55rem; margin-top: .75rem; }} .inline-form input:not([type="hidden"]) {{ flex: 1 1 18rem; }} .path-list {{ display: grid; gap: .55rem; }} .path-row {{ display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }} .path-row input {{ flex: 1 1 18rem; }} .path-row .button-link {{ flex: 0 0 auto; }} .library-tools {{ display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr); align-items: start; gap: 1rem; margin-top: 1.1rem; padding-top: 1rem; border-top: 1px solid #26354a; }} .library-tools > .inline-form {{ margin: 0; }} .library-display fieldset {{ display: flex; flex-wrap: wrap; align-items: center; gap: .6rem 1rem; min-width: 0; margin: 0; padding: 0; border: 0; }} .library-display legend {{ width: 100%; margin-bottom: .55rem; color: #91a0b6; font-size: .72rem; font-weight: 750; letter-spacing: .09em; text-transform: uppercase; }} .library-display label {{ display: inline-flex; align-items: center; gap: .4rem; color: #c6d0df; font-size: .82rem; }} input[type="checkbox"] {{ width: 1rem; height: 1rem; margin: 0; accent-color: #4389f5; }} .library-display button {{ min-height: 2.3rem; padding: .48rem .7rem; font-size: .78rem; }} .empty-state {{ margin: 0; padding: 1rem; border: 1px dashed #35445b; border-radius: .7rem; color: #9aa8bf; text-align: center; }} .sr-only {{ position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }}
 .library-card {{ padding: 0; overflow: hidden; }} .library-summary {{ display: flex; width: 100%; align-items: center; justify-content: space-between; gap: .8rem; padding: 1rem 1.05rem; border: 0; border-radius: 0; color: #e8eef8; background: transparent; font-size: .95rem; text-align: left; }} .library-summary::before {{ content: none !important; }} .library-summary::after {{ content: "⌄"; margin-left: auto; color: #91a8c7; transition: transform .15s; }} .library-card[open] > .library-summary::after {{ transform: rotate(180deg); }} .library-summary-title {{ display: flex; flex-wrap: wrap; align-items: center; gap: .65rem; }} .folder-count {{ flex: 0 0 auto; color: #91a0b6; font-size: .78rem; font-weight: 500; }} .library-content {{ padding: 0 1.05rem 1.05rem; }} .library-tools {{ grid-template-columns: minmax(0, auto) minmax(0, 1fr) auto; }} .library-delete {{ display: flex; justify-content: flex-end; }} .button-danger {{ border-color: #713841; color: #ffd3d7; background: #3a202a; }} .button-danger:hover {{ border-color: #9d4b55; background: #512630; }}
 @media (max-width: 820px) {{ .library-tools {{ grid-template-columns: 1fr; }} .library-delete {{ justify-content: flex-start; }} }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; padding: .7rem; border-right: 0; border-bottom: 1px solid #263244; }} .sidebar-top {{ padding-bottom: .35rem; }} .sidebar-brand {{ padding: .35rem .55rem; }} .sidebar-toggle {{ display: none; }} .sidebar-label {{ display: none; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} main {{ padding: 1.35rem 1rem 2.5rem; }} }} @media (max-width: 560px) {{ .metadata-options, .form-grid {{ grid-template-columns: 1fr; }} .metadata-option {{ min-height: auto; }} .section-heading {{ display: block; }} .library-tools .inline-form > * {{ flex: 1 1 auto; }} .library-display fieldset {{ align-items: flex-start; }} .action-row > form, .action-row button {{ width: 100%; }} .action-row > form {{ flex: 1 1 100%; }} }}
+.library-scan-settings {{ display: flex; grid-column: 1 / -1; flex-wrap: wrap; align-items: center; gap: .65rem; padding-top: .9rem; border-top: 1px solid #26354a; }} .library-scan-settings > strong {{ margin-right: .25rem; }} .library-scan-settings label {{ display: flex; align-items: center; gap: .4rem; color: #c9d4e4; font-size: .84rem; }} .library-scan-settings input[type="number"] {{ width: 5.5rem; }} .library-scan-settings select {{ width: auto; }}
+.settings-tabs {{ display: flex; gap: .35rem; margin: 0 0 1.15rem; padding-bottom: .7rem; border-bottom: 1px solid #29364b; }} .settings-tabs a {{ padding: .55rem .8rem; border-radius: .5rem; color: #aeb9cc; text-decoration: none; }} .settings-tabs a.active, .settings-tabs a:hover {{ color: #fff; background: #1d4ed8; }} .settings-logs {{ max-height: 70vh; margin: 0; padding: 1rem; overflow: auto; border: 1px solid #29364b; border-radius: .65rem; color: #d4deec; background: #0a111e; font: .8rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }}
 </style></head><body><div class="app-shell">{}
 <main><header class="page-heading"><p class="eyebrow">harbringer</p><h1>Settings</h1><p class="page-subtitle">Manage Plex access, metadata storage, and the libraries available on this server.</p></header>{}{}
-<div class="settings-stack">
+<div class="settings-stack"{}>
 <section class="settings-card" aria-labelledby="plex-heading"><div class="section-heading"><div><h2 id="plex-heading">Plex account</h2><p class="section-description">Connect harbringer to Plex so compatible clients can discover and authenticate with this server.</p></div></div>{}<form method="post" action="/settings/server-name" class="settings-form server-name-form"><label class="field"><span>Server name</span><input name="server_name" type="text" value="{}" maxlength="64" required><small class="note">This is the name Plex clients see. It defaults to harbringer.</small></label><div><button class="button-secondary" type="submit">Save server name</button></div></form></section>
 <section class="settings-card" aria-labelledby="metadata-heading"><div class="section-heading"><div><h2 id="metadata-heading">Metadata storage</h2><p class="section-description">Choose one place for matched movie and TV metadata. Sidecars let another mplex server reuse matches and artwork without its database or a new TMDB lookup. SQLite still stores server identity, library configuration, and playback progress.</p></div></div><form method="post" action="/settings/preferences" class="settings-form"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="database" {}><span class="option-copy"><strong>SQLite database {}</strong><span class="note">Matched metadata stays in this server’s database.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="sidecar" {}><span class="option-copy"><strong>.mplex files in media folders {}</strong><span class="note">Artwork and metadata are written to <code>.mplex/cover.jpg</code>, <code>banner.jpg</code>, and <code>info.toml</code>.</span></span></label></div><label class="field"><span>TMDB bearer token</span><input name="tmdb_bearer_token" type="password" autocomplete="new-password" placeholder="Enter a token to save or replace it"></label>{}<div><button type="submit">Save metadata settings</button></div></form></section>
 <section class="settings-card" aria-labelledby="libraries-heading"><div class="section-heading"><div><h2 id="libraries-heading">Libraries</h2><p class="section-description">A library groups media of one type from one or more monitored folders. Add a folder to an existing library when the same collection spans multiple locations.</p></div></div><details class="add-library"><summary>Add a library</summary><form method="post" action="/settings/libraries" class="settings-form"><div class="form-grid"><label class="field"><span>Library name</span><input name="name" type="text" placeholder="e.g. Films" required></label><label class="field"><span>Content type</span><select name="kind"><option value="movie">Movies</option><option value="tv">TV Shows</option><option value="other">Other</option></select></label></div><div class="field"><span>Media folders</span><div class="path-list" id="new-library-paths"><div class="path-row"><label class="sr-only" for="new-path-0">Folder path</label><input id="new-path-0" name="path[]" type="text" placeholder="/path/to/folder" value="{}" required><a class="button-link button-secondary" href="/settings/browse">Browse</a><button type="button" class="button-quiet remove-path" aria-label="Remove folder path" title="Remove folder path" disabled>−</button></div></div></div><div class="action-row path-actions"><button type="button" class="button-secondary" id="add-path" aria-label="Add another folder path" title="Add another folder path">＋ Add folder</button><button type="submit">Create library</button></div></form></details>
 <div class="library-list">{}</div></section>
-</div>
+</div>{}
  </main></div><script>
 const shell = document.querySelector('.app-shell'); const toggle = document.querySelector('.sidebar-toggle');
 if (localStorage.getItem('mplex-sidebar-collapsed') === 'true') shell.classList.add('sidebar-collapsed');
@@ -2703,6 +2918,7 @@ document.querySelector('#add-path')?.addEventListener('click', () => {{ const in
         sidebar_nav_for_settings(&state),
         error,
         notice,
+        settings_stack_style,
         format!("<div class=\"section-content\">{}</div>", plex_auth),
         current_server_name,
         if metadata_enabled { "" } else { "checked" },
@@ -2711,7 +2927,8 @@ document.querySelector('#add-path')?.addEventListener('click', () => {{ const in
         if metadata_enabled { "(current)" } else { "" },
         tmdb_token_status,
         html(query.folder.as_deref().unwrap_or("")),
-        if list.is_empty() { "<p class=\"empty-state\">No libraries yet. Add a library to start organizing your media.</p>".to_owned() } else { list }
+        if list.is_empty() { "<p class=\"empty-state\">No libraries yet. Add a library to start organizing your media.</p>".to_owned() } else { list },
+        logs_content
     ))
     .into_response()
 }
@@ -2818,11 +3035,25 @@ async fn scan_library_metadata(
     let sidecar_mode = config.metadata_storage == "sidecar";
     let kind = if library.kind == "tv" { "tv" } else { "movie" };
     let mut matched = 0;
+    let indexed_ids = media_snapshot(&state)
+        .iter()
+        .map(|media| (media.path.clone(), media.id.clone()))
+        .collect::<HashMap<_, _>>();
     let forced = scan_query.force.unwrap_or(false);
+    info!(library = %library.name, forced, "metadata scan started");
     for folder in &library.folders {
-        let Ok(files) = scan_media(folder).await else {
-            continue;
+        let mut files = match scan_media(folder).await {
+            Ok(files) => files,
+            Err(error) => {
+                warn!(library = %library.name, folder = %folder.display(), error = %error, "metadata scan could not read a library folder");
+                continue;
+            }
         };
+        for media in &mut files {
+            if let Some(id) = indexed_ids.get(&media.path) {
+                media.id.clone_from(id);
+            }
+        }
         let mut groups = BTreeMap::<PathBuf, Vec<Media>>::new();
         for media in files {
             let group_path = metadata_group_path(folder, &media.path, kind);
@@ -2831,18 +3062,32 @@ async fn scan_library_metadata(
         for (group_path, group) in groups {
             let group_title = metadata_group_title(&group_path, folder);
             if !forced {
-                let media_key = format!("{}-{}", library_id + 1, group[0].id);
+                let media_key = database_media_key(library_id + 1, &group[0].id);
                 let selected = if sidecar_mode {
                     read_sidecar_metadata(&group_path)
                 } else {
                     read_database_metadata(&state, &media_key)
                 };
-                if selected
-                    .as_ref()
-                    .is_some_and(|metadata| metadata.get("id").is_some())
-                {
+                if let Some(metadata) = selected.filter(|metadata| metadata.get("id").is_some()) {
                     if sidecar_mode {
                         clear_group_database_metadata(&state, library_id, &group);
+                    } else {
+                        for media in &group {
+                            let key = database_media_key(library_id + 1, &media.id);
+                            let existing = read_database_metadata(&state, &key);
+                            if existing
+                                .as_ref()
+                                .is_some_and(|metadata| metadata.get("id").is_some())
+                            {
+                                continue;
+                            }
+                            let metadata =
+                                tv_metadata_for_media(&metadata, folder, &media.path, kind);
+                            if !write_database_metadata(&state, &key, &metadata) {
+                                warn!(library = %library.name, path = %media.path.display(), "existing match could not be applied to newly found media");
+                                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                            }
+                        }
                     }
                     matched += 1;
                     continue;
@@ -2886,7 +3131,7 @@ async fn scan_library_metadata(
                         for media in &group {
                             let metadata =
                                 tv_metadata_for_media(&metadata, folder, &media.path, kind);
-                            let key = format!("{}-{}", library_id + 1, media.id);
+                            let key = database_media_key(library_id + 1, &media.id);
                             if !write_database_metadata(&state, &key, &metadata) {
                                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                             }
@@ -2897,11 +3142,13 @@ async fn scan_library_metadata(
                 }
             }
             let Some(token) = token else {
+                warn!(library = %library.name, title = %group_title, "metadata matching skipped because no TMDB bearer token is configured");
                 return settings_error(
                     "Add a TMDB bearer token before matching media without stored metadata",
                 );
             };
             let title = metadata_search_title(&group_title);
+            info!(library = %library.name, title = %group_title, media_kind = kind, "TMDB metadata search started");
             let response = client
                 .get(format!("https://api.themoviedb.org/3/search/{}", kind))
                 .bearer_auth(token)
@@ -2912,23 +3159,49 @@ async fn scan_library_metadata(
                 ])
                 .send()
                 .await;
-            let Ok(response) = response else { continue };
-            let Ok(payload) = response.json::<serde_json::Value>().await else {
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    warn!(library = %library.name, title = %group_title, error = %error, "TMDB metadata search request failed");
+                    continue;
+                }
+            };
+            let status = response.status();
+            if !status.is_success() {
+                warn!(library = %library.name, title = %group_title, status = %status, "TMDB metadata search returned an error status");
+                continue;
+            }
+            let payload = match response.json::<serde_json::Value>().await {
+                Ok(payload) => payload,
+                Err(error) => {
+                    warn!(library = %library.name, title = %group_title, error = %error, "TMDB metadata response could not be parsed");
+                    continue;
+                }
+            };
+            let Some(results) = payload.get("results").and_then(serde_json::Value::as_array) else {
+                info!(library = %library.name, title = %group_title, search = %title, "TMDB metadata search returned no results");
                 continue;
             };
-            let Some(result) = payload
-                .get("results")
-                .and_then(|results| results.as_array())
-                .and_then(|results| results.first())
+            let Some((result, match_score)) = best_metadata_result(results, &group_title, kind)
             else {
+                info!(library = %library.name, title = %group_title, search = %title, result_count = results.len(), "TMDB results had no confident title match");
                 continue;
             };
+            info!(
+                library = %library.name,
+                title = %group_title,
+                match_score,
+                matched_title = ?result.get(if kind == "tv" { "name" } else { "title" }),
+                tmdb_id = ?result.get("id"),
+                poster_available = result.get("poster_path").and_then(serde_json::Value::as_str).is_some(),
+                "TMDB metadata matched"
+            );
             for media in &group {
                 let media_metadata = tv_metadata_for_media(result, folder, &media.path, kind);
                 if !sidecar_mode {
                     let metadata_json =
                         serde_json::to_string(&media_metadata).unwrap_or_else(|_| "{}".to_owned());
-                    let media_key = format!("{}-{}", library_id + 1, media.id);
+                    let media_key = database_media_key(library_id + 1, &media.id);
                     let database_ok = state
                         .db
                         .lock()
@@ -2963,8 +3236,8 @@ async fn scan_library_metadata(
                         "Could not write matched metadata to the media-folder sidecar",
                     );
                 }
-                let media_key = format!("{}-{}", library_id + 1, representative.id);
-                let _ = download_tmdb_artwork(
+                let media_key = database_media_key(library_id + 1, &representative.id);
+                if let Err(error) = download_tmdb_artwork(
                     &client,
                     token,
                     folder,
@@ -2973,7 +3246,10 @@ async fn scan_library_metadata(
                     result,
                     &state,
                 )
-                .await;
+                .await
+                {
+                    warn!(library = %library.name, title = %group_title, error = %error, "TMDB artwork download failed");
+                }
                 if kind == "tv" {
                     let mut seasons = BTreeMap::<PathBuf, (u32, String)>::new();
                     for media in &group {
@@ -2984,11 +3260,14 @@ async fn scan_library_metadata(
                             continue;
                         };
                         seasons.entry(season_path.to_path_buf()).or_insert_with(|| {
-                            (episode.season, format!("{}-{}", library_id + 1, media.id))
+                            (
+                                episode.season,
+                                database_media_key(library_id + 1, &media.id),
+                            )
                         });
                     }
                     for (season_path, (season, media_key)) in seasons {
-                        let _ = download_tmdb_season_artwork(
+                        if let Err(error) = download_tmdb_season_artwork(
                             &client,
                             token,
                             &season_path,
@@ -2997,15 +3276,309 @@ async fn scan_library_metadata(
                             &media_key,
                             &state,
                         )
-                        .await;
+                        .await
+                        {
+                            warn!(library = %library.name, title = %group_title, season, error = %error, "TMDB season artwork download failed");
+                        }
                     }
+                }
+            }
+            if !sidecar_mode {
+                let representative = &group[0];
+                let media_key = database_media_key(library_id + 1, &representative.id);
+                if let Err(error) = download_tmdb_artwork(
+                    &client,
+                    token,
+                    folder,
+                    &group_path,
+                    &media_key,
+                    result,
+                    &state,
+                )
+                .await
+                {
+                    warn!(library = %library.name, title = %group_title, error = %error, "TMDB artwork download failed");
                 }
             }
             matched += 1;
         }
     }
+    info!(library = %library.name, matched, "metadata scan finished");
     let suffix = if forced { "&metadata_forced=true" } else { "" };
     Redirect::to(&format!("/settings?metadata_matched={matched}{suffix}")).into_response()
+}
+
+fn tv_match_target(
+    state: &AppState,
+    library_index: usize,
+    relative_path: &str,
+) -> Result<(ConfigLibrary, PathBuf, PathBuf, String, Vec<Media>), String> {
+    let library = state
+        .config
+        .lock()
+        .map_err(|_| "Configuration is unavailable".to_owned())?
+        .libraries
+        .get(library_index)
+        .cloned()
+        .ok_or_else(|| "Library does not exist".to_owned())?;
+    if library.kind != "tv" {
+        return Err("Fix Match is only available for TV libraries".to_owned());
+    }
+    let relative = clean_relative_path(relative_path)
+        .filter(|path| path.components().count() == 1)
+        .ok_or_else(|| "Invalid TV show path".to_owned())?;
+    let (root, show_directory) = library
+        .folders
+        .iter()
+        .find_map(|root| {
+            let show_directory = root.join(&relative);
+            show_directory
+                .is_dir()
+                .then(|| (root.clone(), show_directory))
+        })
+        .ok_or_else(|| "TV show folder does not exist".to_owned())?;
+    let episodes = media_snapshot(state)
+        .iter()
+        .filter(|media| media.path.starts_with(&show_directory))
+        .cloned()
+        .collect::<Vec<_>>();
+    if episodes.is_empty() {
+        return Err("No indexed media found for this TV show".to_owned());
+    }
+    let title = show_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("TV Show")
+        .to_owned();
+    Ok((library, root, show_directory, title, episodes))
+}
+
+async fn tv_match_search(
+    State(state): State<AppState>,
+    Query(query): Query<TvMatchSearchQuery>,
+) -> Response {
+    let (library, _, _, title, _) = match tv_match_target(&state, query.library, &query.path) {
+        Ok(target) => target,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": error})),
+            )
+                .into_response()
+        }
+    };
+    let search = query.query.trim();
+    if search.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Enter a search title"})),
+        )
+            .into_response();
+    }
+    let token = state
+        .config
+        .lock()
+        .ok()
+        .and_then(|config| config.tmdb_bearer_token.clone())
+        .filter(|token| !token.trim().is_empty());
+    let Some(token) = token else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Add a TMDB bearer token in Settings first"})),
+        )
+            .into_response();
+    };
+    info!(library = %library.name, show = %title, query = search, "TV fix-match search started");
+    let response = match reqwest::Client::new()
+        .get("https://api.themoviedb.org/3/search/tv")
+        .bearer_auth(token)
+        .query(&[("query", search), ("language", "en-US")])
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(library = %library.name, show = %title, error = %error, "TV fix-match search request failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": "TMDB search request failed"})),
+            )
+                .into_response();
+        }
+    };
+    let status = response.status();
+    if !status.is_success() {
+        warn!(library = %library.name, show = %title, %status, "TV fix-match search returned an error status");
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("TMDB returned {status}")})),
+        )
+            .into_response();
+    }
+    let payload = match response.json::<serde_json::Value>().await {
+        Ok(payload) => payload,
+        Err(error) => {
+            warn!(library = %library.name, show = %title, error = %error, "TV fix-match search response was invalid");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": "TMDB search response was invalid"})),
+            )
+                .into_response();
+        }
+    };
+    let results = payload
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|result| {
+            let id = result.get("id")?.as_i64()?;
+            Some(serde_json::json!({
+                "id": id,
+                "title": result.get("name").and_then(serde_json::Value::as_str).unwrap_or("Untitled"),
+                "first_air_date": result.get("first_air_date").and_then(serde_json::Value::as_str).unwrap_or(""),
+                "overview": result.get("overview").and_then(serde_json::Value::as_str).unwrap_or(""),
+                "poster_path": result.get("poster_path").and_then(serde_json::Value::as_str),
+            }))
+        })
+        .take(20)
+        .collect::<Vec<_>>();
+    info!(library = %library.name, show = %title, result_count = results.len(), "TV fix-match search finished");
+    Json(serde_json::json!({"results": results})).into_response()
+}
+
+async fn tv_match_select(
+    State(state): State<AppState>,
+    Json(selection): Json<TvMatchSelection>,
+) -> Response {
+    let (library, root, show_directory, title, episodes) =
+        match tv_match_target(&state, selection.library, &selection.path) {
+            Ok(target) => target,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": error})),
+                )
+                    .into_response();
+            }
+        };
+    if selection.tmdb_id <= 0 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid TMDB result"})),
+        )
+            .into_response();
+    }
+    let config = match state.config.lock() {
+        Ok(config) => config.clone(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let Some(token) = config
+        .tmdb_bearer_token
+        .filter(|token| !token.trim().is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Add a TMDB bearer token in Settings first"})),
+        )
+            .into_response();
+    };
+    info!(library = %library.name, show = %title, tmdb_id = selection.tmdb_id, "TV fix-match selection started");
+    let response = match reqwest::Client::new()
+        .get(format!(
+            "https://api.themoviedb.org/3/tv/{}",
+            selection.tmdb_id
+        ))
+        .bearer_auth(&token)
+        .query(&[("language", "en-US")])
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(library = %library.name, show = %title, error = %error, "TV fix-match details request failed");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": "TMDB details request failed"})),
+            )
+                .into_response();
+        }
+    };
+    let status = response.status();
+    if !status.is_success() {
+        warn!(library = %library.name, show = %title, %status, "TV fix-match details returned an error status");
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("TMDB returned {status}")})),
+        )
+            .into_response();
+    }
+    let metadata = match response.json::<serde_json::Value>().await {
+        Ok(metadata)
+            if metadata.get("id").and_then(serde_json::Value::as_i64)
+                == Some(selection.tmdb_id) =>
+        {
+            metadata
+        }
+        Ok(_) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": "TMDB returned a different show"})),
+            )
+                .into_response()
+        }
+        Err(error) => {
+            warn!(library = %library.name, show = %title, error = %error, "TV fix-match details response was invalid");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": "TMDB details response was invalid"})),
+            )
+                .into_response();
+        }
+    };
+    if config.metadata_storage == "sidecar" {
+        if let Err(error) =
+            store_metadata_sidecar(&root, &show_directory, &title, &episodes[0], &metadata).await
+        {
+            warn!(library = %library.name, show = %title, error = %error, "TV fix-match metadata could not be saved");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        clear_group_database_metadata(&state, selection.library, &episodes);
+    } else {
+        for episode in &episodes {
+            let media_key = database_media_key(selection.library + 1, &episode.id);
+            let metadata = tv_metadata_for_media(&metadata, &root, &episode.path, "tv");
+            if !write_database_metadata(&state, &media_key, &metadata) {
+                warn!(library = %library.name, show = %title, media = %episode.path.display(), "TV fix-match metadata could not be saved");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
+    if let Err(error) = download_tmdb_artwork(
+        &reqwest::Client::new(),
+        &token,
+        &root,
+        &show_directory,
+        &database_media_key(selection.library + 1, &episodes[0].id),
+        &metadata,
+        &state,
+    )
+    .await
+    {
+        warn!(library = %library.name, show = %title, error = %error, "TV fix-match artwork download failed");
+    }
+    let artwork_directory = show_directory.join(".mplex");
+    for episode in &episodes {
+        let media_key = database_media_key(selection.library + 1, &episode.id);
+        for (kind, filename) in [("cover", "cover.jpg"), ("banner", "banner.jpg")] {
+            let artwork = artwork_directory.join(filename);
+            if artwork.is_file() {
+                record_artwork(&state.db, &media_key, kind, &artwork);
+            }
+        }
+    }
+    info!(library = %library.name, show = %title, tmdb_id = selection.tmdb_id, "TV fix-match selection saved");
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 async fn scan_media_metadata(
@@ -3072,7 +3645,7 @@ async fn scan_media_metadata(
     else {
         return settings_error("No metadata match was found");
     };
-    let media_key = format!("{}-{}", library_id + 1, media.id);
+    let media_key = database_media_key(library_id + 1, &media.id);
     let metadata_json = serde_json::to_string(result).unwrap_or_else(|_| "{}".to_owned());
     if !sidecar_mode {
         let database_ok = state
@@ -3158,6 +3731,15 @@ fn read_sidecar_metadata(group_path: &std::path::Path) -> Option<serde_json::Val
     parse_sidecar_metadata(&contents)
 }
 
+fn database_media_key(section_id: usize, media_id: &str) -> String {
+    let prefix = format!("{section_id}-");
+    if media_id.starts_with(&prefix) {
+        media_id.to_owned()
+    } else {
+        format!("{prefix}{media_id}")
+    }
+}
+
 fn read_database_metadata(state: &AppState, media_key: &str) -> Option<serde_json::Value> {
     let connection = state.db.lock().ok()?;
     let contents = connection
@@ -3192,7 +3774,7 @@ fn clear_group_database_metadata(state: &AppState, library_id: usize, group: &[M
         return;
     };
     for media in group {
-        let media_key = format!("{}-{}", library_id + 1, media.id);
+        let media_key = database_media_key(library_id + 1, &media.id);
         let _ = connection.execute(
             "UPDATE media SET metadata_json = NULL, matched_at = NULL WHERE media_key = ?1",
             [media_key],
@@ -3217,13 +3799,132 @@ fn metadata_group_title(group: &std::path::Path, root: &PathBuf) -> String {
 }
 
 fn metadata_search_title(title: &str) -> String {
-    title
+    let mut words = Vec::new();
+    let title = title
         .replace('.', " ")
         .replace('_', " ")
         .replace('-', " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+        .replace('(', " ")
+        .replace(')', " ")
+        .replace('[', " ")
+        .replace(']', " ");
+    for word in title.split_whitespace() {
+        let lower = word.to_ascii_lowercase();
+        let is_year = word.len() == 4
+            && word
+                .parse::<u16>()
+                .is_ok_and(|year| (1900..=2099).contains(&year));
+        let is_release_tag = matches!(
+            lower.as_str(),
+            "480p"
+                | "720p"
+                | "1080p"
+                | "2160p"
+                | "4k"
+                | "8k"
+                | "bluray"
+                | "brrip"
+                | "dvdrip"
+                | "hdrip"
+                | "hdtv"
+                | "webrip"
+                | "webdl"
+                | "web-dl"
+                | "x264"
+                | "x265"
+                | "h264"
+                | "h265"
+                | "hevc"
+                | "remux"
+        );
+        if is_release_tag || (is_year && !words.is_empty()) {
+            break;
+        }
+        words.push(word);
+    }
+    words.join(" ")
+}
+
+fn normalized_metadata_title(title: &str) -> String {
+    metadata_search_title(title)
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+        .collect()
+}
+
+fn metadata_title_year(title: &str) -> Option<&str> {
+    title
+        .split(|character: char| !character.is_ascii_digit())
+        .find(|part| {
+            part.len() == 4
+                && part
+                    .parse::<u16>()
+                    .is_ok_and(|year| (1900..=2099).contains(&year))
+        })
+}
+
+fn metadata_result_score(title: &str, result: &serde_json::Value, kind: &str) -> i32 {
+    let candidate = if kind == "tv" {
+        result.get("name").or_else(|| result.get("original_name"))
+    } else {
+        result.get("title").or_else(|| result.get("original_title"))
+    }
+    .and_then(serde_json::Value::as_str)
+    .unwrap_or_default();
+    let expected = normalized_metadata_title(title);
+    let actual = normalized_metadata_title(candidate);
+    if expected.is_empty() || actual.is_empty() {
+        return 0;
+    }
+    let mut score = if expected == actual {
+        100
+    } else if expected.contains(&actual) || actual.contains(&expected) {
+        70
+    } else {
+        let expected_words = metadata_search_title(title)
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>();
+        let actual_words = metadata_search_title(candidate)
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>();
+        let overlap = expected_words
+            .iter()
+            .filter(|word| actual_words.contains(word))
+            .count();
+        (60 * overlap / expected_words.len().max(1)) as i32
+    };
+    let expected_year = metadata_title_year(title);
+    let candidate_year = result
+        .get(if kind == "tv" {
+            "first_air_date"
+        } else {
+            "release_date"
+        })
+        .and_then(serde_json::Value::as_str)
+        .and_then(metadata_title_year);
+    if let Some(year) = expected_year {
+        score += if candidate_year == Some(year) {
+            15
+        } else {
+            -10
+        };
+    }
+    score
+}
+
+fn best_metadata_result<'a>(
+    results: &'a [serde_json::Value],
+    title: &str,
+    kind: &str,
+) -> Option<(&'a serde_json::Value, i32)> {
+    results
+        .iter()
+        .map(|result| (result, metadata_result_score(title, result, kind)))
+        .max_by_key(|(_, score)| *score)
+        .filter(|(_, score)| *score >= 40)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -3245,28 +3946,37 @@ fn tv_metadata_for_media(
     if kind != "tv" {
         return metadata.clone();
     }
-    let Some(episode) = tv_episode_info(root, media) else {
-        return metadata.clone();
-    };
     let mut enriched = metadata.clone();
-    if let Some(object) = enriched.as_object_mut() {
+    let Some(object) = enriched.as_object_mut() else {
+        return enriched;
+    };
+    for key in [
+        "mplex_season",
+        "mplex_episode",
+        "mplex_episode_end",
+        "mplex_episode_title",
+    ] {
+        object.remove(key);
+    }
+    let Some(episode) = tv_episode_info(root, media) else {
+        return enriched;
+    };
+    object.insert(
+        "mplex_season".to_owned(),
+        serde_json::Value::from(episode.season),
+    );
+    object.insert(
+        "mplex_episode".to_owned(),
+        serde_json::Value::from(episode.episode),
+    );
+    if let Some(end) = episode.episode_end {
+        object.insert("mplex_episode_end".to_owned(), serde_json::Value::from(end));
+    }
+    if let Some(title) = episode.episode_title {
         object.insert(
-            "mplex_season".to_owned(),
-            serde_json::Value::from(episode.season),
+            "mplex_episode_title".to_owned(),
+            serde_json::Value::from(title),
         );
-        object.insert(
-            "mplex_episode".to_owned(),
-            serde_json::Value::from(episode.episode),
-        );
-        if let Some(end) = episode.episode_end {
-            object.insert("mplex_episode_end".to_owned(), serde_json::Value::from(end));
-        }
-        if let Some(title) = episode.episode_title {
-            object.insert(
-                "mplex_episode_title".to_owned(),
-                serde_json::Value::from(title),
-            );
-        }
     }
     enriched
 }
@@ -4088,20 +4798,40 @@ async fn download_tmdb_artwork(
     tokio::fs::create_dir_all(&artwork).await?;
     for (kind, field) in [("cover", "poster_path"), ("banner", "backdrop_path")] {
         let Some(path) = metadata.get(field).and_then(|value| value.as_str()) else {
+            info!(artwork = kind, "TMDB match has no artwork path");
             continue;
         };
-        let response = client
+        info!(
+            artwork = kind,
+            image_path = path,
+            "TMDB artwork request started"
+        );
+        let response = match client
             .get(format!("https://image.tmdb.org/t/p/w780{}", path))
             .bearer_auth(token)
             .send()
-            .await?;
-        if !response.status().is_success() {
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(artwork = kind, error = %error, "TMDB artwork request failed");
+                return Err(Box::new(error));
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            warn!(artwork = kind, %status, "TMDB artwork request returned an error status");
             continue;
         }
         let bytes = response.bytes().await?;
         let local = artwork.join(format!("{kind}.jpg"));
         tokio::fs::write(&local, &bytes).await?;
         record_artwork(&state.db, media_key, kind, &local);
+        info!(
+            artwork = kind,
+            bytes = bytes.len(),
+            "TMDB artwork downloaded"
+        );
     }
     Ok(())
 }
@@ -4347,6 +5077,43 @@ async fn add_library_folder(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     Redirect::to("/settings").into_response()
+}
+
+async fn rename_library(
+    State(state): State<AppState>,
+    Path(library_id): Path<usize>,
+    RawForm(raw): RawForm,
+) -> Response {
+    let form = match serde_urlencoded::from_bytes::<RenameLibraryForm>(&raw) {
+        Ok(form) => form,
+        Err(_) => return settings_error("Invalid library name form"),
+    };
+    let name = form.name.trim();
+    if name.is_empty() {
+        return settings_error("Library name is required");
+    }
+    if name.chars().count() > 64 {
+        return settings_error("Library names must be 64 characters or fewer");
+    }
+    let Ok(mut config) = state.config.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if library_id >= config.libraries.len() {
+        return settings_error("Library does not exist");
+    }
+    if config
+        .libraries
+        .iter()
+        .enumerate()
+        .any(|(index, library)| index != library_id && library.name.eq_ignore_ascii_case(name))
+    {
+        return settings_error("A library with that name already exists");
+    }
+    config.libraries[library_id].name = name.to_owned();
+    if save_config(&state.config_path, &config).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    Redirect::to("/settings?library_renamed=true").into_response()
 }
 
 async fn update_library_display(
@@ -5341,6 +6108,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     .media-card-poster, .media-card-poster img {{ display: block; width: 100%; aspect-ratio: 2 / 3; }}
     .media-card-poster img {{ object-fit: cover; border-radius: .35rem; background: #111827; }}
     .media-card-placeholder {{ display: grid; width: 100%; height: 100%; place-items: center; border-radius: .35rem; color: #bfdbfe; background: linear-gradient(135deg, #1e3a8a, #312e81 55%, #111827); font-size: 2rem; }}
+    .media-card-placeholder {{ font-size: .9rem; padding: .7rem; text-align: center; overflow-wrap: anywhere; }}
     .media-card-info {{ display: grid; gap: .12rem; padding: .55rem 0 0; color: inherit; text-align: center; text-decoration: none; }}
     .media-card-title {{ display: block; height: 2.4em; overflow: hidden; margin: .25rem 0 .15rem; font-size: .8rem; font-weight: 500; line-height: 1.2; }}
     .media-card-tv .media-card-title {{ height: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
@@ -5371,6 +6139,16 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     .info-button {{ background: #374151; }}
     dialog {{ position: relative; max-width: min(760px, calc(100vw - 2rem)); width: 100%; color: #f9fafb; border: 1px solid #4b5563; border-radius: .75rem; background: #111827; }} dialog::backdrop {{ background: rgba(0,0,0,.7); }} dialog form {{ position: absolute; top: .75rem; right: .75rem; margin: 0; }} dialog form button {{ padding: .35rem .6rem; }} .info-grid {{ display: grid; gap: .45rem; max-height: 65vh; overflow: auto; }} .info-row {{ display: grid; grid-template-columns: minmax(140px, .4fr) 1fr; gap: .8rem; padding: .45rem 0; border-bottom: 1px solid #263244; }} .info-key {{ color: #9ca3af; }} .info-value {{ overflow-wrap: anywhere; }}
     .theatre-button {{ background: #4b5563; }}
+    #tv-fix-match-dialog {{ max-height: calc(100vh - 2rem); padding: 1.25rem; overflow: auto; }}
+    #tv-fix-match-dialog h2 {{ padding-right: 2.5rem; }}
+    .fix-match-close {{ position: absolute; top: .65rem; right: .65rem; min-width: 2.4rem; padding: .3rem .55rem; }}
+    .fix-match-search-row {{ display: flex; flex-wrap: wrap; gap: .5rem; margin: .9rem 0; }}
+    .fix-match-search-row input {{ flex: 1 1 16rem; min-width: 0; padding: .6rem .7rem; border: 1px solid #4b5563; border-radius: .4rem; color: #fff; background: #0b1220; font: inherit; }}
+    .fix-match-results {{ display: grid; gap: .65rem; }}
+    .fix-match-result {{ padding: .75rem; border: 1px solid #374151; border-radius: .5rem; background: #1f2937; }}
+    .fix-match-result p {{ margin: .35rem 0 .65rem; color: #cbd5e1; font-size: .85rem; line-height: 1.45; }}
+    .fix-match-status {{ min-height: 1.5rem; color: #cbd5e1; }}
+
     body.theatre-mode main {{ max-width: none; padding: 0; }}
     body.theatre-mode .library {{ display: block; }}
     body.theatre-mode article:not(.theatre-card), body.theatre-mode .breadcrumb, body.theatre-mode .folder-card {{ display: none; }}
@@ -5417,6 +6195,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     {}
     <section class="library">{}</section>
     <dialog id="info-modal"><form method="dialog"><button type="submit" aria-label="Close dialog" title="Close">×</button></form><h2>Technical media information</h2><div id="info-content" class="info-grid">Loading…</div></dialog>
+    <dialog id="tv-fix-match-dialog" aria-labelledby="tv-fix-match-heading"><button class="fix-match-close" type="button" aria-label="Close Fix Match dialog" title="Close">×</button><h2 id="tv-fix-match-heading">Fix TV Show Match</h2><p id="tv-fix-match-show" class="note"></p><div class="fix-match-search-row"><input id="tv-fix-match-query" type="search" aria-label="Search TV shows" autocomplete="off"><button id="tv-fix-match-search" type="button">Search</button></div><p id="tv-fix-match-status" class="fix-match-status" role="status" aria-live="polite"></p><div id="tv-fix-match-results" class="fix-match-results"></div></dialog>
     </main>
   </div>
   <script>
@@ -5433,7 +6212,10 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     if (!window.__mplexInfoEscapeBound) {{
       window.__mplexInfoEscapeBound = true;
       document.addEventListener("keydown", event => {{
-        if (event.key === "Escape") document.querySelector('#info-modal')?.close();
+        if (event.key === "Escape") {{
+          document.querySelector('#info-modal')?.close();
+          document.querySelector('#tv-fix-match-dialog')?.close();
+        }}
       }});
     }}
     function renderTechnicalInfo(value) {{
@@ -6661,7 +7443,7 @@ fn media_poster_card(
         })
         .unwrap_or_else(|| {
             format!(
-                r#"<div class="media-card-placeholder" role="img" aria-label="No poster for {}">▶</div>"#,
+                r#"<div class="media-card-placeholder" role="img" aria-label="Poster unavailable for {}">No poster available</div>"#,
                 html(title)
             )
         });
@@ -6686,8 +7468,21 @@ fn media_poster_card(
     let remove_action = format!(
         r#"<button type="button" data-watch-action="remove_from_continue" data-path="{path}" data-library="{library}" data-watch-scope="{watch_scope}" data-watch-key="{watch_key}">Remove from Continue Watching</button>"#
     );
+    let fix_match_action = if watch_scope == "show" {
+        let show_path = media_path
+            .components()
+            .next()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .unwrap_or_default();
+        format!(
+            "<button type=\"button\" data-fix-match data-library=\"{library}\" data-path=\"{}\">Fix Match</button>",
+            html(&show_path)
+        )
+    } else {
+        String::new()
+    };
     let card = format!(
-        r#"<div class="{}" style="{}" data-media-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}"><div class="media-card-artwork"><a class="media-card-poster" data-spa-link href="{}">{}</a><details class="media-card-menu"><summary aria-label="More options" title="More options">⋮</summary><div class="media-card-menu-items"><button type="button" data-watch-action="watched">Mark as watched</button><button type="button" data-watch-action="unwatched" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Mark as unwatched</button><button type="button" data-watch-action="remove_from_continue" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Remove from Continue Watching</button></div></details></div><a class="media-card-info" data-spa-link href="{}"{}><span class="media-card-title" title="{}"{}>{}</span>{}{}{}</a></div>"#,
+        r#"<div class="{}" style="{}" data-media-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}"><div class="media-card-artwork"><a class="media-card-poster" data-spa-link href="{}">{}</a><details class="media-card-menu"><summary aria-label="More options" title="More options">⋮</summary><div class="media-card-menu-items"><button type="button" data-watch-action="watched">Mark as watched</button><button type="button" data-watch-action="unwatched" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Mark as unwatched</button><button type="button" data-watch-action="remove_from_continue" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Remove from Continue Watching</button>{}</div></details></div><a class="media-card-info" data-spa-link href="{}"{}><span class="media-card-title" title="{}"{}>{}</span>{}{}{}</a></div>"#,
         card_class,
         card_style,
         path,
@@ -6704,6 +7499,7 @@ fn media_poster_card(
         library,
         watch_scope,
         watch_key,
+        fix_match_action,
         html(href),
         card_info_style,
         html(title),
@@ -6753,9 +7549,104 @@ fn media_card_progress(metadata: &serde_json::Value) -> f64 {
 }
 
 fn media_card_action_script() -> &'static str {
-    r#"<script>
+    r##"<script>
 if (!window.__mplexCardActionsBound) {
 window.__mplexCardActionsBound = true;
+document.addEventListener("error", event => {
+  const image = event.target;
+  if (!(image instanceof HTMLImageElement) || !image.matches(".media-card-poster img")) return;
+  const placeholder = document.createElement("div");
+  const title = image.alt.replace(/^Poster for /, "");
+  placeholder.className = "media-card-placeholder";
+  placeholder.setAttribute("role", "img");
+  placeholder.setAttribute("aria-label", `Poster unavailable for ${title}`);
+  placeholder.textContent = "No poster available";
+  image.replaceWith(placeholder);
+}, true);
+const fixMatchDialog = document.querySelector("#tv-fix-match-dialog");
+const fixMatchQuery = document.querySelector("#tv-fix-match-query");
+const fixMatchSearchButton = document.querySelector("#tv-fix-match-search");
+const fixMatchStatus = document.querySelector("#tv-fix-match-status");
+const fixMatchResults = document.querySelector("#tv-fix-match-results");
+const searchTvMatches = async () => {
+  fixMatchResults.replaceChildren();
+  const query = fixMatchQuery.value.trim();
+  if (!query) {
+    fixMatchStatus.textContent = "Enter a show title to search.";
+    return;
+  }
+  fixMatchStatus.textContent = "Searching TMDB…";
+  fixMatchSearchButton.disabled = true;
+  try {
+    const params = new URLSearchParams({
+      library: fixMatchDialog.dataset.library,
+      path: fixMatchDialog.dataset.path,
+      query
+    });
+    const response = await fetch(`/web/tv-match/search?${params}`, { cache: "no-store" });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "TMDB search failed.");
+    if (!payload.results.length) {
+      fixMatchStatus.textContent = "No shows found. Try another search.";
+      return;
+    }
+    fixMatchStatus.textContent = `${payload.results.length} results. Select the correct show.`;
+    payload.results.forEach(result => {
+      const item = document.createElement("div");
+      item.className = "fix-match-result";
+      const heading = document.createElement("h3");
+      const year = result.first_air_date ? ` (${result.first_air_date.slice(0, 4)})` : "";
+      heading.textContent = `${result.title}${year}`;
+      const overview = document.createElement("p");
+      overview.textContent = result.overview || "No summary available.";
+      const select = document.createElement("button");
+      select.type = "button";
+      select.dataset.matchId = String(result.id);
+      select.textContent = "Use this match";
+      item.append(heading, overview, select);
+      fixMatchResults.append(item);
+    });
+  } catch (error) {
+    fixMatchStatus.textContent = error.message || "TMDB search failed.";
+  } finally {
+    fixMatchSearchButton.disabled = false;
+  }
+};
+fixMatchSearchButton.addEventListener("click", searchTvMatches);
+fixMatchQuery.addEventListener("keydown", event => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    searchTvMatches();
+  }
+});
+fixMatchResults.addEventListener("click", async event => {
+  const select = event.target.closest("[data-match-id]");
+  if (!select || select.disabled) return;
+  select.disabled = true;
+  fixMatchStatus.textContent = "Saving match and artwork…";
+  try {
+    const response = await fetch("/web/tv-match/select", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        library: Number(fixMatchDialog.dataset.library),
+        path: fixMatchDialog.dataset.path,
+        tmdb_id: Number(select.dataset.matchId)
+      })
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Could not save this match.");
+    fixMatchDialog.close();
+    window.location.reload();
+  } catch (error) {
+    select.disabled = false;
+    fixMatchStatus.textContent = error.message || "Could not save this match.";
+  }
+});
+document.querySelector(".fix-match-close")?.addEventListener("click", () => fixMatchDialog.close());
+fixMatchDialog.addEventListener("click", event => {
+  if (event.target === fixMatchDialog) fixMatchDialog.close();
+});
 document.addEventListener("click", async event => {
   const menu = event.target.closest(".media-card-menu");
   if (menu && event.target.closest("summary")) {
@@ -6766,6 +7657,22 @@ document.addEventListener("click", async event => {
     document.querySelectorAll(".media-card-menu[open]").forEach(openMenu => openMenu.removeAttribute("open"));
   }
   const button = event.target.closest("[data-watch-action]");
+  const fixMatchButton = event.target.closest("[data-fix-match]");
+  if (fixMatchButton) {
+    event.preventDefault();
+    document.querySelectorAll(".media-card-menu[open]").forEach(openMenu => openMenu.removeAttribute("open"));
+    const card = fixMatchButton.closest(".media-card");
+    const title = card?.querySelector(".media-card-title")?.textContent.trim() || "TV Show";
+    fixMatchDialog.dataset.library = fixMatchButton.dataset.library;
+    fixMatchDialog.dataset.path = fixMatchButton.dataset.path;
+    document.querySelector("#tv-fix-match-show").textContent = `Search for the correct match for ${title}.`;
+    fixMatchQuery.value = title;
+    fixMatchStatus.textContent = "";
+    fixMatchResults.replaceChildren();
+    fixMatchDialog.showModal();
+    searchTvMatches();
+    return;
+  }
   if (!button || button.disabled) return;
   event.preventDefault();
   button.disabled = true;
@@ -6832,7 +7739,7 @@ document.addEventListener("click", async event => {
   }
 });
 }
-</script>"#
+</script>"##
 }
 
 fn spa_navigation_script() -> &'static str {
@@ -11564,7 +12471,7 @@ async fn plex_artwork(state: &AppState, id: &str, filename: &str) -> Response {
         );
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((_, library)) = media_library(state, &media) else {
+    let Some((library_id, library)) = media_library(state, &media) else {
         info!(
             media_id = id,
             artwork = filename,
@@ -11604,6 +12511,32 @@ async fn plex_artwork(state: &AppState, id: &str, filename: &str) -> Response {
         };
         for artwork in artwork_paths {
             if let Ok(bytes) = tokio::fs::read(artwork).await {
+                return (
+                    [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
+                    bytes,
+                )
+                    .into_response();
+            }
+        }
+    }
+    if !sidecar_mode {
+        let kind = match filename {
+            "cover.jpg" => "cover",
+            "banner.jpg" => "banner",
+            _ => return StatusCode::NOT_FOUND.into_response(),
+        };
+        let media_key = database_media_key(library_id, &media.id);
+        let artwork_path = state.db.lock().ok().and_then(|connection| {
+            connection
+                .query_row(
+                    "SELECT local_path FROM artwork WHERE media_key = ?1 AND kind = ?2",
+                    (&media_key, kind),
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+        });
+        if let Some(artwork_path) = artwork_path {
+            if let Ok(bytes) = tokio::fs::read(artwork_path).await {
                 return (
                     [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
                     bytes,

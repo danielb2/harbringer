@@ -326,6 +326,70 @@ fn html_escapes_titles() {
 }
 
 #[test]
+fn metadata_search_title_removes_years_and_release_tags() {
+    assert_eq!(
+        super::metadata_search_title("The.Matrix.1999.1080p.BluRay.x264-GROUP"),
+        "The Matrix"
+    );
+    assert_eq!(
+        super::metadata_search_title("Stranger_Things_(2016)"),
+        "Stranger Things"
+    );
+}
+
+#[test]
+fn metadata_matching_prefers_exact_title_and_year() {
+    let results = vec![
+        serde_json::json!({"id": 11, "title": "The Thing", "release_date": "2011-06-01"}),
+        serde_json::json!({"id": 22, "title": "The Thing", "release_date": "1982-06-25"}),
+        serde_json::json!({"id": 33, "title": "Another Film", "release_date": "1982-01-01"}),
+    ];
+    let (selected, score) = super::best_metadata_result(&results, "The Thing (1982)", "movie")
+        .expect("a confident title match should be found");
+    assert_eq!(selected["id"], 22);
+    assert!(score > 100);
+    assert!(super::best_metadata_result(&results, "Unknown Film", "movie").is_none());
+}
+
+#[test]
+fn tv_metadata_matching_replaces_stale_episode_fields() {
+    let root = std::path::PathBuf::from("/library");
+    let media = root.join("Example Show/Season 01/Example.Show.S01E03.New.mkv");
+    let metadata = serde_json::json!({
+        "id": 7,
+        "mplex_season": 9,
+        "mplex_episode": 99,
+        "mplex_episode_end": 100,
+        "mplex_episode_title": "Stale title"
+    });
+    let enriched = super::tv_metadata_for_media(&metadata, &root, &media, "tv");
+    assert_eq!(enriched["mplex_season"], 1);
+    assert_eq!(enriched["mplex_episode"], 3);
+    assert_eq!(enriched["mplex_episode_title"], "New");
+}
+
+#[test]
+fn missing_poster_markup_uses_a_readable_fallback() {
+    let card = super::media_poster_card(
+        None,
+        "/web?library=0",
+        "Missing Artwork",
+        None,
+        None,
+        0.0,
+        std::path::Path::new("Missing Show/Episode.mkv"),
+        0,
+        true,
+        "show",
+        false,
+    );
+    assert!(card.contains("No poster available"));
+    assert!(card.contains("Poster unavailable for Missing Artwork"));
+    assert!(!card.contains("<img"));
+    assert!(super::media_card_action_script().contains("image.replaceWith(placeholder)"));
+}
+
+#[test]
 fn database_metadata_renders_movie_and_episode_information() {
     let movie = serde_json::json!({
         "title": "A <Film>",

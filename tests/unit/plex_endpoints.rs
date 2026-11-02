@@ -70,6 +70,7 @@ static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
 
 struct Fixture {
     app: Router,
+    state: AppState,
     config: Arc<Mutex<Config>>,
     db: Arc<Mutex<rusqlite::Connection>>,
     root: PathBuf,
@@ -155,7 +156,8 @@ fn fixture() -> Fixture {
         plex_tls: PlexTls::load(root.join("config/certs")).unwrap(),
     };
     Fixture {
-        app: build_app(state),
+        app: build_app(state.clone()),
+        state,
         config: shared_config,
         db: shared_db,
         root,
@@ -235,7 +237,8 @@ fn tv_fixture() -> Fixture {
         plex_tls: PlexTls::load(root.join("config/certs")).unwrap(),
     };
     Fixture {
-        app: build_app(state),
+        app: build_app(state.clone()),
+        state,
         config: shared_config,
         db: shared_db,
         root,
@@ -252,6 +255,25 @@ async fn send(app: &Router, method: Method, uri: &str, body: Body) -> axum::resp
                 .method(method)
                 .uri(uri)
                 .body(body)
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn send_form(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    body: &str,
+) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body.to_owned()))
                 .unwrap(),
         )
         .await
@@ -319,13 +341,136 @@ async fn settings_indicates_saved_tmdb_token_without_disclosing_it() {
 }
 
 #[tokio::test]
+async fn settings_logs_tab_displays_recent_events() {
+    let fixture = fixture();
+    super::push_log_line("event=http_request method=GET path=/settings".to_owned());
+    super::push_log_line("event=tmdb \x1b[31msearch\x1b[0m finished".to_owned());
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/settings?tab=logs",
+        Body::empty(),
+    )
+    .await;
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("<h2 id=\"logs-heading\">Logs</h2>"));
+    assert!(body.contains("<div class=\"settings-stack\" style=\"display:none\">"));
+    assert!(body.contains("event=http_request method=GET path=/settings"));
+    assert!(body.contains("event=tmdb search finished"));
+    assert!(!body.contains('\u{1b}'));
+    assert!(body.contains("class=\"active\" href=\"/settings?tab=logs\""));
+}
+
+#[tokio::test]
+async fn settings_can_rename_a_library() {
+    let fixture = fixture();
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/libraries/0/rename",
+        "name=My+Films",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(response.headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .contains("library_renamed=true"));
+    assert_eq!(fixture.config.lock().unwrap().libraries[0].name, "My Films");
+    let saved_config = std::fs::read_to_string(fixture.root.join("config/config.toml")).unwrap();
+    assert!(saved_config.contains("My Films"));
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/settings?library_renamed=true",
+        Body::empty(),
+    )
+    .await;
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("Library name saved."));
+    assert!(body.contains("value=\"My Films\" maxlength=\"64\""));
+    assert!(body.contains("action=\"/settings/libraries/0/rename\""));
+}
+
+#[tokio::test]
+async fn library_rename_rejects_blank_names_and_unknown_libraries() {
+    let fixture = fixture();
+    for (path, body) in [
+        ("/settings/libraries/0/rename", "name=%20%20"),
+        ("/settings/libraries/9/rename", "name=Unknown"),
+    ] {
+        let response = send_form(&fixture.app, Method::POST, path, body).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    }
+
+    let mut duplicate = fixture.config.lock().unwrap().libraries[0].clone();
+    duplicate.name = "Archive".to_owned();
+    fixture.config.lock().unwrap().libraries.push(duplicate);
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/libraries/0/rename",
+        "name=archive",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(fixture.config.lock().unwrap().libraries[0].name, "Movies");
+}
+
+#[tokio::test]
+async fn plex_artwork_serves_database_stored_cover() {
+    let fixture = fixture();
+    fixture.config.lock().unwrap().metadata_storage = "database".to_owned();
+    let artwork_path = fixture.root.join("saved-cover.jpg");
+    std::fs::write(&artwork_path, b"poster bytes").unwrap();
+    fixture
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT OR REPLACE INTO artwork (media_key, kind, local_path, downloaded_at) VALUES (?1, ?2, ?3, strftime('%s', 'now'))",
+            (
+                "1-1",
+                "cover",
+                artwork_path.to_string_lossy().as_ref(),
+            ),
+        )
+        .unwrap();
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/library/metadata/1-1/thumb",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.as_ref(), b"poster bytes");
+}
+
+#[tokio::test]
 async fn settings_saves_and_validates_per_library_scan_schedule() {
     let fixture = fixture();
     let page = send(&fixture.app, Method::GET, "/settings", Body::empty()).await;
     let page = to_bytes(page.into_body(), usize::MAX).await.unwrap();
     let page = String::from_utf8(page.to_vec()).unwrap();
+    assert!(page.contains("<div class=\"settings-stack\">"));
+    assert!(page.contains("<div class=\"section-content\">"));
+    assert!(!page.contains("class=\"settings-stack\" style=\"<div"));
     assert!(page.contains("name=\"scan_interval_value\" min=\"1\" value=\"5\""));
     assert!(page.contains("<option value=\"minutes\" selected>minutes</option>"));
+    let library_start = page.find("<details class=\"library-card\">").unwrap();
+    let scan_settings = page.find("<form class=\"library-scan-settings\"").unwrap();
+    let library_end = page[library_start..]
+        .find("</div></div></details>")
+        .unwrap()
+        + library_start;
+    assert!(library_start < scan_settings && scan_settings < library_end);
+    assert!(!page.contains("class=\"library-card library-scan-settings\""));
 
     let saved = fixture
         .app
@@ -519,6 +664,59 @@ async fn manual_scan_adds_new_tv_episode_to_plex_inventory() {
     let shows = json["MediaContainer"]["Metadata"].as_array().unwrap();
     assert_eq!(shows.len(), 1);
     assert_eq!(shows[0]["leafCount"], 3);
+}
+
+#[tokio::test]
+async fn new_tv_episode_inherits_database_show_match_automatically() {
+    let fixture = tv_fixture();
+    fixture.config.lock().unwrap().metadata_storage = "database".to_owned();
+    {
+        let mut inventory = fixture.state.media.write().unwrap();
+        let mut media = inventory.as_ref().clone();
+        for (index, item) in media.iter_mut().enumerate() {
+            item.id = format!("1-{}", index + 1);
+        }
+        *inventory = Arc::new(media);
+    }
+    super::scan_library_inventory(&fixture.state, 0)
+        .await
+        .unwrap();
+
+    let initial = super::media_snapshot(&fixture.state);
+    let first_episode = initial
+        .iter()
+        .find(|media| media.path.ends_with("Example.Show.S01E01.Pilot.mkv"))
+        .unwrap();
+    let show_metadata = serde_json::json!({
+        "id": 4242,
+        "name": "Example Show",
+        "overview": "Matched show"
+    });
+    let first_key = first_episode.id.clone();
+    assert!(super::write_database_metadata(
+        &fixture.state,
+        &first_key,
+        &show_metadata
+    ));
+
+    let new_path = fixture
+        .root
+        .join("media/Example Show/Season 01/Example.Show.S01E03.Added.mkv");
+    std::fs::write(&new_path, b"new episode").unwrap();
+    super::scan_library_inventory(&fixture.state, 0)
+        .await
+        .unwrap();
+
+    let new_episode = super::media_snapshot(&fixture.state)
+        .iter()
+        .find(|media| media.path == new_path)
+        .unwrap()
+        .clone();
+    let new_metadata = super::read_database_metadata(&fixture.state, &new_episode.id).unwrap();
+    assert_eq!(new_metadata["id"], 4242);
+    assert_eq!(new_metadata["mplex_season"], 1);
+    assert_eq!(new_metadata["mplex_episode"], 3);
+    assert_eq!(new_metadata["mplex_episode_title"], "Added");
 }
 
 #[tokio::test]
@@ -1240,7 +1438,7 @@ async fn tv_season_navigation_renders_episode_poster_cards() {
         "href=\"/?library=0&amp;path=Example%20Show%2FSeason%2001&amp;episode=Example%20Show%2FSeason%2001%2FExample.Show.S01E01.Pilot.mkv\""
     ));
     assert!(body.contains(
-        "class=\"media-card-placeholder\" role=\"img\" aria-label=\"No poster for New\""
+        "class=\"media-card-placeholder\" role=\"img\" aria-label=\"Poster unavailable for New\">No poster available"
     ));
     assert!(!body.contains("tv-episode-card"));
 }
@@ -1264,6 +1462,29 @@ async fn tv_show_cards_display_the_season_count() {
 
     assert!(body.contains("class=\"media-card-subtitle\">1 season</span>"));
     assert!(!body.contains("class=\"metadata-panel\""));
+    assert!(body.contains(
+        "data-fix-match data-library=\"0\" data-path=\"Example Show\">Fix Match</button>"
+    ));
+    assert!(body.contains("id=\"tv-fix-match-dialog\""));
+    assert!(body.contains("aria-label=\"Search TV shows\""));
+    assert!(body.contains("aria-label=\"Close Fix Match dialog\" title=\"Close\""));
+    assert!(body.contains("/web/tv-match/search"));
+}
+
+#[tokio::test]
+async fn tv_fix_match_rejects_invalid_show_paths_without_calling_tmdb() {
+    let fixture = tv_fixture();
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/web/tv-match/search?library=0&path=..%2Foutside&query=Example",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("Invalid TV show path"));
 }
 
 #[tokio::test]
