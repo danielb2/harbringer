@@ -41,6 +41,8 @@ Open `http://<server>:32400/` for the built-in web client. Each library has a **
 
 mplex advertises `transcoderVideo` and serves a DASH MPD for supported H.264 Matroska media with optional AAC audio. HLS and other video codecs are not supported. Plex Desktop playback works; Plex Web DASH playback remains under validation. See [`ROADMAP.md`](ROADMAP.md).
 
+TV show overviews show the series cover beside its description and include available genres and content ratings. They hide the representative episode's file path and season/episode numbers.
+
 The web client uses the homepage as its only browsing page. Its collapsible rail lists Home, each library, and Settings. TV libraries group shows by series, then open seasons and episode cards. Home includes Continue Watching, Recently Added, and library cards. Card actions mark items watched or unwatched. **Remove from Continue Watching** appears only on cards in that section. Settings lets you create and delete libraries, add folders, and set each library's automatic scan state and interval in seconds, minutes, or hours. New folders and media files enter the shared inventory during a manual or automatic filesystem scan. **Scan metadata** remains a separate TMDB matching action. The folder picker browses server directories. Web playback offers Resume and Play from beginning actions and stores progress while playing or paused.
 
 ## Connect Plezy

@@ -124,6 +124,7 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 - Settings now supports reconnecting an already connected Plex account without first disconnecting.
 - Added Plex `thumb` and `art` routes for media entries with cached sidecar artwork; broader artwork coverage and client validation remain outstanding.
 - Implemented the TV browsing hierarchy: show overview, season cards with compact episode-count badges, season artwork/descriptions, episode poster cards with per-episode watch controls, and episode detail views with descriptions.
+- TV show overviews now show the series cover beside its description, display available genres and content ratings, and omit representative episode paths and episode numbers; official-client parity still needs validation.
 - Added Plex-style TV naming support for `Season 01`, `season.01`, `Specials`, `s01e01`, and multi-episode markers such as `s02e18-e19`.
 - Added TMDB season artwork and season metadata caching under each season’s `.mplex` directory.
 - Added movie/show/TV metadata matching, sidecar metadata storage, artwork download, per-media rematching, force rescans, and ffprobe technical metadata caching.

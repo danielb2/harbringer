@@ -1,8 +1,8 @@
 # Changelog
 
 ## Unreleased
-- Hide filesystem paths from TV show overview details.
-- Reflection: show overview sidecar details exposed the `media_path` field as an episode-file location. Filter that field in the shared detail renderer and add a regression test with the reported ThunderCats path. Formatting and tests could not run because shell startup tried to write Fish state outside the sandbox.
+- Improve TV show overviews with cover art, genres, and content ratings; hide representative episode paths and episode numbers.
+- Reflection: show sidecars reused metadata from the first episode, so the generic details made the show overview look like an episode view. Render a show-level summary and suppress those episode fields, while preserving next-episode metadata. Fetch and cache missing TMDB show details during matching/scans. `cargo fmt --check`, `cargo test` (84 passed), `cargo build`, and `git diff --check` passed.
 
 
 - Add a limited pure-Rust DASH remux path and restore Plex video-transcoder capability advertisement.

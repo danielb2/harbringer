@@ -3068,7 +3068,50 @@ async fn scan_library_metadata(
                 } else {
                     read_database_metadata(&state, &media_key)
                 };
-                if let Some(metadata) = selected.filter(|metadata| metadata.get("id").is_some()) {
+                if let Some(mut metadata) = selected.filter(|metadata| metadata.get("id").is_some())
+                {
+                    if kind == "tv"
+                        && (metadata.get("genres").is_none()
+                            || metadata.get("content_ratings").is_none())
+                    {
+                        if let Some(token) = token {
+                            if let Some(details) =
+                                tmdb_tv_show_details(&client, token, &metadata).await
+                            {
+                                metadata = merge_tv_show_details(&metadata, &details);
+                                if sidecar_mode {
+                                    if store_metadata_sidecar(
+                                        folder,
+                                        &group_path,
+                                        &group_title,
+                                        &group[0],
+                                        &metadata,
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        return settings_error(
+                                            "Could not update TV show details in the media-folder sidecar",
+                                        );
+                                    }
+                                } else {
+                                    for media in &group {
+                                        let metadata = tv_metadata_for_media(
+                                            &metadata,
+                                            folder,
+                                            &media.path,
+                                            kind,
+                                        );
+                                        let key = database_media_key(library_id + 1, &media.id);
+                                        if !write_database_metadata(&state, &key, &metadata) {
+                                            return StatusCode::INTERNAL_SERVER_ERROR
+                                                .into_response();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if sidecar_mode {
                         clear_group_database_metadata(&state, library_id, &group);
                     } else {
@@ -3187,6 +3230,16 @@ async fn scan_library_metadata(
                 info!(library = %library.name, title = %group_title, search = %title, result_count = results.len(), "TMDB results had no confident title match");
                 continue;
             };
+            let full_result = if kind == "tv" {
+                if let Some(details) = tmdb_tv_show_details(&client, token, result).await {
+                    merge_tv_show_details(result, &details)
+                } else {
+                    result.clone()
+                }
+            } else {
+                result.clone()
+            };
+            let result = &full_result;
             info!(
                 library = %library.name,
                 title = %group_title,
@@ -3935,6 +3988,39 @@ struct TvEpisodeInfo {
     episode_end: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     episode_title: Option<String>,
+}
+
+async fn tmdb_tv_show_details(
+    client: &reqwest::Client,
+    token: &str,
+    metadata: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let id = metadata.get("id")?.as_u64()?;
+    let response = client
+        .get(format!("https://api.themoviedb.org/3/tv/{id}"))
+        .bearer_auth(token)
+        .query(&[
+            ("language", "en-US"),
+            ("append_to_response", "content_ratings"),
+        ])
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json().await.ok()
+}
+
+fn merge_tv_show_details(
+    metadata: &serde_json::Value,
+    details: &serde_json::Value,
+) -> serde_json::Value {
+    let mut metadata = metadata.clone();
+    if let (Some(target), Some(details)) = (metadata.as_object_mut(), details.as_object()) {
+        target.extend(details.clone());
+    }
+    metadata
 }
 
 fn tv_metadata_for_media(
@@ -5664,6 +5750,9 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             .and_then(|name| name.to_str())
             .and_then(parse_tv_season_directory)
             .is_some();
+    let tv_show_view = library_kind.as_deref() == Some("tv")
+        && relative.components().count() == 1
+        && !tv_season_view;
 
     let info_panel = if let Some(selected_relative) = selected_relative.as_deref() {
         if tv_episode_info(&library_root, &library_root.join(selected_relative)).is_some() {
@@ -5685,11 +5774,22 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             media_info_panel(
                 selected_path.parent().unwrap_or(&library_root),
                 database_metadata.as_ref(),
+                false,
+                None,
             )
             .await
         }
     } else if sidecar_mode || tv_season_view {
-        media_info_panel(&directory, None).await
+        let cover_url = if tv_show_view
+            && tokio::fs::metadata(directory.join(".mplex/cover.jpg"))
+                .await
+                .is_ok()
+        {
+            Some(artwork_url(&relative, query.library, "cover"))
+        } else {
+            None
+        };
+        media_info_panel(&directory, None, tv_show_view, cover_url.as_deref()).await
     } else {
         String::new()
     };
@@ -6163,6 +6263,10 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     .breadcrumb-separator {{ color: #6b7280; }}
     .metadata-panel {{ grid-column: 1 / -1; padding: 1rem 1.2rem; border: 1px solid #374151; border-radius: .75rem; background: rgba(17,24,39,.62); backdrop-filter: blur(8px); }}
     .metadata-panel h2 {{ margin: 0 0 .45rem; }} .metadata-description {{ max-width: 75ch; color: #d1d5db; line-height: 1.5; }} .metadata-details {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: .6rem 1.2rem; margin-top: .8rem; }} .metadata-detail strong {{ display: block; color: #9ca3af; font-size: .75rem; text-transform: uppercase; }}
+    .show-overview-summary {{ display: flex; align-items: flex-start; gap: 1rem; }}
+    .show-overview-cover {{ width: 120px; max-height: 180px; object-fit: cover; border-radius: .5rem; box-shadow: 0 3px 12px #0008; }}
+    .show-overview-summary > div {{ min-width: 0; }}
+    @media (max-width: 600px) {{ .show-overview-summary {{ gap: .75rem; }} .show-overview-cover {{ width: 88px; }} }}
     .folder-card {{ display: block; width: 100%; overflow: hidden; color: inherit; text-decoration: none; border: 1px solid #374151; border-radius: .75rem; background: #1f2937; transition: border-color .15s, transform .15s; }}
     .folder-card:hover {{ border-color: #60a5fa; transform: translateY(-2px); }}
     .folder-preview {{ position: relative; display: grid; place-items: center; overflow: hidden; aspect-ratio: 2 / 3; color: #bfdbfe; font-size: 3rem; background: linear-gradient(135deg, #1e3a8a, #312e81 55%, #111827); }}
@@ -6623,6 +6727,8 @@ async fn web_subtitle(State(s): State<AppState>, Query(query): Query<WebPath>) -
 async fn media_info_panel(
     directory: &std::path::Path,
     database_metadata: Option<&serde_json::Value>,
+    hide_episode_fields: bool,
+    cover_artwork: Option<&str>,
 ) -> String {
     if let Ok(contents) = tokio::fs::read_to_string(directory.join(".mplex/info.toml")).await {
         if let Ok(value) = contents.parse::<toml::Value>() {
@@ -6636,14 +6742,40 @@ async fn media_info_panel(
                 .filter(|value| !value.is_empty())
                 .map(|value| format!(r#"<p class="metadata-description">{}</p>"#, html(value)))
                 .unwrap_or_default();
-            let details = value
+            let overview = if hide_episode_fields {
+                let artwork = cover_artwork
+                    .map(|url| {
+                        format!(
+                            r#"<img class="show-overview-cover" src="{}" alt="Cover for {}">"#,
+                            html(url),
+                            html(title)
+                        )
+                    })
+                    .unwrap_or_default();
+                format!(
+                    r#"<div class="show-overview-summary">{}<div>{}</div></div>"#,
+                    artwork, description
+                )
+            } else {
+                description
+            };
+            let mut details = value
                 .as_table()
-                .map(render_toml_details)
+                .map(|table| render_toml_details(table, hide_episode_fields))
                 .unwrap_or_default();
+            if hide_episode_fields {
+                if let Some(metadata) = value
+                    .get("metadata_json")
+                    .and_then(toml::Value::as_str)
+                    .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+                {
+                    details.push_str(&render_tv_show_metadata_details(&metadata));
+                }
+            }
             return format!(
                 r#"<section class="metadata-panel"><h2>{}</h2>{}<div class="metadata-details">{}</div></section>"#,
                 html(title),
-                description,
+                overview,
                 details
             );
         }
@@ -6651,6 +6783,57 @@ async fn media_info_panel(
     database_metadata
         .map(|metadata| render_database_info_panel(metadata, None))
         .unwrap_or_default()
+}
+
+fn render_tv_show_metadata_details(metadata: &serde_json::Value) -> String {
+    let mut details = Vec::new();
+    if let Some(genres) = metadata
+        .get("genres")
+        .and_then(serde_json::Value::as_array)
+        .map(|genres| {
+            genres
+                .iter()
+                .filter_map(|genre| {
+                    genre
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .or_else(|| genre.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|genres| !genres.is_empty())
+    {
+        details.push(("genres", genres));
+    }
+    let content_rating = metadata
+        .get("content_ratings")
+        .and_then(|ratings| ratings.get("results"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|ratings| {
+            ratings
+                .iter()
+                .find(|rating| {
+                    rating.get("iso_3166_1").and_then(serde_json::Value::as_str) == Some("US")
+                })
+                .or_else(|| ratings.first())
+        })
+        .and_then(|rating| rating.get("rating"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|rating| !rating.is_empty());
+    if let Some(rating) = content_rating {
+        details.push(("rating", rating.to_owned()));
+    }
+    details
+        .into_iter()
+        .map(|(key, value)| {
+            format!(
+                r#"<div class="metadata-detail"><strong>{}</strong><span>{}</span></div>"#,
+                html(key),
+                html(&value)
+            )
+        })
+        .collect()
 }
 
 fn render_database_info_panel(
@@ -6865,19 +7048,25 @@ async fn episode_info_panel(
     )
 }
 
-fn render_toml_details(table: &toml::map::Map<String, toml::Value>) -> String {
+fn render_toml_details(
+    table: &toml::map::Map<String, toml::Value>,
+    hide_episode_fields: bool,
+) -> String {
     table
         .iter()
         .filter(|(key, _)| {
-            key.as_str() != "metadata_json"
-                && key.as_str() != "description"
-                && key.as_str() != "technical"
-                && key.as_str() != "path"
-                && key.as_str() != "media_path"
+            !matches!(
+                key.as_str(),
+                "metadata_json" | "description" | "technical" | "path" | "media_path"
+            ) && !(hide_episode_fields
+                && matches!(
+                    key.as_str(),
+                    "season" | "episode" | "episode_end" | "episode_title"
+                ))
         })
         .map(|(key, value)| {
             let rendered = match value {
-                toml::Value::Table(table) => render_toml_details(table),
+                toml::Value::Table(table) => render_toml_details(table, hide_episode_fields),
                 toml::Value::Array(values) => values
                     .iter()
                     .map(render_toml_value)

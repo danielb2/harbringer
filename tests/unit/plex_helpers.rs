@@ -15,10 +15,9 @@ use super::{
     plex_stream_id_and_format, plex_track_label, plex_tv_episode_parents, plex_tv_season_groups,
     plex_tv_season_json, plex_tv_show_groups, plex_tv_show_json, plex_video_json,
     plex_video_resolution, render_database_info_panel, render_toml_details,
-    sidebar_nav_with_library_links, sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms,
-    technical_tracks, tv_show_title, vtt_to_srt, ConfigLibrary, HeaderMap, HeaderValue, Media,
-    PathBuf, PlexStreamSelection,
-    TvEpisodeInfo, Uri,
+    render_tv_show_metadata_details, sidebar_nav_with_library_links, sidebar_nav_with_settings,
+    srt_to_vtt, technical_duration_ms, technical_tracks, tv_show_title, vtt_to_srt, ConfigLibrary,
+    HeaderMap, HeaderValue, Media, PathBuf, PlexStreamSelection, TvEpisodeInfo, Uri,
 };
 #[test]
 fn plex_playback_ids_resolve_rating_keys_and_metadata_paths() {
@@ -429,17 +428,38 @@ fn database_metadata_renders_movie_and_episode_information() {
     assert!(!episode_panel.contains("Series summary"));
 }
 
-
 #[test]
-fn overview_details_hide_media_path() {
-    let details = "title = \"ThunderCats\"\nmedia_path = \"ThunderCats/season.01/ThunderCats.s01e01.Exodus.mkv\"\n\nruntime = 42"
+fn overview_details_hide_media_path_and_episode_numbers() {
+    let details = "title = \"ThunderCats\"\nmedia_path = \"ThunderCats/season.01/ThunderCats.s01e01.Exodus.mkv\"\nseason = 1\nepisode = 1\nepisode_title = \"Exodus\"\nnext_episode = \"S01E02\"\n\nruntime = 42"
         .parse::<toml::Value>()
         .unwrap();
-    let rendered = render_toml_details(details.as_table().unwrap());
-    assert!(rendered.contains("ThunderCats"));
-    assert!(rendered.contains("42"));
-    assert!(!rendered.contains("media path"));
-    assert!(!rendered.contains("ThunderCats/season.01/ThunderCats.s01e01.Exodus.mkv"));
+    let table = details.as_table().unwrap();
+    let overview = render_toml_details(table, true);
+    assert!(overview.contains("ThunderCats"));
+    assert!(overview.contains("42"));
+    assert!(overview.contains("next episode</strong><span>S01E02"));
+    assert!(!overview.contains("media path"));
+    assert!(!overview.contains("season</strong>"));
+    assert!(!overview.contains("<strong>episode</strong>"));
+    assert!(!overview.contains("Exodus"));
+    assert!(!overview.contains("ThunderCats/season.01/ThunderCats.s01e01.Exodus.mkv"));
+
+    let season_view = render_toml_details(table, false);
+    assert!(season_view.contains("season</strong><span>1"));
+    assert!(season_view.contains("episode</strong><span>1"));
+}
+
+#[test]
+fn tv_show_details_render_genres_and_content_rating() {
+    let metadata = serde_json::json!({
+        "genres": [{"name": "Adventure"}, {"name": "Fantasy"}],
+        "content_ratings": {"results": [
+            {"iso_3166_1": "US", "rating": "TV-PG"}
+        ]}
+    });
+    let rendered = render_tv_show_metadata_details(&metadata);
+    assert!(rendered.contains("Adventure, Fantasy"));
+    assert!(rendered.contains("TV-PG"));
 }
 
 #[test]
