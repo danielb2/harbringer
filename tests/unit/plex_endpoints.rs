@@ -396,7 +396,17 @@ async fn settings_can_rename_a_library() {
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.contains("Library name saved."));
     assert!(body.contains("value=\"My Films\" maxlength=\"64\""));
-    assert!(body.contains("action=\"/settings/libraries/0/rename\""));
+    assert!(body.contains("action=\"/settings/libraries/0/save\""));
+    let settings_form_start = body.find("<form class=\"library-settings\"").unwrap();
+    let name_row = body.find("class=\"library-rename\"").unwrap();
+    let folders_start = body.find("<section class=\"library-folders\"").unwrap();
+    assert!(settings_form_start < name_row && name_row < folders_start);
+    assert!(
+        body.contains("name=\"name\" type=\"text\" form=\"library-settings-0\" value=\"My Films\"")
+    );
+    assert!(body.contains("flex-wrap:nowrap"));
+    assert!(body
+        .contains("form=\"library-settings-0\" style=\"margin-left:auto\">Save changes</button>"));
 }
 
 #[tokio::test]
@@ -468,13 +478,57 @@ async fn settings_saves_and_validates_per_library_scan_schedule() {
     assert!(page.contains("name=\"scan_interval_value\" min=\"1\" value=\"5\""));
     assert!(page.contains("<option value=\"minutes\" selected>minutes</option>"));
     let library_start = page.find("<details class=\"library-card\">").unwrap();
-    let scan_settings = page.find("<form class=\"library-scan-settings\"").unwrap();
-    let library_end = page[library_start..]
-        .find("</div></div></details>")
-        .unwrap()
-        + library_start;
-    assert!(library_start < scan_settings && scan_settings < library_end);
-    assert!(!page.contains("class=\"library-card library-scan-settings\""));
+    let library_end = page[library_start..].find("</div></details>").unwrap() + library_start;
+    let library_markup = &page[library_start..library_end];
+    let settings_form_start = library_markup
+        .find("<form class=\"library-settings\"")
+        .unwrap();
+    let scan_settings = library_markup
+        .find("<div class=\"library-scan-settings\"")
+        .unwrap();
+    let scan_actions = library_markup
+        .find("class=\"library-scan-actions\"")
+        .unwrap();
+    let add_folder = library_markup
+        .find("<summary style=\"min-height:2.65rem;padding:.65rem .95rem;font-size:.87rem\">Add folder</summary>")
+        .unwrap();
+    let scan = library_markup.find(">Scan metadata</button>").unwrap();
+    let force_scan = library_markup.find(">Force rescan</button>").unwrap();
+    let folders_section = library_markup
+        .find("<section class=\"library-folders\"")
+        .unwrap();
+    let folders_heading = library_markup
+        .find("<h4 style=\"margin:0\">Folders</h4>")
+        .unwrap();
+    let folder_list = library_markup.find("<ul>").unwrap();
+    let delete = library_markup.find("class=\"library-delete\"").unwrap();
+    let save = library_markup
+        .find("form=\"library-settings-0\" style=\"margin-left:auto\">Save changes</button>")
+        .unwrap();
+    assert!(settings_form_start < scan_settings);
+    assert!(scan_settings < scan_actions && scan_actions < scan && scan < force_scan);
+    assert!(force_scan < folders_section);
+    assert!(library_markup.contains("class=\"library-scan-actions\" style=\"display:flex;flex:0 0 auto;align-items:center;gap:.4rem;white-space:nowrap\""));
+    assert!(
+        folders_section < folders_heading
+            && folders_heading < add_folder
+            && add_folder < folder_list
+    );
+    assert!(folder_list < delete && delete < save);
+    assert_eq!(library_markup.matches(">Save changes</button>").count(), 1);
+    assert!(!library_markup.contains("Save scan schedule"));
+    assert!(!library_markup.contains("Save Home sections"));
+    assert!(library_markup.contains("justify-content:space-between"));
+    assert!(library_markup.contains("justify-content:flex-start"));
+    assert!(library_markup.contains("form=\"library-settings-0\" formmethod=\"post\" formaction=\"/settings/libraries/0/scan\" formnovalidate"));
+    assert!(page.contains(".library-add-folder[open] > summary::before { content: \"+\"; }"));
+    assert!(library_markup.contains("action=\"/settings/folders/remove\""));
+    assert!(library_markup.contains("name=\"folder_index\""));
+    assert!(library_markup.contains("Remove folder</button>"));
+    assert!(library_markup.contains(
+        "onclick=\"this.form.reset();this.closest('details').open=false\">Cancel</button>"
+    ));
+    assert!(library_markup.contains("onsubmit=\"return confirm('Remove this folder from the library? Media files will not be deleted.')\""));
 
     let saved = fixture
         .app
@@ -546,6 +600,102 @@ async fn settings_saves_and_validates_per_library_scan_schedule() {
     assert!(!config.libraries[0].scan_enabled);
     assert_eq!(config.libraries[0].scan_interval_value, 1);
     assert_eq!(config.libraries[0].scan_interval_unit, "hours");
+}
+
+#[tokio::test]
+async fn removing_a_library_folder_keeps_media_files_and_rejects_stale_paths() {
+    let fixture = fixture();
+    let folder_path = fixture.root.join("media").to_string_lossy().into_owned();
+    let media_file = fixture.root.join("media/Demo.mkv");
+
+    let stale = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/folders/remove",
+        "library_id=0&folder_index=0&path=%2Fstale",
+    )
+    .await;
+    assert_eq!(stale.status(), StatusCode::SEE_OTHER);
+    assert_eq!(fixture.config.lock().unwrap().libraries[0].folders.len(), 1);
+
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/folders/remove",
+        &format!("library_id=0&folder_index=0&path={folder_path}"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(fixture.config.lock().unwrap().libraries[0]
+        .folders
+        .is_empty());
+    assert!(media_file.exists());
+
+    let connection = fixture.db.lock().unwrap();
+    let folder_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM library_folders WHERE path = ?1",
+            [&folder_path],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(folder_count, 0);
+    let group_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM library_groups WHERE name = 'Movies'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(group_count, 1);
+}
+
+#[tokio::test]
+async fn library_settings_save_updates_name_schedule_and_home_sections_together() {
+    let fixture = fixture();
+    let original_name = fixture.config.lock().unwrap().libraries[0].name.clone();
+    let invalid = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/libraries/0/save",
+        "name=Ignored&scan_interval_value=0&scan_interval_unit=seconds",
+    )
+    .await;
+    assert_eq!(invalid.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        fixture.config.lock().unwrap().libraries[0].name,
+        original_name
+    );
+
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/libraries/0/save",
+        "name=Series&scan_enabled=true&scan_interval_value=2&scan_interval_unit=seconds&show_recently_added=true&show_continue_watching=true",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response.headers()[header::LOCATION].to_str().unwrap();
+    assert!(location.contains("library_saved=true"));
+    assert!(location.contains("library_open=0"));
+    {
+        let config = fixture.config.lock().unwrap();
+        let library = &config.libraries[0];
+        assert_eq!(library.name, "Series");
+        assert!(library.scan_enabled);
+        assert_eq!(library.scan_interval_value, 2);
+        assert_eq!(library.scan_interval_unit, "seconds");
+        assert!(library.show_recently_added);
+        assert!(library.show_continue_watching);
+    }
+    let connection = fixture.db.lock().unwrap();
+    assert!(connection
+        .query_row(
+            "SELECT id FROM library_groups WHERE name = ?1",
+            ["Series"],
+            |row| { row.get::<_, i64>(0) }
+        )
+        .is_ok());
 }
 
 #[tokio::test]

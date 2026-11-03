@@ -559,8 +559,11 @@ fn build_app(state: AppState) -> Router {
         .route("/settings", get(settings_page))
         .route("/settings/libraries", post(create_library))
         .route("/settings/libraries/:id/rename", post(rename_library))
+        .route("/settings/libraries/:id/save", post(save_library_settings))
+
         .route("/settings/libraries/:id/delete", post(delete_library))
         .route("/settings/folders", post(add_library_folder))
+        .route("/settings/folders/remove", post(remove_library_folder))
         .route("/settings/libraries/display", post(update_library_display))
         .route("/settings/libraries/scan-settings", post(update_library_scan_settings))
         .route("/settings/scan", post(scan_all_libraries))
@@ -1563,6 +1566,13 @@ struct LibraryFolderForm {
 }
 
 #[derive(Deserialize)]
+struct RemoveLibraryFolderForm {
+    library_id: usize,
+    folder_index: usize,
+    path: String,
+}
+
+#[derive(Deserialize)]
 struct LibraryDisplayForm {
     library_id: usize,
     show_recently_added: Option<String>,
@@ -1572,6 +1582,16 @@ struct LibraryDisplayForm {
 #[derive(Deserialize)]
 struct RenameLibraryForm {
     name: String,
+}
+
+#[derive(Deserialize)]
+struct LibrarySettingsForm {
+    name: String,
+    scan_enabled: Option<String>,
+    scan_interval_value: u32,
+    scan_interval_unit: String,
+    show_recently_added: Option<String>,
+    show_continue_watching: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1606,6 +1626,8 @@ struct SettingsQuery {
     inventory_error: Option<bool>,
     tab: Option<String>,
     library_renamed: Option<bool>,
+    library_saved: Option<bool>,
+
     library_created: Option<bool>,
 }
 
@@ -2868,37 +2890,44 @@ async fn settings_page(
                         )
                     })
                     .collect::<String>();
-                let scan_settings = format!(
-                    "<form class=\"library-scan-settings\" method=\"post\" action=\"/settings/libraries/scan-settings\"><input type=\"hidden\" name=\"library_id\" value=\"{id}\"><strong>Automatic scan</strong><label><input type=\"checkbox\" name=\"scan_enabled\" value=\"true\" {}> Enabled</label><label>Every <input type=\"number\" name=\"scan_interval_value\" min=\"1\" value=\"{interval_value}\" required><select name=\"scan_interval_unit\">{unit_options}</select></label><button class=\"button-secondary\" type=\"submit\">Save scan schedule</button></form>",
+                let library_settings = format!(
+                    concat!(
+                        "<form class=\"library-settings\" id=\"library-settings-{0}\" method=\"post\" action=\"/settings/libraries/{0}/save\" aria-label=\"Library settings\"></form><div class=\"library-rename\" style=\"display:flex;flex-wrap:nowrap;align-items:center;gap:.55rem\"><label for=\"library-name-{0}\" style=\"flex:0 0 auto\">Library name</label><input id=\"library-name-{0}\" name=\"name\" type=\"text\" form=\"library-settings-{0}\" value=\"{1}\" maxlength=\"64\" required style=\"flex:1 1 auto;width:auto;min-width:0\"></div>",
+                        "<div class=\"library-scan-settings\"><strong>Automatic scan</strong><label><input type=\"checkbox\" name=\"scan_enabled\" value=\"true\" form=\"library-settings-{0}\" {2}> Enabled</label><label>Every <input type=\"number\" name=\"scan_interval_value\" min=\"1\" value=\"{3}\" required form=\"library-settings-{0}\"><select name=\"scan_interval_unit\" form=\"library-settings-{0}\">{4}</select></label>",
+                        "<div class=\"library-scan-actions\" style=\"display:flex;flex:0 0 auto;align-items:center;gap:.4rem;white-space:nowrap\"><button type=\"submit\" form=\"library-settings-{0}\" formmethod=\"post\" formaction=\"/settings/libraries/{0}/scan\" formnovalidate>Scan metadata</button><button class=\"button-secondary\" type=\"submit\" form=\"library-settings-{0}\" formmethod=\"post\" formaction=\"/settings/libraries/{0}/scan?force=true\" formnovalidate>Force rescan</button></div></div>",
+                        "<div class=\"library-display\" style=\"margin-top:.8rem\"><fieldset><legend>Show on Home</legend><label><input type=\"checkbox\" name=\"show_recently_added\" value=\"true\" form=\"library-settings-{0}\" {5}> Recently Added</label><label><input type=\"checkbox\" name=\"show_continue_watching\" value=\"true\" form=\"library-settings-{0}\" {6}> Continue Watching</label></fieldset></div>"
+                    ),
+
+                    id,
+                    html(name),
                     if *scan_enabled { "checked" } else { "" },
+                    interval_value,
+                    unit_options,
+                    if *show_recently_added { "checked" } else { "" },
+                    if *show_continue_watching { "checked" } else { "" },
                 );
-                let rename_form = format!(
-                    "<form class=\"library-rename\" style=\"display:flex;flex-wrap:wrap;align-items:end;gap:.55rem;margin-top:1rem;padding-top:1rem;border-top:1px solid #26354a;grid-column:1/-1\" method=\"post\" action=\"/settings/libraries/{id}/rename\"><label for=\"library-name-{id}\">Library name</label><input id=\"library-name-{id}\" name=\"name\" type=\"text\" value=\"{}\" maxlength=\"64\" required><button class=\"button-secondary\" type=\"submit\">Save name</button></form>",
-                    html(name)
+                let add_folder_control = format!(
+                    "<details class=\"library-add-folder\" style=\"margin:0\"><summary style=\"min-height:2.65rem;padding:.65rem .95rem;font-size:.87rem\">Add folder</summary><form method=\"post\" action=\"/settings/folders\" class=\"inline-form\"><input type=\"hidden\" name=\"library_id\" value=\"{id}\"><label class=\"sr-only\" for=\"folder-{id}\">Folder path</label><input id=\"folder-{id}\" name=\"path\" type=\"text\" placeholder=\"/another/folder\" required><button type=\"submit\">Add folder</button><button class=\"button-secondary\" type=\"button\" onclick=\"this.form.reset();this.closest('details').open=false\">Cancel</button></form></details>"
                 );
-                let card = format!(
-                    "<details class=\"library-card\"><summary class=\"library-summary\"><span class=\"library-summary-title\"><strong>{}</strong><span class=\"type-pill\">{}</span></span><span class=\"folder-count\">{} folders</span></summary><div class=\"library-content\"><section class=\"library-folders\" aria-label=\"Folders\"><h4>Folders</h4><ul>{}</ul></section><details class=\"library-add-folder\"><summary>Add folder</summary><form method=\"post\" action=\"/settings/folders\" class=\"inline-form\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><label class=\"sr-only\" for=\"folder-{}\">Folder path</label><input id=\"folder-{}\" name=\"path\" type=\"text\" placeholder=\"/another/folder\" required><button type=\"submit\">Add folder</button></form></details><div class=\"library-tools\"><form method=\"post\" action=\"/settings/libraries/{}/scan\" class=\"inline-form\"><button type=\"submit\">Scan metadata</button><button class=\"button-secondary\" type=\"submit\" formaction=\"/settings/libraries/{}/scan?force=true\">Force rescan</button></form>{}<form method=\"post\" action=\"/settings/libraries/display\" class=\"library-display\"><input type=\"hidden\" name=\"library_id\" value=\"{}\"><fieldset><legend>Show on Home</legend><label><input type=\"checkbox\" name=\"show_recently_added\" value=\"true\" {}> Recently Added</label><label><input type=\"checkbox\" name=\"show_continue_watching\" value=\"true\" {}> Continue Watching</label><button class=\"button-secondary\" type=\"submit\">Save Home sections</button></fieldset></form><form method=\"post\" action=\"/settings/libraries/{}/delete\" class=\"library-delete\" onsubmit=\"return confirm('Delete this library from Harbringer? Media files will not be deleted.')\"><button class=\"button-danger\" type=\"submit\">Delete library</button></form></div></div></details>",
+                let folder_rows = folders
+                    .iter()
+                    .enumerate()
+                    .map(|(folder_index, path)| {
+                        let folder_path = html(path);
+                        format!(
+                            "<li style=\"display:flex;align-items:center;justify-content:space-between;gap:.55rem\"><code style=\"flex:1 1 auto;min-width:0\">{folder_path}</code><form method=\"post\" action=\"/settings/folders/remove\" class=\"inline-form\" style=\"margin:0\" onsubmit=\"return confirm('Remove this folder from the library? Media files will not be deleted.')\"><input type=\"hidden\" name=\"library_id\" value=\"{id}\"><input type=\"hidden\" name=\"folder_index\" value=\"{folder_index}\"><input type=\"hidden\" name=\"path\" value=\"{folder_path}\"><button class=\"button-secondary\" type=\"submit\" style=\"min-height:2.2rem;padding:.45rem .65rem;font-size:.8rem\">Remove folder</button></form></li>"
+                        )
+                    })
+                    .collect::<String>();
+                format!(
+                    "<details class=\"library-card\"><summary class=\"library-summary\"><span class=\"library-summary-title\"><strong>{}</strong><span class=\"type-pill\">{}</span></span><span class=\"folder-count\">{} folders</span></summary><div class=\"library-content\">{}<section class=\"library-folders\" aria-label=\"Folders\"><div style=\"display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.55rem;margin-bottom:.6rem\"><h4 style=\"margin:0\">Folders</h4>{}</div><ul>{}</ul></section><div class=\"library-footer\" style=\"display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:1rem;margin-top:.9rem\"><form method=\"post\" action=\"/settings/libraries/{}/delete\" class=\"library-delete\" style=\"display:flex;justify-content:flex-start;margin:0\" onsubmit=\"return confirm('Delete this library from Harbringer? Media files will not be deleted.')\"><button class=\"button-danger\" type=\"submit\">Delete library</button></form><button class=\"button-secondary\" type=\"submit\" form=\"library-settings-{id}\" style=\"margin-left:auto\">Save changes</button></div></div></details>",
                     html(name),
                     html(library_kind_label(kind)),
                     folders.len(),
-                    folders
-                        .iter()
-                        .map(|path| format!("<li><code>{}</code></li>", html(path)))
-                        .collect::<String>(),
+                    library_settings,
+                    add_folder_control,
+                    folder_rows,
                     id,
-                    id,
-                    id,
-                    id,
-                    id,
-                    scan_settings,
-                    id,
-                    if *show_recently_added { "checked" } else { "" },
-                    if *show_continue_watching { "checked" } else { "" },
-                    id,
-                );
-                card.replace(
-                    "</div></div></details>",
-                    &format!("{rename_form}</div></div></details>"),
                 )
             },
         )
@@ -2959,6 +2988,11 @@ async fn settings_page(
         .or_else(|| {
             query.library_renamed.filter(|saved| *saved).map(|_| {
                 "<div class=\"flash-notice\" role=\"status\">Library name saved.</div>".to_owned()
+            })
+        })
+        .or_else(|| {
+            query.library_saved.filter(|saved| *saved).map(|_| {
+                "<div class=\"flash-notice\" role=\"status\">Library settings saved.</div>".to_owned()
             })
         })
         .unwrap_or_default();
@@ -3099,7 +3133,9 @@ button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: 
 .library-list {{ display: grid; gap: .85rem; margin: 1.2rem 0 0; padding: 0; list-style: none; }} .library-card {{ min-width: 0; padding: 1.05rem; border: 1px solid #2c3a50; border-radius: .8rem; background: rgba(10, 17, 30, .46); }} .library-heading {{ display: flex; align-items: center; justify-content: space-between; gap: 1rem; }} .library-heading > div {{ display: flex; flex-wrap: wrap; align-items: center; gap: .65rem; }} .type-pill {{ padding: .28rem .55rem; border: 1px solid #354a68; border-radius: 999px; color: #b9cee9; background: #17243a; font-size: .72rem; font-weight: 700; }} .library-folders {{ margin-top: 1.15rem; }} .library-folders ul {{ display: grid; gap: .45rem; margin: 0; padding: 0; list-style: none; }} .library-folders li {{ min-width: 0; margin: 0; padding: .6rem .7rem; overflow-wrap: anywhere; border-radius: .48rem; background: #0d1727; }} .library-folders code {{ overflow-wrap: anywhere; }} .library-add-folder, .add-library {{ margin-top: .8rem; }} .add-library {{ margin: 0; }} .add-library .settings-form {{ margin-top: 1rem; }} summary {{ display: inline-flex; align-items: center; gap: .5rem; padding: .48rem .68rem; border: 1px solid #394a63; border-radius: .55rem; color: #bfcee2; background: #172337; font-size: .82rem; font-weight: 650; cursor: pointer; list-style: none; }} summary::before {{ content: "+"; color: #83b4ff; font-size: 1rem; }} details[open] summary::before {{ content: "−"; }} summary::-webkit-details-marker {{ display: none; }} .inline-form {{ display: flex; flex-wrap: wrap; align-items: end; gap: .55rem; margin-top: .75rem; }} .inline-form input:not([type="hidden"]) {{ flex: 1 1 18rem; }} .path-list {{ display: grid; gap: .55rem; }} .path-row {{ display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }} .path-row input {{ flex: 1 1 18rem; }} .path-row .button-link {{ flex: 0 0 auto; }} .library-tools {{ display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr); align-items: start; gap: 1rem; margin-top: 1.1rem; padding-top: 1rem; border-top: 1px solid #26354a; }} .library-tools > .inline-form {{ margin: 0; }} .library-display fieldset {{ display: flex; flex-wrap: wrap; align-items: center; gap: .6rem 1rem; min-width: 0; margin: 0; padding: 0; border: 0; }} .library-display legend {{ width: 100%; margin-bottom: .55rem; color: #91a0b6; font-size: .72rem; font-weight: 750; letter-spacing: .09em; text-transform: uppercase; }} .library-display label {{ display: inline-flex; align-items: center; gap: .4rem; color: #c6d0df; font-size: .82rem; }} input[type="checkbox"] {{ width: 1rem; height: 1rem; margin: 0; accent-color: #4389f5; }} .library-display button {{ min-height: 2.3rem; padding: .48rem .7rem; font-size: .78rem; }} .empty-state {{ margin: 0; padding: 1rem; border: 1px dashed #35445b; border-radius: .7rem; color: #9aa8bf; text-align: center; }} .sr-only {{ position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }}
 .library-card {{ padding: 0; overflow: hidden; }} .library-summary {{ display: flex; width: 100%; align-items: center; justify-content: space-between; gap: .8rem; padding: 1rem 1.05rem; border: 0; border-radius: 0; color: #e8eef8; background: transparent; font-size: .95rem; text-align: left; }} .library-summary::before {{ content: none !important; }} .library-summary::after {{ content: "⌄"; margin-left: auto; color: #91a8c7; transition: transform .15s; }} .library-card[open] > .library-summary::after {{ transform: rotate(180deg); }} .library-summary-title {{ display: flex; flex-wrap: wrap; align-items: center; gap: .65rem; }} .folder-count {{ flex: 0 0 auto; color: #91a0b6; font-size: .78rem; font-weight: 500; }} .library-content {{ padding: 0 1.05rem 1.05rem; }} .library-tools {{ grid-template-columns: minmax(0, auto) minmax(0, 1fr) auto; }} .library-delete {{ display: flex; justify-content: flex-end; }} .button-danger {{ border-color: #713841; color: #ffd3d7; background: #3a202a; }} .button-danger:hover {{ border-color: #9d4b55; background: #512630; }}
 @media (max-width: 820px) {{ .library-tools {{ grid-template-columns: 1fr; }} .library-delete {{ justify-content: flex-start; }} }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; padding: .7rem; border-right: 0; border-bottom: 1px solid #263244; }} .sidebar-top {{ padding-bottom: .35rem; }} .sidebar-brand {{ padding: .35rem .55rem; }} .sidebar-toggle {{ display: none; }} .sidebar-label {{ display: none; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} main {{ padding: 1.35rem 1rem 2.5rem; }} }} @media (max-width: 560px) {{ .metadata-options, .form-grid {{ grid-template-columns: 1fr; }} .metadata-option {{ min-height: auto; }} .section-heading {{ display: block; }} .library-tools .inline-form > * {{ flex: 1 1 auto; }} .library-display fieldset {{ align-items: flex-start; }} .action-row > form, .action-row button {{ width: 100%; }} .action-row > form {{ flex: 1 1 100%; }} }}
-.library-scan-settings {{ display: flex; grid-column: 1 / -1; flex-wrap: wrap; align-items: center; gap: .65rem; padding-top: .9rem; border-top: 1px solid #26354a; }} .library-scan-settings > strong {{ margin-right: .25rem; }} .library-scan-settings label {{ display: flex; align-items: center; gap: .4rem; color: #c9d4e4; font-size: .84rem; }} .library-scan-settings input[type="number"] {{ width: 5.5rem; }} .library-scan-settings select {{ width: auto; }}
+.library-scan-settings {{ display: flex; grid-column: 1 / -1; flex-wrap: wrap; align-items: center; gap: .4rem; padding-top: .9rem; border-top: 1px solid #26354a; }} .library-scan-settings > strong {{ margin-right: .25rem; }} .library-scan-settings label {{ display: flex; align-items: center; gap: .4rem; color: #c9d4e4; font-size: .84rem; }} .library-scan-settings input[type="number"] {{ width: 5.5rem; }} .library-scan-settings select {{ width: auto; }}
+
+.library-add-folder[open] > summary::before {{ content: "+"; }}
 .settings-tabs {{ display: flex; gap: .35rem; margin: 0 0 1.15rem; padding-bottom: .7rem; border-bottom: 1px solid #29364b; }} .settings-tabs a {{ padding: .55rem .8rem; border-radius: .5rem; color: #aeb9cc; text-decoration: none; }} .settings-tabs a.active, .settings-tabs a:hover {{ color: #fff; background: #1d4ed8; }} .settings-logs {{ max-height: 70vh; margin: 0; padding: 1rem; overflow: auto; border: 1px solid #29364b; border-radius: .65rem; color: #d4deec; background: #0a111e; font: .8rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }}
 </style></head><body><div class="app-shell">{}
 <main><header class="page-heading"><p class="eyebrow">harbringer</p><h1>Settings</h1><p class="page-subtitle">Manage Plex access, metadata storage, and the libraries available on this server.</p></header>{}{}
@@ -4495,6 +4531,7 @@ async fn store_metadata_sidecar(
         episode_title: episode.and_then(|value| value.episode_title),
         metadata_json: serde_json::to_string_pretty(metadata).unwrap_or_default(),
         technical: inspect_media(&media.path).await,
+        show_id: None,
     };
     let contents = toml::to_string_pretty(&info).map_err(std::io::Error::other)?;
     tokio::fs::write(directory.join("info.toml"), contents).await
@@ -4520,6 +4557,8 @@ struct MediaInfo {
     metadata_json: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     technical: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    show_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -5403,6 +5442,61 @@ async fn add_library_folder(
     Redirect::to(&format!("/settings?library_open={}", form.library_id)).into_response()
 }
 
+async fn remove_library_folder(
+    State(state): State<AppState>,
+    Form(form): Form<RemoveLibraryFolderForm>,
+) -> Response {
+    let Ok(mut config) = state.config.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Some(library) = config.libraries.get(form.library_id) else {
+        return settings_error("Library does not exist");
+    };
+    let Some(folder) = library.folders.get(form.folder_index) else {
+        return settings_error("Folder does not exist");
+    };
+    let path = folder.to_string_lossy().into_owned();
+    if path != form.path {
+        return settings_error("Folder list changed. Reload and try again");
+    }
+    let library_name = library.name.clone();
+    let mut updated_config = config.clone();
+    updated_config.libraries[form.library_id]
+        .folders
+        .remove(form.folder_index);
+
+    let Ok(mut connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(transaction) = connection.transaction() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if transaction
+        .execute(
+            "DELETE FROM library_folders WHERE library_id = (SELECT id FROM library_groups WHERE name = ?1) AND path = ?2",
+            (&library_name, &path),
+        )
+        .is_err()
+        || transaction
+            .execute(
+                "UPDATE library_groups SET updated_at = MAX(updated_at + 1, CAST(strftime('%s', 'now') AS INTEGER)) WHERE name = ?1",
+                [&library_name],
+            )
+            .is_err()
+        || update_library_catalog_timestamp(&transaction).is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if save_config(&state.config_path, &updated_config).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if transaction.commit().is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    *config = updated_config;
+    Redirect::to(&format!("/settings?library_open={}", form.library_id)).into_response()
+}
+
 async fn rename_library(
     State(state): State<AppState>,
     Path(library_id): Path<usize>,
@@ -5449,6 +5543,69 @@ async fn rename_library(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     Redirect::to("/settings?library_renamed=true").into_response()
+}
+
+async fn save_library_settings(
+    State(state): State<AppState>,
+    Path(library_id): Path<usize>,
+    Form(form): Form<LibrarySettingsForm>,
+) -> Response {
+    let name = form.name.trim();
+    if name.is_empty() {
+        return settings_error("Library name is required");
+    }
+    if name.chars().count() > 64 {
+        return settings_error("Library names must be 64 characters or fewer");
+    }
+    if form.scan_interval_value == 0
+        || !matches!(
+            form.scan_interval_unit.as_str(),
+            "seconds" | "minutes" | "hours"
+        )
+    {
+        return settings_error("Scan intervals need a positive integer and a valid time unit");
+    }
+    let Ok(mut config) = state.config.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if library_id >= config.libraries.len() {
+        return settings_error("Library does not exist");
+    }
+    let old_name = config.libraries[library_id].name.clone();
+    if config
+        .libraries
+        .iter()
+        .enumerate()
+        .any(|(index, library)| index != library_id && library.name.eq_ignore_ascii_case(name))
+    {
+        return settings_error("A library with that name already exists");
+    }
+    let library = &mut config.libraries[library_id];
+    library.name = name.to_owned();
+    library.scan_enabled = form.scan_enabled.is_some();
+    library.scan_interval_value = form.scan_interval_value;
+    library.scan_interval_unit = form.scan_interval_unit;
+    library.show_recently_added = form.show_recently_added.is_some();
+    library.show_continue_watching = form.show_continue_watching.is_some();
+    if save_config(&state.config_path, &config).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if old_name != name {
+        let Ok(connection) = state.db.lock() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        let updated = connection.execute(
+            "UPDATE library_groups SET name = ?1, updated_at = MAX(updated_at + 1, CAST(strftime('%s', 'now') AS INTEGER)) WHERE name = ?2",
+            (name, &old_name),
+        );
+        if updated.is_err() || update_library_catalog_timestamp(&connection).is_err() {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    Redirect::to(&format!(
+        "/settings?library_saved=true&library_open={library_id}"
+    ))
+    .into_response()
 }
 
 async fn update_library_display(
@@ -5583,7 +5740,6 @@ struct WebPath {
     episode: Option<String>,
     view: Option<String>,
     show_id: Option<String>,
-
 }
 
 fn selected_library_root(state: &AppState, library: Option<usize>) -> PathBuf {

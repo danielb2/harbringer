@@ -90,9 +90,9 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 
 ### 2026-11-03
 
-- Settings removes the duplicate scan label and uses a modal server-folder browser. The add-library panel and affected library card stay open after create or folder changes.
+- Settings uses one Save changes action for a library's name, scan schedule, and Home visibility. Scan actions stay beside scan settings, and Add folder stays beside Folders to keep related controls compact. Folder additions can be canceled, and existing folders can be detached without deleting media. These changes group related actions and reduce unnecessary layout breaks; the modal server-folder browser and open-panel state remain in place.
 - Plex Web request traces show `/media/providers` requests after library changes. The live provider and section responses include the TV library. Provider entries previously used the request time for both timestamps, and section IDs determined UUIDs. They now report persisted scan/catalog timestamps and use the database library identity for UUIDs, so deleting an earlier section does not change a surviving library's UUID. Protocol tests cover these fields and reordering; real-client visibility remains unverified.
-- Validation: `cargo test` passed all 87 tests; `cargo build`, `cargo fmt --check`, and `git diff --check` passed.
+- Validation: `cargo test` passed all 89 tests; `cargo build`, `cargo fmt --check`, and `git diff --check` passed.
 
 ### 2026-11-02
 
