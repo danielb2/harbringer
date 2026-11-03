@@ -605,6 +605,10 @@ fn build_app(state: AppState) -> Router {
         .route("/library/sections", get(plex_sections))
         .route("/library/sections/:section", get(plex_section))
         .route(
+            "/library/sections/:section/refresh",
+            get(plex_section_refresh).post(plex_section_refresh),
+        )
+        .route(
             "/library/sections/:section/collections",
             get(plex_section_collections),
         )
@@ -5798,6 +5802,29 @@ async fn scan_library_inventory_handler(
         Err(error) => {
             warn!(library_id, %error, "manual library scan failed");
             Redirect::to("/settings?inventory_error=true").into_response()
+        }
+    }
+}
+
+async fn plex_section_refresh(
+    State(state): State<AppState>,
+    Path(section): Path<usize>,
+) -> Response {
+    let Some(library_id) = section.checked_sub(1) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let library_exists = match state.config.lock() {
+        Ok(config) => config.libraries.get(library_id).is_some(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if !library_exists {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match scan_library_inventory(&state, library_id).await {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(error) => {
+            warn!(section, %error, "Plex library scan failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }

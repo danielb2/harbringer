@@ -767,6 +767,15 @@ async fn manual_scan_updates_web_and_plex_inventory_without_changing_existing_id
     assert_eq!(scanned.status(), StatusCode::SEE_OTHER);
     let location = scanned.headers()[header::LOCATION].to_str().unwrap();
     assert!(location.contains("inventory_scan=2"));
+    std::fs::write(media_dir.join("PlexAdded.mp4"), b"new Plex media").unwrap();
+    let refreshed = send(
+        &fixture.app,
+        Method::GET,
+        "/library/sections/1/refresh",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(refreshed.status(), StatusCode::OK);
 
     let web = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
     let web = to_bytes(web.into_body(), usize::MAX).await.unwrap();
@@ -784,8 +793,9 @@ async fn manual_scan_updates_web_and_plex_inventory_without_changing_existing_id
     let plex: serde_json::Value =
         serde_json::from_slice(&to_bytes(plex.into_body(), usize::MAX).await.unwrap()).unwrap();
     let items = plex["MediaContainer"]["Metadata"].as_array().unwrap();
-    assert_eq!(items.len(), 2);
+    assert_eq!(items.len(), 3);
     assert!(items.iter().any(|item| item["title"] == "Added"));
+    assert!(items.iter().any(|item| item["title"] == "PlexAdded"));
     assert_eq!(
         send(
             &fixture.app,
@@ -848,6 +858,59 @@ async fn manual_scan_updates_web_and_plex_inventory_without_changing_existing_id
         .status(),
         StatusCode::OK
     );
+    let second_media_dir = fixture.root.join("second-media");
+    std::fs::create_dir_all(&second_media_dir).unwrap();
+    std::fs::write(
+        second_media_dir.join("SectionTwo.mkv"),
+        b"section two media",
+    )
+    .unwrap();
+    fixture
+        .config
+        .lock()
+        .unwrap()
+        .libraries
+        .push(super::ConfigLibrary {
+            name: "Other videos".to_owned(),
+            kind: "other".to_owned(),
+            folders: vec![second_media_dir],
+            show_recently_added: true,
+            show_continue_watching: true,
+            scan_enabled: true,
+            scan_interval_value: 5,
+            scan_interval_unit: "minutes".to_owned(),
+        });
+    {
+        let config = fixture.config.lock().unwrap();
+        let connection = fixture.db.lock().unwrap();
+        super::sync_config_libraries(&connection, &config).unwrap();
+    }
+    let second_refresh = send(
+        &fixture.app,
+        Method::GET,
+        "/library/sections/2/refresh",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(second_refresh.status(), StatusCode::OK);
+    let second_listing = send(
+        &fixture.app,
+        Method::GET,
+        "/library/sections/2/all",
+        Body::empty(),
+    )
+    .await;
+    let second_listing: serde_json::Value = serde_json::from_slice(
+        &to_bytes(second_listing.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let second_items = second_listing["MediaContainer"]["Metadata"]
+        .as_array()
+        .unwrap();
+    assert_eq!(second_items.len(), 1);
+    assert_eq!(second_items[0]["title"], "SectionTwo");
 }
 
 #[tokio::test]
@@ -2786,6 +2849,7 @@ async fn every_registered_plex_route_has_success_and_failure_cases() {
         (Method::GET, "/hubs/sections/1/recommended"),
         (Method::GET, "/library/sections"),
         (Method::GET, "/library/sections/1"),
+        (Method::GET, "/library/sections/1/refresh"),
         (Method::GET, "/library/sections/1/collections"),
         (Method::GET, "/library/sections/1/prefs"),
         (Method::PUT, "/library/sections/1/prefs"),
@@ -3344,6 +3408,16 @@ async fn plex_route_errors_are_explicit_for_unknown_resources_and_bad_requests()
             StatusCode::NOT_FOUND,
         ),
         (Method::GET, "/library/sections/99", StatusCode::NOT_FOUND),
+        (
+            Method::GET,
+            "/library/sections/99/refresh",
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            Method::GET,
+            "/library/sections/0/refresh",
+            StatusCode::NOT_FOUND,
+        ),
         (
             Method::GET,
             "/library/sections/99/collections",

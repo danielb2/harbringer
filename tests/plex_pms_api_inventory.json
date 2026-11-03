@@ -730,7 +730,7 @@
       "path": "/library/sections/all/refresh",
       "operation_id": "libraryDeleteSectionsAllRefresh",
       "summary": "Stop refresh",
-      "expected_status": 404
+      "expected_status": 405
     },
     {
       "method": "GET",
@@ -968,14 +968,14 @@
       "path": "/library/sections/{sectionId}/refresh",
       "operation_id": "librarySectionPostRefresh",
       "summary": "Refresh section",
-      "expected_status": 404
+      "expected_status": 200
     },
     {
       "method": "DELETE",
       "path": "/library/sections/{sectionId}/refresh",
       "operation_id": "librarySectionDeleteRefresh",
       "summary": "Cancel section refresh",
-      "expected_status": 404
+      "expected_status": 405
     },
     {
       "method": "GET",

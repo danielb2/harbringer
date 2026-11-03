@@ -27,12 +27,13 @@ Project guidance for `mplex`: the target is a 100% drop-in replacement for Plex'
 
 - `src/main.rs`: configuration, media/library state, Plex routes, shared media serving, playback, and the built-in web client.
 - `src/plex_tls.rs`: Plex discovery, TLS, and HTTP/WebSocket serving.
-- `README.md`: setup, connection, playback behavior, validation, and current limitations.
+- `README.md`: user-facing project overview, setup, connection, playback, and current limitations.
 - `ROADMAP.md`: full PMS compatibility checklist and client validation status.
 - `CHANGELOG.md`: change history and short implementation reflections.
 
 ## Documentation and UI rules
+- Keep `README.md` user-focused. Put detailed implementation notes, technical compatibility status, and technical reflections in `ROADMAP.md`.
 
-- Keep `README.md` and `ROADMAP.md` in sync with behavior changes. Before a requested commit, update only these two documentation files; record a brief reflection in `ROADMAP.md` with what changed, why, and the checks run. Do not update `CHANGELOG.md` unless explicitly requested.
+- Update `README.md` and `ROADMAP.md` only when preparing a requested commit. In `ROADMAP.md`, record a brief reflection with what changed, why, and the checks run. Do not update `CHANGELOG.md` unless explicitly requested.
 - Dialog close controls must stay fixed at the dialog's top-right corner, have an accessible label and tooltip, and close on Escape.
 - Follow DRY principles across UI components, markup, styles, route behavior, data transformations, validation, and media logic. Home and Library presentation should share implementations where sensible.
