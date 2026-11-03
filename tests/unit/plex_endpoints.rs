@@ -284,6 +284,26 @@ async fn send_form(
         .unwrap()
 }
 
+async fn send_async_form(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    body: &str,
+) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("X-Mplex-Async", "1")
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 async fn settings_server_name_is_saved_and_advertised_to_plex_clients() {
     let fixture = fixture();
@@ -477,7 +497,9 @@ async fn settings_saves_and_validates_per_library_scan_schedule() {
     assert!(!page.contains("class=\"settings-stack\" style=\"<div"));
     assert!(page.contains("name=\"scan_interval_value\" min=\"1\" value=\"5\""));
     assert!(page.contains("<option value=\"minutes\" selected>minutes</option>"));
-    let library_start = page.find("<details class=\"library-card\">").unwrap();
+    let library_start = page
+        .find("<details class=\"library-card\" data-library-id=\"0\">")
+        .unwrap();
     let library_end = page[library_start..].find("</div></details>").unwrap() + library_start;
     let library_markup = &page[library_start..library_end];
     let settings_form_start = library_markup
@@ -529,6 +551,12 @@ async fn settings_saves_and_validates_per_library_scan_schedule() {
         "onclick=\"this.form.reset();this.closest('details').open=false\">Cancel</button>"
     ));
     assert!(library_markup.contains("onsubmit=\"return confirm('Remove this folder from the library? Media files will not be deleted.')\""));
+
+    assert!(library_markup.contains("data-settings-delete=\"folder\""));
+    assert!(library_markup.contains("data-settings-delete=\"library\""));
+    assert!(page.contains("X-Mplex-Async"));
+    assert!(page.contains("currentList.replaceWith(nextList)"));
+    assert!(page.contains("window.scrollTo(0, scrollTop)"));
 
     let saved = fixture
         .app
@@ -648,6 +676,36 @@ async fn removing_a_library_folder_keeps_media_files_and_rejects_stale_paths() {
         )
         .unwrap();
     assert_eq!(group_count, 1);
+}
+
+#[tokio::test]
+async fn removing_a_library_folder_uses_async_responses() {
+    let fixture = fixture();
+    let folder_path = fixture.root.join("media").to_string_lossy().into_owned();
+    let media_file = fixture.root.join("media/Demo.mkv");
+
+    let stale = send_async_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/folders/remove",
+        "library_id=0&folder_index=0&path=%2Fstale",
+    )
+    .await;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    assert_eq!(fixture.config.lock().unwrap().libraries[0].folders.len(), 1);
+
+    let removed = send_async_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/folders/remove",
+        &format!("library_id=0&folder_index=0&path={folder_path}"),
+    )
+    .await;
+    assert_eq!(removed.status(), StatusCode::NO_CONTENT);
+    assert!(fixture.config.lock().unwrap().libraries[0]
+        .folders
+        .is_empty());
+    assert!(media_file.exists());
 }
 
 #[tokio::test]
@@ -1973,6 +2031,33 @@ async fn deleting_a_library_removes_its_settings_but_keeps_media_files() {
     let sections_json: serde_json::Value =
         serde_json::from_slice(&to_bytes(sections.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(sections_json["MediaContainer"]["size"], 0);
+}
+
+#[tokio::test]
+async fn deleting_a_library_uses_an_async_response() {
+    let fixture = fixture();
+    let media_file = fixture.root.join("media/Demo.mkv");
+
+    let missing = send_async_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/libraries/9/delete",
+        "",
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(fixture.config.lock().unwrap().libraries.len(), 1);
+
+    let deleted = send_async_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/libraries/0/delete",
+        "",
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    assert!(fixture.config.lock().unwrap().libraries.is_empty());
+    assert!(media_file.exists());
 }
 
 #[tokio::test]

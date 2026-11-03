@@ -2915,12 +2915,12 @@ async fn settings_page(
                     .map(|(folder_index, path)| {
                         let folder_path = html(path);
                         format!(
-                            "<li style=\"display:flex;align-items:center;justify-content:space-between;gap:.55rem\"><code style=\"flex:1 1 auto;min-width:0\">{folder_path}</code><form method=\"post\" action=\"/settings/folders/remove\" class=\"inline-form\" style=\"margin:0\" onsubmit=\"return confirm('Remove this folder from the library? Media files will not be deleted.')\"><input type=\"hidden\" name=\"library_id\" value=\"{id}\"><input type=\"hidden\" name=\"folder_index\" value=\"{folder_index}\"><input type=\"hidden\" name=\"path\" value=\"{folder_path}\"><button class=\"button-secondary\" type=\"submit\" style=\"min-height:2.2rem;padding:.45rem .65rem;font-size:.8rem\">Remove folder</button></form></li>"
+                            "<li class=\"library-folder-row\" style=\"display:flex;align-items:center;justify-content:space-between;gap:.55rem\"><code style=\"flex:1 1 auto;min-width:0\">{folder_path}</code><form method=\"post\" action=\"/settings/folders/remove\" class=\"inline-form\" data-settings-delete=\"folder\" style=\"margin:0\" onsubmit=\"return confirm('Remove this folder from the library? Media files will not be deleted.')\"><input type=\"hidden\" name=\"library_id\" value=\"{id}\"><input type=\"hidden\" name=\"folder_index\" value=\"{folder_index}\"><input type=\"hidden\" name=\"path\" value=\"{folder_path}\"><button class=\"button-secondary\" type=\"submit\" style=\"min-height:2.2rem;padding:.45rem .65rem;font-size:.8rem\">Remove folder</button></form></li>"
                         )
                     })
                     .collect::<String>();
                 format!(
-                    "<details class=\"library-card\"><summary class=\"library-summary\"><span class=\"library-summary-title\"><strong>{}</strong><span class=\"type-pill\">{}</span></span><span class=\"folder-count\">{} folders</span></summary><div class=\"library-content\">{}<section class=\"library-folders\" aria-label=\"Folders\"><div style=\"display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.55rem;margin-bottom:.6rem\"><h4 style=\"margin:0\">Folders</h4>{}</div><ul>{}</ul></section><div class=\"library-footer\" style=\"display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:1rem;margin-top:.9rem\"><form method=\"post\" action=\"/settings/libraries/{}/delete\" class=\"library-delete\" style=\"display:flex;justify-content:flex-start;margin:0\" onsubmit=\"return confirm('Delete this library from Harbringer? Media files will not be deleted.')\"><button class=\"button-danger\" type=\"submit\">Delete library</button></form><button class=\"button-secondary\" type=\"submit\" form=\"library-settings-{id}\" style=\"margin-left:auto\">Save changes</button></div></div></details>",
+                    "<details class=\"library-card\" data-library-id=\"{id}\"><summary class=\"library-summary\"><span class=\"library-summary-title\"><strong>{}</strong><span class=\"type-pill\">{}</span></span><span class=\"folder-count\">{} folders</span></summary><div class=\"library-content\">{}<section class=\"library-folders\" aria-label=\"Folders\"><div style=\"display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:.55rem;margin-bottom:.6rem\"><h4 style=\"margin:0\">Folders</h4>{}</div><ul>{}</ul></section><div class=\"library-footer\" style=\"display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:1rem;margin-top:.9rem\"><form method=\"post\" action=\"/settings/libraries/{}/delete\" class=\"library-delete\" data-settings-delete=\"library\" style=\"display:flex;justify-content:flex-start;margin:0\" onsubmit=\"return confirm('Delete this library from Harbringer? Media files will not be deleted.')\"><button class=\"button-danger\" type=\"submit\">Delete library</button></form><button class=\"button-secondary\" type=\"submit\" form=\"library-settings-{id}\" style=\"margin-left:auto\">Save changes</button></div></div></details>",
                     html(name),
                     html(library_kind_label(kind)),
                     folders.len(),
@@ -3064,7 +3064,85 @@ window.addEventListener('message', event => {
   folderPicker?.close();
 });
 </script>"#;
-    let notice = format!("{notice}{folder_picker_script}");
+
+    let settings_delete_script = r#"<style>.settings-delete-status{flex-basis:100%;margin:0;color:#ffd6dc;font-size:.8rem}</style><script>
+if (!window.__mplexSettingsDeleteBound) {
+  window.__mplexSettingsDeleteBound = true;
+  document.addEventListener("submit", async event => {
+    const form = event.target.closest("form[data-settings-delete]");
+    if (!form || event.defaultPrevented || form.dataset.pending === "true") return;
+    event.preventDefault();
+    form.dataset.pending = "true";
+    form.setAttribute("aria-busy", "true");
+    const button = form.querySelector('button[type="submit"]');
+    const originalLabel = button?.textContent || "Delete";
+    if (button) {
+      button.disabled = true;
+      button.textContent = form.dataset.settingsDelete === "folder" ? "Removing…" : "Deleting…";
+    }
+    form.querySelector(".settings-delete-status")?.remove();
+    const showError = message => {
+      const status = document.createElement("p");
+      status.className = "settings-delete-status";
+      status.setAttribute("role", "alert");
+      status.textContent = message || "Could not complete this action. Try again.";
+      form.append(status);
+    };
+    try {
+      const response = await fetch(form.action, {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+          "X-Mplex-Async": "1"
+        },
+        body: new URLSearchParams(new FormData(form))
+      });
+      if (!response.ok) throw new Error((await response.text()).trim());
+      if (form.dataset.settingsDelete === "folder") {
+        const card = form.closest("details.library-card");
+        form.closest("li.library-folder-row")?.remove();
+        const folderCount = card?.querySelectorAll(".library-folders ul > li").length || 0;
+        const countLabel = card?.querySelector(".folder-count");
+        if (countLabel) countLabel.textContent = `${folderCount} folder${folderCount === 1 ? "" : "s"}`;
+        return;
+      }
+      const deletedId = Number(form.closest("details.library-card")?.dataset.libraryId);
+      const scrollTop = window.scrollY;
+      const openLibraryIds = new Set(
+        [...document.querySelectorAll(".library-list details.library-card[open]")]
+          .map(card => Number(card.dataset.libraryId))
+          .filter(id => Number.isInteger(id) && id !== deletedId)
+          .map(id => id > deletedId ? id - 1 : id)
+      );
+      const page = await fetch("/settings", { cache: "no-store" });
+      if (!page.ok) throw new Error("Library deleted. Reload Settings to refresh the library list.");
+      const parsed = new DOMParser().parseFromString(await page.text(), "text/html");
+      const currentList = document.querySelector(".library-list");
+      const nextList = parsed.querySelector(".library-list");
+      const currentNav = document.querySelector(".sidebar-nav");
+      const nextNav = parsed.querySelector(".sidebar-nav");
+      if (!currentList || !nextList || !currentNav || !nextNav) {
+        throw new Error("Library deleted. Reload Settings to refresh the library list.");
+      }
+      currentList.replaceWith(nextList);
+      currentNav.replaceWith(nextNav);
+      nextList.querySelectorAll("details.library-card[data-library-id]").forEach(card => {
+        if (openLibraryIds.has(Number(card.dataset.libraryId))) card.open = true;
+      });
+      window.scrollTo(0, scrollTop);
+    } catch (error) {
+      form.dataset.pending = "false";
+      form.removeAttribute("aria-busy");
+      if (button) {
+        button.disabled = false;
+        button.textContent = originalLabel;
+      }
+      showError(error instanceof Error ? error.message : "Could not complete this action. Try again.");
+    }
+  });
+}
+</script>"#;
+    let notice = format!("{notice}{folder_picker_script}{settings_delete_script}");
     let tmdb_token_status = if tmdb_token_saved {
         "<p class=\"credential-status is-saved\"><span class=\"status-dot\"></span>TMDB token is saved. Leave the field blank to keep it, or enter a new token to replace it.</p>"
     } else {
@@ -4517,6 +4595,11 @@ async fn store_metadata_sidecar(
         .unwrap_or(&media.path)
         .to_string_lossy();
     let episode = tv_episode_info(folder, &media.path);
+    let show_id = tokio::fs::read_to_string(directory.join("info.toml"))
+        .await
+        .ok()
+        .and_then(|contents| contents.parse::<toml::Value>().ok())
+        .and_then(|value| value.get("show_id")?.as_str().map(str::to_owned));
     let info = MediaInfo {
         title: title.to_owned(),
         media_path: path.into_owned(),
@@ -4531,7 +4614,7 @@ async fn store_metadata_sidecar(
         episode_title: episode.and_then(|value| value.episode_title),
         metadata_json: serde_json::to_string_pretty(metadata).unwrap_or_default(),
         technical: inspect_media(&media.path).await,
-        show_id: None,
+        show_id,
     };
     let contents = toml::to_string_pretty(&info).map_err(std::io::Error::other)?;
     tokio::fs::write(directory.join("info.toml"), contents).await
@@ -5238,6 +5321,29 @@ fn settings_error(message: &str) -> Response {
     Redirect::to(&location).into_response()
 }
 
+fn is_async_settings_action(headers: &HeaderMap) -> bool {
+    headers
+        .get("X-Mplex-Async")
+        .and_then(|value| value.to_str().ok())
+        == Some("1")
+}
+
+fn settings_action_error(headers: &HeaderMap, status: StatusCode, message: &str) -> Response {
+    if is_async_settings_action(headers) {
+        (status, message.to_owned()).into_response()
+    } else {
+        settings_error(message)
+    }
+}
+
+fn settings_action_response(headers: &HeaderMap, redirect: &str) -> Response {
+    if is_async_settings_action(headers) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        Redirect::to(redirect).into_response()
+    }
+}
+
 fn library_form_error(message: &str) -> Response {
     Redirect::to(&format!(
         "/settings?add_library=true&error={}",
@@ -5444,20 +5550,25 @@ async fn add_library_folder(
 
 async fn remove_library_folder(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Form(form): Form<RemoveLibraryFolderForm>,
 ) -> Response {
     let Ok(mut config) = state.config.lock() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let Some(library) = config.libraries.get(form.library_id) else {
-        return settings_error("Library does not exist");
+        return settings_action_error(&headers, StatusCode::NOT_FOUND, "Library does not exist");
     };
     let Some(folder) = library.folders.get(form.folder_index) else {
-        return settings_error("Folder does not exist");
+        return settings_action_error(&headers, StatusCode::NOT_FOUND, "Folder does not exist");
     };
     let path = folder.to_string_lossy().into_owned();
     if path != form.path {
-        return settings_error("Folder list changed. Reload and try again");
+        return settings_action_error(
+            &headers,
+            StatusCode::CONFLICT,
+            "Folder list changed. Reload and try again",
+        );
     }
     let library_name = library.name.clone();
     let mut updated_config = config.clone();
@@ -5494,7 +5605,10 @@ async fn remove_library_folder(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     *config = updated_config;
-    Redirect::to(&format!("/settings?library_open={}", form.library_id)).into_response()
+    settings_action_response(
+        &headers,
+        &format!("/settings?library_open={}", form.library_id),
+    )
 }
 
 async fn rename_library(
@@ -5688,12 +5802,16 @@ async fn scan_library_inventory_handler(
     }
 }
 
-async fn delete_library(State(state): State<AppState>, Path(library_id): Path<usize>) -> Response {
+async fn delete_library(
+    State(state): State<AppState>,
+    Path(library_id): Path<usize>,
+    headers: HeaderMap,
+) -> Response {
     let Ok(mut config) = state.config.lock() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let Some(library) = config.libraries.get(library_id) else {
-        return settings_error("Library does not exist");
+        return settings_action_error(&headers, StatusCode::NOT_FOUND, "Library does not exist");
     };
     let library_name = library.name.clone();
     let mut updated_config = config.clone();
@@ -5727,7 +5845,7 @@ async fn delete_library(State(state): State<AppState>, Path(library_id): Path<us
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     *config = updated_config;
-    Redirect::to("/settings").into_response()
+    settings_action_response(&headers, "/settings")
 }
 
 #[derive(Deserialize, Default)]
