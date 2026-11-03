@@ -24,7 +24,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     io::{self, Write},
     net::SocketAddr,
     path::{Component, PathBuf},
@@ -111,8 +111,13 @@ fn plex_machine_identifier(seed: &str) -> String {
         .collect()
 }
 
-fn plex_library_uuid(machine_identifier: &str, section: usize) -> String {
-    let digest = Sha256::digest(format!("{machine_identifier}:library:{section}").as_bytes());
+fn plex_library_uuid(state: &AppState, library_name: &str, section: usize) -> String {
+    let (stable_id, _, _) = library_publication_state(state, library_name, section);
+    plex_library_uuid_for_id(&state.machine_identifier, stable_id)
+}
+
+fn plex_library_uuid_for_id(machine_identifier: &str, stable_id: i64) -> String {
+    let digest = Sha256::digest(format!("{machine_identifier}:library:{stable_id}").as_bytes());
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         digest[0],
@@ -144,6 +149,7 @@ struct AppState {
     root: Arc<PathBuf>,
     media: Arc<RwLock<Arc<Vec<Media>>>>,
     inventory_scan_lock: Arc<tokio::sync::Mutex<()>>,
+    plex_notifications: tokio::sync::broadcast::Sender<String>,
     media_info: Arc<Mutex<HashMap<String, serde_json::Value>>>,
     plex_stream_selections: Arc<Mutex<HashMap<u64, PlexStreamSelection>>>,
     plex_play_queues: Arc<Mutex<HashMap<u64, serde_json::Value>>>,
@@ -398,6 +404,7 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
         .unwrap_or(std::path::Path::new("config"))
         .join("certs");
     let plex_tls = PlexTls::load(cert_dir).map_err(std::io::Error::other)?;
+    let (plex_notifications, _) = tokio::sync::broadcast::channel(64);
     let state = AppState {
         config: Arc::new(Mutex::new(config.clone())),
         config_path: Arc::new(config_path),
@@ -407,6 +414,7 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
         root: Arc::new(root),
         media: Arc::new(RwLock::new(Arc::new(media))),
         inventory_scan_lock: Arc::new(tokio::sync::Mutex::new(())),
+        plex_notifications,
         media_info: Arc::new(Mutex::new(HashMap::new())),
         plex_stream_selections: Arc::new(Mutex::new(HashMap::new())),
         plex_play_queues: Arc::new(Mutex::new(HashMap::new())),
@@ -1074,6 +1082,8 @@ async fn scan_library_inventory(state: &AppState, library_id: usize) -> Result<u
             persist_media_records(&connection, configured_root, media)
                 .map_err(|error| format!("Could not save scanned media: {error}"))?;
         }
+        mark_library_updated(&connection, &library.name, true)
+            .map_err(|error| format!("Could not save library scan time: {error}"))?;
     }
     let scanned = scanned_roots
         .into_iter()
@@ -1085,6 +1095,15 @@ async fn scan_library_inventory(state: &AppState, library_id: usize) -> Result<u
             media.path.starts_with(configured_root) || media.path.starts_with(canonical_root)
         })
     };
+    let scanned_ids = scanned
+        .iter()
+        .map(|media| media.id.as_str())
+        .collect::<HashSet<_>>();
+    let removed_media = current
+        .iter()
+        .filter(|media| belongs_to_library(media) && !scanned_ids.contains(media.id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
     let insertion_index = current
         .iter()
         .position(belongs_to_library)
@@ -1109,7 +1128,34 @@ async fn scan_library_inventory(state: &AppState, library_id: usize) -> Result<u
         *media = Arc::new(updated);
     }
     drop(_scan_guard);
-    if !newly_found.is_empty() {
+    if !removed_media.is_empty() {
+        let timeline_entries = removed_media
+            .iter()
+            .map(|media| {
+                serde_json::json!({
+                    "identifier": "com.plexapp.plugins.library",
+                    "sectionID": (library_id + 1).to_string(),
+                    "itemID": plex_rating_key(media).to_string(),
+                    "type": 1,
+                    "title": media.title,
+                    "state": 9,
+                    "updatedAt": SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                })
+            })
+            .collect::<Vec<_>>();
+        let notification = serde_json::json!({
+            "NotificationContainer": {
+                "type": "timeline",
+                "size": timeline_entries.len(),
+                "TimelineEntry": timeline_entries
+            }
+        });
+        let _ = state.plex_notifications.send(notification.to_string());
+    }
+    if !newly_found.is_empty() && library.kind != "other" {
         info!(library = %library.name, count = newly_found.len(), "automatic metadata detection started");
         let response = scan_library_metadata(
             State(state.clone()),
@@ -1190,27 +1236,106 @@ fn save_config(path: &std::path::Path, config: &Config) -> Result<(), Box<dyn st
 
 fn sync_config_libraries(connection: &Connection, config: &Config) -> Result<(), rusqlite::Error> {
     for library in &config.libraries {
-        connection.execute(
-            "INSERT OR IGNORE INTO library_groups (name, kind, added_at) VALUES (?1, ?2, strftime('%s', 'now'))",
+        let inserted = connection.execute(
+            "INSERT OR IGNORE INTO library_groups (name, kind, added_at, updated_at) VALUES (?1, ?2, strftime('%s', 'now'), strftime('%s', 'now'))",
             (&library.name, &library.kind),
         )?;
+        if inserted > 0 {
+            update_library_catalog_timestamp(connection)?;
+        }
         let id: i64 = connection.query_row(
             "SELECT id FROM library_groups WHERE name = ?1",
             [&library.name],
             |row| row.get(0),
         )?;
-        connection.execute(
-            "UPDATE library_groups SET kind = ?1 WHERE id = ?2",
+        let kind_changed = connection.execute(
+            "UPDATE library_groups SET kind = ?1, updated_at = MAX(updated_at + 1, CAST(strftime('%s', 'now') AS INTEGER)) WHERE id = ?2 AND kind != ?1",
             (&library.kind, id),
         )?;
+        if kind_changed > 0 {
+            update_library_catalog_timestamp(connection)?;
+        }
         for folder in &library.folders {
-            connection.execute(
+            let inserted = connection.execute(
                 "INSERT OR IGNORE INTO library_folders (library_id, path, added_at) VALUES (?1, ?2, strftime('%s', 'now'))",
                 (id, folder.to_string_lossy().as_ref()),
             )?;
+            if inserted > 0 {
+                connection.execute(
+                    "UPDATE library_groups SET updated_at = MAX(updated_at + 1, CAST(strftime('%s', 'now') AS INTEGER)) WHERE id = ?1",
+                    [id],
+                )?;
+                update_library_catalog_timestamp(connection)?;
+            }
         }
     }
     Ok(())
+}
+
+fn update_library_catalog_timestamp(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute(
+        "UPDATE library_catalog_state SET updated_at = MAX(updated_at + 1, CAST(strftime('%s', 'now') AS INTEGER)) WHERE id = 1",
+        [],
+    )?;
+    Ok(())
+}
+
+fn mark_library_updated(
+    connection: &Connection,
+    library_name: &str,
+    scanned: bool,
+) -> Result<(), rusqlite::Error> {
+    let query = if scanned {
+        "UPDATE library_groups SET scanned_at = MAX(scanned_at + 1, CAST(strftime('%s', 'now') AS INTEGER)), updated_at = MAX(updated_at + 1, CAST(strftime('%s', 'now') AS INTEGER)) WHERE name = ?1"
+    } else {
+        "UPDATE library_groups SET updated_at = MAX(updated_at + 1, CAST(strftime('%s', 'now') AS INTEGER)) WHERE name = ?1"
+    };
+    connection.execute(query, [library_name])?;
+    update_library_catalog_timestamp(connection)
+}
+
+fn library_publication_state(
+    state: &AppState,
+    library_name: &str,
+    fallback_section: usize,
+) -> (i64, u64, u64) {
+    state
+        .db
+        .lock()
+        .ok()
+        .and_then(|connection| {
+            connection
+                .query_row(
+                    "SELECT id, scanned_at, updated_at FROM library_groups WHERE name = ?1",
+                    [library_name],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, u64>(2)?,
+                        ))
+                    },
+                )
+                .ok()
+        })
+        .unwrap_or((fallback_section as i64, 0, 0))
+}
+
+fn library_catalog_updated_at(state: &AppState) -> u64 {
+    state
+        .db
+        .lock()
+        .ok()
+        .and_then(|connection| {
+            connection
+                .query_row(
+                    "SELECT updated_at FROM library_catalog_state WHERE id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .ok()
+        })
+        .unwrap_or_default()
 }
 
 fn open_database(
@@ -1230,6 +1355,13 @@ fn open_database(
              plex_account_token TEXT,
              claimed INTEGER NOT NULL DEFAULT 0,
              plex_last_error TEXT
+         );
+         CREATE TABLE IF NOT EXISTS tv_show_identity (
+             show_id TEXT PRIMARY KEY,
+             library_section INTEGER NOT NULL,
+             relative_path TEXT NOT NULL,
+             title TEXT NOT NULL,
+             UNIQUE (library_section, relative_path)
          );
          CREATE TABLE IF NOT EXISTS plex_auth (
              id INTEGER PRIMARY KEY,
@@ -1288,7 +1420,13 @@ fn open_database(
              id INTEGER PRIMARY KEY AUTOINCREMENT,
              name TEXT NOT NULL UNIQUE,
              kind TEXT NOT NULL DEFAULT 'other',
-             added_at INTEGER NOT NULL
+             added_at INTEGER NOT NULL,
+             scanned_at INTEGER NOT NULL DEFAULT 0,
+             updated_at INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE TABLE IF NOT EXISTS library_catalog_state (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             updated_at INTEGER NOT NULL
          );
          CREATE TABLE IF NOT EXISTS library_folders (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1340,6 +1478,22 @@ fn open_database(
         "ALTER TABLE watch_progress ADD COLUMN hidden_from_continue INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    let _ = connection.execute(
+        "ALTER TABLE library_groups ADD COLUMN scanned_at INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = connection.execute(
+        "ALTER TABLE library_groups ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    connection.execute(
+        "UPDATE library_groups SET updated_at = added_at WHERE updated_at = 0",
+        [],
+    )?;
+    connection.execute(
+        "INSERT OR IGNORE INTO library_catalog_state (id, updated_at) VALUES (1, strftime('%s', 'now'))",
+        [],
+    )?;
     let machine_identifier = connection
         .query_row(
             "SELECT machine_identifier FROM server_identity WHERE id = 1",
@@ -1452,6 +1606,7 @@ struct SettingsQuery {
     inventory_error: Option<bool>,
     tab: Option<String>,
     library_renamed: Option<bool>,
+    library_created: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -2751,7 +2906,7 @@ async fn settings_page(
     let mut list = list;
     list.insert_str(
         0,
-        r#"<form class="library-card" method="post" action="/settings/scan"><strong>Scan all libraries</strong><button type="submit">Scan all libraries</button></form>"#,
+        r#"<form class="library-card" method="post" action="/settings/scan"><button type="submit">Scan all libraries</button></form>"#,
     );
     let error = query
         .error
@@ -2797,6 +2952,11 @@ async fn settings_page(
             })
         })
         .or_else(|| {
+            query.library_created.filter(|created| *created).map(|_| {
+                "<div class=\"flash-notice\" role=\"status\">Library created and added to Plex discovery.</div>".to_owned()
+            })
+        })
+        .or_else(|| {
             query.library_renamed.filter(|saved| *saved).map(|_| {
                 "<div class=\"flash-notice\" role=\"status\">Library name saved.</div>".to_owned()
             })
@@ -2825,11 +2985,52 @@ async fn settings_page(
         String::new()
     };
     let notice = format!(
-        "<nav class=\"settings-tabs\" aria-label=\"Settings sections\"><a class=\"{}\" href=\"/settings\">Libraries</a><a class=\"{}\" href=\"/settings?tab=logs\">Logs</a></nav>{notice}",
+        "<nav class=\"settings-tabs\" aria-label=\"Settings sections\"><a class=\"{}\" href=\"/settings\">Libraries</a><a class=\"{}\" href=\"/settings?tab=logs\">Logs</a></nav>{}<dialog id=\"folder-picker\" aria-labelledby=\"folder-picker-title\" style=\"position:relative;width:min(48rem,calc(100vw - 2rem));height:min(38rem,calc(100vh - 2rem));padding:3.5rem 0 0;border:1px solid #394a63;border-radius:1rem;color:#e5eaf4;background:#101a2b\"><header style=\"position:absolute;top:.65rem;left:1rem;right:1rem;display:flex;align-items:center;justify-content:space-between\"><h2 id=\"folder-picker-title\">Choose a media folder</h2><button id=\"folder-picker-close\" type=\"button\" aria-label=\"Close folder picker\" title=\"Close folder picker\">×</button></header><iframe id=\"folder-picker-frame\" title=\"Media folder browser\" src=\"/settings/browse\" style=\"width:100%;height:calc(100% - 1rem);border:0;border-radius:0 0 1rem 1rem\"></iframe></dialog><script>document.addEventListener('DOMContentLoaded',()=>{{const params=new URLSearchParams(location.search);if(params.get('add_library')==='true')document.querySelector('.add-library')?.setAttribute('open','');const openLibrary=Number(params.get('library_open'));if(Number.isInteger(openLibrary)&&openLibrary>=0)document.querySelectorAll('.library-list details.library-card')[openLibrary]?.setAttribute('open','');}});</script>",
         if logs_active { "" } else { "active" },
         if logs_active { "active" } else { "" },
+        notice
     );
     let current_server_name = html(&server_name(&state));
+    let folder_picker_script = r#"<style>#folder-picker[open]{position:fixed!important;inset:0!important;margin:auto!important}#folder-picker::backdrop{background:rgba(4,8,16,.78)}#folder-picker-close{position:absolute;top:.3rem;right:0}</style><script>
+const folderPicker = document.querySelector('#folder-picker');
+const folderPickerFrame = document.querySelector('#folder-picker-frame');
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('.library-add-folder .inline-form').forEach(form => {
+    const input = form.querySelector('input[name="path"]');
+    if (!input) return;
+    const browse = document.createElement('a');
+    browse.href = '/settings/browse';
+    browse.className = 'button-link button-secondary';
+    browse.textContent = 'Browse';
+    input.insertAdjacentElement('afterend', browse);
+  });
+  if (!new URLSearchParams(location.search).has('library_open')) {
+    document.querySelectorAll('.library-list details.library-card').forEach(card => card.removeAttribute('open'));
+  }
+});
+document.addEventListener('click', event => {
+  const browse = event.target.closest?.('a[href="/settings/browse"]');
+  if (browse) {
+    event.preventDefault();
+    const input = browse.previousElementSibling;
+    if (!input || !folderPicker) return;
+    folderPicker.dataset.target = input.id;
+    const url = new URL(browse.href, location.origin);
+    if (input.value.trim()) url.searchParams.set('path', input.value.trim());
+    folderPickerFrame.src = url.pathname + url.search;
+    folderPicker.showModal();
+    return;
+  }
+  if (event.target.closest?.('#folder-picker-close')) folderPicker?.close();
+});
+window.addEventListener('message', event => {
+  if (event.origin !== location.origin || event.data?.type !== 'mplex-folder-selected') return;
+  const input = document.getElementById(folderPicker?.dataset.target || '');
+  if (input) input.value = event.data.path;
+  folderPicker?.close();
+});
+</script>"#;
+    let notice = format!("{notice}{folder_picker_script}");
     let tmdb_token_status = if tmdb_token_saved {
         "<p class=\"credential-status is-saved\"><span class=\"status-dot\"></span>TMDB token is saved. Leave the field blank to keep it, or enter a new token to replace it.</p>"
     } else {
@@ -3027,6 +3228,10 @@ async fn scan_library_metadata(
     let Some(library) = config.libraries.get(library_id) else {
         return settings_error("Library does not exist");
     };
+    if library.kind == "other" {
+        info!(library = %library.name, "TMDB metadata matching skipped for other library kind");
+        return Redirect::to("/settings?metadata_matched=0").into_response();
+    }
     let client = reqwest::Client::new();
     let token = config
         .tmdb_bearer_token
@@ -3645,6 +3850,9 @@ async fn scan_media_metadata(
     let Some(library) = config.libraries.get(library_id) else {
         return settings_error("Library does not exist");
     };
+    if library.kind == "other" {
+        return settings_error("TMDB matching is not available for Other libraries");
+    }
     let sidecar_mode = config.metadata_storage == "sidecar";
     let Some(token) = config
         .tmdb_bearer_token
@@ -4991,6 +5199,14 @@ fn settings_error(message: &str) -> Response {
     Redirect::to(&location).into_response()
 }
 
+fn library_form_error(message: &str) -> Response {
+    Redirect::to(&format!(
+        "/settings?add_library=true&error={}",
+        url_encode(message)
+    ))
+    .into_response()
+}
+
 async fn settings_browse(Query(query): Query<BrowseQuery>) -> Response {
     let at_root = query.path.is_none();
     let directory = query
@@ -5054,20 +5270,25 @@ async fn settings_browse(Query(query): Query<BrowseQuery>) -> Response {
     } else {
         String::new()
     };
-    Html(format!(
+    let page = format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Choose folder · harbringer</title><style>body {{ margin: 0; padding: 2rem; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} main {{ max-width: 820px; margin: auto; }} a {{ color: #93c5fd; }} .toolbar {{ display: flex; flex-wrap: wrap; gap: .6rem; margin: 1.2rem 0; }} .shortcut, .action {{ display: inline-block; padding: .6rem .8rem; border: 1px solid #374151; border-radius: .5rem; text-decoration: none; background: #1f2937; }} .folder-list {{ padding: 0; list-style: none; border: 1px solid #374151; border-radius: .6rem; overflow: hidden; }} .folder {{ display: flex; justify-content: space-between; gap: 1rem; padding: .8rem 1rem; border-bottom: 1px solid #374151; }} .folder:last-child {{ border-bottom: 0; }} .open {{ margin-right: 1rem; }} code, .note {{ color: #9ca3af; overflow-wrap: anywhere; }} </style></head><body><main><p><a href="/settings">← Back to Settings</a></p><h1>Choose a media folder</h1><p class="note">Pick a folder on the harbringer server. You can add more folders to the same library after this.</p><p><strong>Current folder:</strong> <code>{}</code></p><div class="toolbar"><a class="action" href="/settings/browse?path={}">⬆ Parent</a><a class="action" href="/settings?folder={}">Choose this folder</a></div>{}<ul class="folder-list">{}</ul></main></body></html>"#,
         html(&directory.to_string_lossy()),
         url_encode(&parent.to_string_lossy()),
         url_encode(&directory.to_string_lossy()),
         shortcuts,
         items
-    )).into_response()
+    );
+    let page = page.replace(
+        "</body>",
+        "<script>document.addEventListener('click',event=>{const link=event.target.closest?.('a.choose, .toolbar a.action[href*=\\\"/settings?folder=\\\"]');if(!link||window.parent===window)return;event.preventDefault();const path=new URL(link.href,location.origin).searchParams.get('folder');window.parent.postMessage({type:'mplex-folder-selected',path},location.origin);});</script></body>",
+    );
+    Html(page).into_response()
 }
 
 async fn create_library(State(state): State<AppState>, RawForm(raw): RawForm) -> Response {
     let fields = match serde_urlencoded::from_bytes::<Vec<(String, String)>>(&raw) {
         Ok(fields) => fields,
-        Err(_) => return settings_error("Invalid library form"),
+        Err(_) => return library_form_error("Invalid library form"),
     };
     let mut name = String::new();
     let mut kind = String::new();
@@ -5082,14 +5303,14 @@ async fn create_library(State(state): State<AppState>, RawForm(raw): RawForm) ->
     }
     let kind = match kind.as_str() {
         "movie" | "tv" | "other" => kind,
-        _ => return settings_error("Invalid library type"),
+        _ => return library_form_error("Invalid library type"),
     };
     let name = name.trim();
     if name.is_empty() {
-        return settings_error("Library name is required");
+        return library_form_error("Library name is required");
     }
     if paths.is_empty() {
-        return settings_error("At least one folder is required");
+        return library_form_error("At least one folder is required");
     }
     let mut canonical_paths = Vec::with_capacity(paths.len());
     for value in paths
@@ -5098,26 +5319,26 @@ async fn create_library(State(state): State<AppState>, RawForm(raw): RawForm) ->
         .filter(|value| !value.is_empty())
     {
         let Ok(path_metadata) = tokio::fs::metadata(value).await else {
-            return settings_error(&format!("Directory does not exist: {}", value));
+            return library_form_error(&format!("Directory does not exist: {}", value));
         };
         if !path_metadata.is_dir() {
-            return settings_error(&format!("Not a directory: {}", value));
+            return library_form_error(&format!("Not a directory: {}", value));
         }
         let Ok(path) = tokio::fs::canonicalize(value).await else {
-            return settings_error(&format!("Directory could not be resolved: {}", value));
+            return library_form_error(&format!("Directory could not be resolved: {}", value));
         };
         if !canonical_paths.contains(&path) {
             canonical_paths.push(path);
         }
     }
     if canonical_paths.is_empty() {
-        return settings_error("At least one folder is required");
+        return library_form_error("At least one folder is required");
     }
     let Ok(mut config) = state.config.lock() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     if config.libraries.iter().any(|library| library.name == name) {
-        return settings_error("A library with that name already exists");
+        return library_form_error("A library with that name already exists");
     }
     config.libraries.push(ConfigLibrary {
         name: name.to_owned(),
@@ -5132,7 +5353,17 @@ async fn create_library(State(state): State<AppState>, RawForm(raw): RawForm) ->
     if save_config(&state.config_path, &config).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    Redirect::to("/settings").into_response()
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if sync_config_libraries(&connection, &config).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    Redirect::to(&format!(
+        "/settings?library_created=true&add_library=true&library_open={}",
+        config.libraries.len() - 1
+    ))
+    .into_response()
 }
 
 async fn add_library_folder(
@@ -5156,13 +5387,20 @@ async fn add_library_folder(
         return settings_error("Library does not exist");
     };
     if library.folders.iter().any(|folder| folder == &path) {
-        return Redirect::to("/settings").into_response();
+        return Redirect::to(&format!("/settings?library_open={}", form.library_id))
+            .into_response();
     }
     library.folders.push(path);
     if save_config(&state.config_path, &config).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    Redirect::to("/settings").into_response()
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if sync_config_libraries(&connection, &config).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    Redirect::to(&format!("/settings?library_open={}", form.library_id)).into_response()
 }
 
 async fn rename_library(
@@ -5187,6 +5425,7 @@ async fn rename_library(
     if library_id >= config.libraries.len() {
         return settings_error("Library does not exist");
     }
+    let old_name = config.libraries[library_id].name.clone();
     if config
         .libraries
         .iter()
@@ -5197,6 +5436,16 @@ async fn rename_library(
     }
     config.libraries[library_id].name = name.to_owned();
     if save_config(&state.config_path, &config).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let updated = connection.execute(
+        "UPDATE library_groups SET name = ?1, updated_at = MAX(updated_at + 1, CAST(strftime('%s', 'now') AS INTEGER)) WHERE name = ?2",
+        (&name, &old_name),
+    );
+    if updated.is_err() || update_library_catalog_timestamp(&connection).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     Redirect::to("/settings?library_renamed=true").into_response()
@@ -5311,6 +5560,9 @@ async fn delete_library(State(state): State<AppState>, Path(library_id): Path<us
     {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    if update_library_catalog_timestamp(&transaction).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     if save_config(&state.config_path, &updated_config).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -5330,6 +5582,8 @@ struct WebPath {
     play: Option<String>,
     episode: Option<String>,
     view: Option<String>,
+    show_id: Option<String>,
+
 }
 
 fn selected_library_root(state: &AppState, library: Option<usize>) -> PathBuf {
@@ -8330,7 +8584,7 @@ async fn log_not_found(State(state): State<AppState>, req: Request<Body>) -> Res
     ) {
         let (mut parts, _) = req.into_parts();
         return match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
-            Ok(upgrade) => plex_notification_response(upgrade),
+            Ok(upgrade) => plex_notification_response(upgrade, state.clone()),
             Err(rejection) => rejection.into_response(),
         };
     }
@@ -8778,6 +9032,7 @@ async fn plex_sections(State(state): State<AppState>) -> Response {
     plex_json(serde_json::json!({
         "MediaContainer": {
             "size": sections.0,
+            "updatedAt": library_catalog_updated_at(&state),
             "Directory": sections.1
         }
     }))
@@ -8956,10 +9211,7 @@ async fn plex_servers(State(state): State<AppState>) -> Response {
 }
 
 async fn plex_media_providers(State(state): State<AppState>) -> Response {
-    let updated_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default();
+    let updated_at = library_catalog_updated_at(&state);
     let mut directories = state
         .config
         .lock()
@@ -8971,19 +9223,21 @@ async fn plex_media_providers(State(state): State<AppState>) -> Response {
                 .enumerate()
                 .map(|(index, library)| {
                     let section = index + 1;
+                    let (_, scanned_at, library_updated_at) =
+                        library_publication_state(&state, &library.name, section);
                     serde_json::json!({
                         "agent": if library.kind == "tv" { "tv.plex.agents.series" } else { "tv.plex.agents.movie" },
                         "scanner": if library.kind == "tv" { "Plex TV Series" } else { "Plex Movie" },
                         "language": "en-US",
-                        "uuid": plex_library_uuid(&state.machine_identifier, section),
+                        "uuid": plex_library_uuid(&state, &library.name, section),
                         "id": section.to_string(),
                         "key": format!("/library/sections/{section}"),
                         "hubKey": format!("/hubs/sections/{section}"),
                         "type": plex_kind(&library.kind),
                         "title": library.name,
                         "refreshing": false,
-                        "scannedAt": updated_at,
-                        "updatedAt": updated_at,
+                        "scannedAt": scanned_at,
+                        "updatedAt": library_updated_at,
                         "Pivot": [
                             {"id": "recommended", "key": format!("/hubs/sections/{section}"), "type": "hub", "title": "Recommended", "context": "content.discover", "symbol": "star"},
                             {"id": "library", "key": format!("/library/sections/{section}/all?type={}", if library.kind == "tv" { 2 } else { 1 }), "type": "list", "title": "Library", "context": "content.library", "symbol": "library"},
@@ -9211,9 +9465,78 @@ async fn plex_continue_watching_hub(
     }))
 }
 
-fn plex_notification_response(upgrade: WebSocketUpgrade) -> Response {
+fn plex_stale_media_notification(state: &AppState) -> Option<String> {
+    let active_media_ids = media_snapshot(state)
+        .iter()
+        .map(|media| media.id.clone())
+        .collect::<HashSet<_>>();
+    let connection = state.db.lock().ok()?;
+    let mut statement = connection
+        .prepare("SELECT library_section, media_key, canonical_path FROM media_identity")
+        .ok()?;
+    let entries = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|(section, media_key, path)| {
+            let section = u64::try_from(section).ok()?;
+            if section == 0 || active_media_ids.contains(&media_key) {
+                return None;
+            }
+            let item_id = media_key
+                .split_once('-')
+                .filter(|(media_section, _)| media_section.parse::<u64>().ok() == Some(section))
+                .and_then(|(_, item_id)| item_id.parse::<u64>().ok())?;
+            let rating_key = (section << 20) | item_id;
+            let title = path.rsplit(['/', '\\']).next().unwrap_or(&path);
+            Some(serde_json::json!({
+                "identifier": "com.plexapp.plugins.library",
+                "sectionID": section.to_string(),
+                "itemID": rating_key.to_string(),
+                "type": 1,
+                "title": title,
+                "state": 9,
+                "updatedAt": SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            }))
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return None;
+    }
+    Some(
+        serde_json::json!({
+            "NotificationContainer": {
+                "type": "timeline",
+                "size": entries.len(),
+                "TimelineEntry": entries
+            }
+        })
+        .to_string(),
+    )
+}
+
+fn plex_notification_response(upgrade: WebSocketUpgrade, state: AppState) -> Response {
     upgrade
-        .on_upgrade(|mut socket| async move {
+        .on_upgrade(move |mut socket| async move {
+            let mut notifications = state.plex_notifications.subscribe();
+            if let Some(notification) = plex_stale_media_notification(&state) {
+                if socket
+                    .send(Message::Text(notification.into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
             let mut heartbeat = tokio::time::interval_at(
                 tokio::time::Instant::now() + Duration::from_secs(10),
                 Duration::from_secs(10),
@@ -9239,6 +9562,15 @@ fn plex_notification_response(upgrade: WebSocketUpgrade) -> Response {
                             info!("Plex notification socket ended by client");
                             break;
                         }
+                    },
+                    notification = notifications.recv() => match notification {
+                        Ok(notification) => {
+                            if socket.send(Message::Text(notification.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     },
                     _ = heartbeat.tick() => {
                         if socket.send(Message::Ping(vec![b'?'].into())).await.is_err() {
@@ -9376,7 +9708,7 @@ async fn plex_hubs_response(
         container["librarySectionID"] = serde_json::json!(section);
         container["librarySectionTitle"] = serde_json::json!(library.name);
         container["librarySectionUUID"] =
-            serde_json::json!(plex_library_uuid(&state.machine_identifier, section));
+            serde_json::json!(plex_library_uuid(&state, &library.name, section));
     }
     plex_json(serde_json::json!({"MediaContainer": container}))
 }
@@ -9795,7 +10127,7 @@ async fn plex_related_hubs(
             "identifier": "com.plexapp.plugins.library",
             "librarySectionID": section,
             "librarySectionTitle": library.name,
-            "librarySectionUUID": plex_library_uuid(&state.machine_identifier, section),
+            "librarySectionUUID": plex_library_uuid(&state, &library.name, section),
             "Hub": hubs
         }
     }))
@@ -10180,17 +10512,21 @@ async fn plex_section(State(state): State<AppState>, Path(section): Path<usize>)
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let uuid = plex_library_uuid(&state.machine_identifier, section);
+    let uuid = plex_library_uuid(&state, &library.name, section);
+    let (_, scanned_at, updated_at) = library_publication_state(&state, &library.name, section);
     plex_json(serde_json::json!({
         "MediaContainer": {
             "size": 1,
+            "updatedAt": library_catalog_updated_at(&state),
             "librarySectionID": section,
             "librarySectionTitle": library.name,
             "Directory": [{
                 "key": format!("/library/sections/{section}/all"),
                 "type": plex_kind(&library.kind),
                 "title": library.name,
-                "uuid": uuid
+                "uuid": uuid,
+                "scannedAt": scanned_at,
+                "updatedAt": updated_at
             }]
         }
     }))
@@ -10244,8 +10580,17 @@ async fn plex_section_collections(
     };
     body["MediaContainer"]["librarySectionID"] = serde_json::json!(section);
     body["MediaContainer"]["librarySectionTitle"] = serde_json::json!(library.name);
-    body["MediaContainer"]["librarySectionUUID"] =
-        serde_json::json!(plex_library_uuid(&state.machine_identifier, section));
+    let stable_id = connection
+        .query_row(
+            "SELECT id FROM library_groups WHERE name = ?1",
+            [&library.name],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(section as i64);
+    body["MediaContainer"]["librarySectionUUID"] = serde_json::json!(plex_library_uuid_for_id(
+        &state.machine_identifier,
+        stable_id
+    ));
     body["MediaContainer"]["title1"] = serde_json::json!(library.name);
     body["MediaContainer"]["title2"] = serde_json::json!("Collections");
     body["MediaContainer"]["viewGroup"] = serde_json::json!(plex_kind(&library.kind));
@@ -10267,7 +10612,7 @@ async fn plex_section_sorts(State(state): State<AppState>, Path(section): Path<u
             "identifier": "com.plexapp.plugins.library",
             "librarySectionID": section,
             "librarySectionTitle": library.name,
-            "librarySectionUUID": plex_library_uuid(&state.machine_identifier, section),
+            "librarySectionUUID": plex_library_uuid(&state, &library.name, section),
             "title1": library.name,
             "Directory": [{
                 "key": "titleSort",
@@ -10299,7 +10644,7 @@ async fn plex_section_filters(
             "identifier": "com.plexapp.plugins.library",
             "librarySectionID": section,
             "librarySectionTitle": library.name,
-            "librarySectionUUID": plex_library_uuid(&state.machine_identifier, section),
+            "librarySectionUUID": plex_library_uuid(&state, &library.name, section),
             "title1": library.name,
             "viewGroup": "secondary",
             "Directory": []
@@ -10372,7 +10717,7 @@ async fn plex_section_first_characters(
             "identifier": "com.plexapp.plugins.library",
             "librarySectionID": section,
             "librarySectionTitle": library.name,
-            "librarySectionUUID": plex_library_uuid(&state.machine_identifier, section),
+            "librarySectionUUID": plex_library_uuid(&state, &library.name, section),
             "title1": library.name,
             "viewGroup": "secondary",
             "Directory": directory
@@ -10446,7 +10791,7 @@ async fn plex_section_first_character_items(
     let mut container = plex_library_media_container(
         &library,
         section,
-        &plex_library_uuid(&state.machine_identifier, section),
+        &plex_library_uuid(&state, &library.name, section),
         items.len(),
         offset,
         total,
@@ -10725,7 +11070,7 @@ async fn plex_all(
         });
     }
     let total = media.len();
-    let uuid = plex_library_uuid(&s.machine_identifier, section);
+    let uuid = plex_library_uuid(&s, &library.name, section);
     let (offset, end) = plex_container_page(&headers, &uri)
         .map(|(requested_offset, requested_size)| {
             let offset = requested_offset.min(total);
@@ -10797,7 +11142,7 @@ async fn plex_tv_all(
     let mut container = plex_library_media_container(
         &library,
         section,
-        &plex_library_uuid(&state.machine_identifier, section),
+        &plex_library_uuid(state, &library.name, section),
         items.len(),
         offset,
         total,
@@ -11115,7 +11460,7 @@ async fn plex_item(
             show.title = show_title.to_owned();
         }
         let show_guid = plex_tv_show_guid(&show, &metadata);
-        let uuid = plex_library_uuid(&s.machine_identifier, section);
+        let uuid = plex_library_uuid(&s, &library.name, section);
         if let Some(season) = season {
             let season_episodes = plex_tv_season_groups(&show, &library.folders)
                 .remove(&season)
@@ -11203,6 +11548,64 @@ async fn plex_item(
         return plex_json(serde_json::json!({"MediaContainer": container}));
     }
     let Some(media) = find_media(&s, &id) else {
+        let media_key = id
+            .split_once('-')
+            .filter(|(section, item)| {
+                section.parse::<usize>().is_ok() && item.parse::<u64>().is_ok()
+            })
+            .map(|_| id.clone())
+            .or_else(|| {
+                id.parse::<u64>().ok().and_then(|rating_key| {
+                    let section = rating_key >> 20;
+                    let item = rating_key & ((1 << 20) - 1);
+                    (section > 0 && item > 0).then(|| format!("{section}-{item}"))
+                })
+            });
+        let known_stale_key = media_key.as_ref().is_some_and(|key| {
+            s.db.lock()
+                .ok()
+                .and_then(|connection| {
+                    connection
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM media_identity WHERE media_key = ?1)",
+                            [key],
+                            |row| row.get::<_, bool>(0),
+                        )
+                        .ok()
+                })
+                .unwrap_or(false)
+        });
+        let section = media_key
+            .as_deref()
+            .and_then(|key| key.split_once('-'))
+            .and_then(|(section, _)| section.parse::<usize>().ok())
+            .filter(|section| {
+                *section > 0
+                    && s.config
+                        .lock()
+                        .map(|config| *section <= config.libraries.len())
+                        .unwrap_or(false)
+            });
+        if known_stale_key {
+            if let Some(section) = section {
+                if scan_library_inventory(&s, section - 1).await.is_ok() {
+                    if let Ok(config) = s.config.lock().map(|config| config.clone()) {
+                        if let Some(library) = config.libraries.get(section - 1) {
+                            let mut container = plex_library_media_container(
+                                library,
+                                section,
+                                &plex_library_uuid(&s, &library.name, section),
+                                0,
+                                0,
+                                0,
+                            );
+                            container["Metadata"] = serde_json::json!([]);
+                            return plex_json(serde_json::json!({"MediaContainer": container}));
+                        }
+                    }
+                }
+            }
+        }
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some((section, library)) = media_library(&s, &media) else {
@@ -11253,7 +11656,7 @@ async fn plex_item(
     let mut container = plex_library_media_container(
         &library,
         section,
-        &plex_library_uuid(&s.machine_identifier, section),
+        &plex_library_uuid(&s, &library.name, section),
         1,
         0,
         1,
@@ -11283,7 +11686,7 @@ async fn plex_extras(State(state): State<AppState>, Path(id): Path<String>) -> R
     plex_json(plex_empty_extras_response(
         &library,
         section,
-        &plex_library_uuid(&state.machine_identifier, section),
+        &plex_library_uuid(&state, &library.name, section),
     ))
 }
 
@@ -11395,8 +11798,15 @@ fn plex_collection_summary(
         {
             summary["librarySectionID"] = serde_json::json!(section);
             summary["librarySectionTitle"] = serde_json::json!(library.name);
+            let stable_id = connection
+                .query_row(
+                    "SELECT id FROM library_groups WHERE name = ?1",
+                    [&library.name],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(section as i64);
             summary["librarySectionUUID"] =
-                serde_json::json!(plex_library_uuid(machine_identifier, section));
+                serde_json::json!(plex_library_uuid_for_id(machine_identifier, stable_id));
             summary["librarySectionKey"] =
                 serde_json::json!(format!("/library/sections/{section}"));
         }
@@ -12286,7 +12696,7 @@ async fn plex_create_play_queue(
     // also serves as the compact integer playQueueItemID expected by PMS clients.
     let queue_item_id = queue_id;
     item["playQueueItemID"] = serde_json::json!(queue_item_id);
-    let library_uuid = plex_library_uuid(&state.machine_identifier, section);
+    let library_uuid = plex_library_uuid(&state, &library.name, section);
     let plex_rating_key = plex_rating_key(&media).to_string();
     let normalized_source_uri = plex_play_queue_source_uri(&library_uuid, &plex_rating_key);
     let selected_metadata_item_id = plex_rating_key.parse::<u64>().unwrap_or_default();
@@ -12356,7 +12766,7 @@ async fn plex_playback_decision(
     let metadata_by_id = plex_section_metadata(&state, section);
     let mut video = plex_video_json(&media, section, &library, metadata_by_id.get(&media.id));
     add_plex_technical_metadata(&state, &mut video, &media).await;
-    let library_uuid = plex_library_uuid(&state.machine_identifier, section);
+    let library_uuid = plex_library_uuid(&state, &library.name, section);
     if query.get("directPlay").map(String::as_str) != Some("0") {
         plex_mark_direct_play(&mut video);
         info!(media_id, section, "Plex direct-play decision returned");
@@ -12788,6 +13198,8 @@ fn plex_section_directories(state: &AppState) -> (usize, Vec<serde_json::Value>)
         .enumerate()
         .map(|(index, library)| {
             let section = index + 1;
+            let (_, scanned_at, updated_at) =
+                library_publication_state(state, &library.name, section);
             serde_json::json!({
                 "key": format!("/library/sections/{section}"),
                 "type": plex_kind(&library.kind),
@@ -12795,7 +13207,9 @@ fn plex_section_directories(state: &AppState) -> (usize, Vec<serde_json::Value>)
                 "agent": if library.kind == "tv" { "tv.plex.agents.series" } else { "tv.plex.agents.movie" },
                 "scanner": if library.kind == "tv" { "Plex TV Series" } else { "Plex Movie" },
                 "language": "en-US",
-                "uuid": plex_library_uuid(&state.machine_identifier, section),
+                "uuid": plex_library_uuid(state, &library.name, section),
+                "scannedAt": scanned_at,
+                "updatedAt": updated_at,
                 "refreshing": false
             })
         })

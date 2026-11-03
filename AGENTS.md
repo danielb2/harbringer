@@ -33,6 +33,6 @@ Project guidance for `mplex`: the target is a 100% drop-in replacement for Plex'
 
 ## Documentation and UI rules
 
-- Keep `README.md`, `ROADMAP.md`, and `CHANGELOG.md` in sync with behavior changes. Each change needs a brief reflection recording what changed, why, and the checks run.
+- Keep `README.md` and `ROADMAP.md` in sync with behavior changes. Before a requested commit, update only these two documentation files; record a brief reflection in `ROADMAP.md` with what changed, why, and the checks run. Do not update `CHANGELOG.md` unless explicitly requested.
 - Dialog close controls must stay fixed at the dialog's top-right corner, have an accessible label and tooltip, and close on Escape.
 - Follow DRY principles across UI components, markup, styles, route behavior, data transformations, validation, and media logic. Home and Library presentation should share implementations where sensible.

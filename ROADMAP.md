@@ -41,7 +41,10 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 ### 3. Library and metadata behavior
 
 - [x] Expose configured libraries as Plex sections and return media metadata with technical tracks and matched metadata.
+- [x] Publish stable per-library UUIDs and persisted scan/catalog timestamps through provider and section discovery.
+- [x] Skip TMDB matching for libraries with kind `other`.
 - [x] Refresh the shared Plex/web inventory with a Settings scan-all action and per-library automatic scans, enabled by default every five minutes.
+- [x] Reconcile the affected Plex library section when a client requests a stale media metadata key; preserve the library and remaining items after episode removal.
 - [x] Provide a built-in Media/Files switch; Files lists visible directories and all visible files, including unsupported formats.
 - [x] Support current title/date/rating sorts, basic recommendations, Plex artwork URLs, external subtitles, and section pagination.
 - [x] Implement Plex title search and confirm Plezy returns local-library results.
@@ -67,7 +70,8 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 - [ ] Implement persistent Plex users, permissions, server preferences, and account responses with documented semantics.
 - [x] Persist watch progress for the current local user from Plex timeline/scrobble and browser playback requests.
 - [ ] Return actual active playback sessions and activities rather than empty containers.
-- [ ] Publish library and playback events over Plex notification connections, and validate reconnect behavior.
+- [x] Publish timeline deletion events for media removed by a library scan over Plex notification connections.
+- [ ] Publish other library and playback events over Plex notification connections, and validate reconnect behavior.
 - [ ] Audit and implement server management, library management, device, diagnostics, and other client-used operations in the official API inventory.
 
 ### 6. Release validation
@@ -83,6 +87,12 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 - [ ] Add an embeddable Rust library API after the server compatibility gates are met.
 
 ## Gap log
+
+### 2026-11-03
+
+- Settings removes the duplicate scan label and uses a modal server-folder browser. The add-library panel and affected library card stay open after create or folder changes.
+- Plex Web request traces show `/media/providers` requests after library changes. The live provider and section responses include the TV library. Provider entries previously used the request time for both timestamps, and section IDs determined UUIDs. They now report persisted scan/catalog timestamps and use the database library identity for UUIDs, so deleting an earlier section does not change a surviving library's UUID. Protocol tests cover these fields and reordering; real-client visibility remains unverified.
+- Validation: `cargo test` passed all 87 tests; `cargo build`, `cargo fmt --check`, and `git diff --check` passed.
 
 ### 2026-11-02
 

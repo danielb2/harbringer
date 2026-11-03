@@ -140,6 +140,7 @@ fn fixture() -> Fixture {
     media.metadata_revision = change_stamp.saturating_add(60);
     let shared_config = Arc::new(Mutex::new(config));
     let shared_db = Arc::new(Mutex::new(db));
+    let (plex_notifications, _) = tokio::sync::broadcast::channel(64);
     let state = AppState {
         config: shared_config.clone(),
         config_path: Arc::new(config_path),
@@ -149,6 +150,7 @@ fn fixture() -> Fixture {
         root: Arc::new(media_dir),
         media: Arc::new(super::RwLock::new(Arc::new(vec![media]))),
         inventory_scan_lock: Arc::new(tokio::sync::Mutex::new(())),
+        plex_notifications,
         media_info: Arc::new(Mutex::new(HashMap::new())),
         plex_stream_selections: Arc::new(Mutex::new(HashMap::new())),
         plex_play_queues: Arc::new(Mutex::new(HashMap::new())),
@@ -221,6 +223,7 @@ fn tv_fixture() -> Fixture {
     let change_stamp = super::media_modified_at(&media[0]);
     let shared_config = Arc::new(Mutex::new(config));
     let shared_db = Arc::new(Mutex::new(db));
+    let (plex_notifications, _) = tokio::sync::broadcast::channel(64);
     let state = AppState {
         config: shared_config.clone(),
         config_path: Arc::new(config_path),
@@ -230,6 +233,7 @@ fn tv_fixture() -> Fixture {
         root: Arc::new(media_dir),
         media: Arc::new(super::RwLock::new(Arc::new(media))),
         inventory_scan_lock: Arc::new(tokio::sync::Mutex::new(())),
+        plex_notifications,
         media_info: Arc::new(Mutex::new(HashMap::new())),
         plex_stream_selections: Arc::new(Mutex::new(HashMap::new())),
         plex_play_queues: Arc::new(Mutex::new(HashMap::new())),
@@ -639,6 +643,83 @@ async fn manual_scan_updates_web_and_plex_inventory_without_changing_existing_id
 }
 
 #[tokio::test]
+async fn stale_episode_request_rescans_without_hiding_its_library() {
+    let fixture = tv_fixture();
+    {
+        let mut media = fixture.state.media.write().unwrap();
+        let mut updated = media.as_ref().clone();
+        updated[0].id = "1-1".to_owned();
+        updated[1].id = "1-2".to_owned();
+        *media = Arc::new(updated);
+    }
+    let initial_scan = send(&fixture.app, Method::POST, "/settings/scan", Body::empty()).await;
+    assert_eq!(initial_scan.status(), StatusCode::SEE_OTHER);
+    let mut notifications = fixture.state.plex_notifications.subscribe();
+
+    let removed_episode = super::media_snapshot(&fixture.state)[0].clone();
+    let rating_key = super::plex_rating_key(&removed_episode);
+    std::fs::remove_file(&removed_episode.path).unwrap();
+
+    let scan = send(&fixture.app, Method::POST, "/settings/scan", Body::empty()).await;
+    assert_eq!(scan.status(), StatusCode::SEE_OTHER);
+    let notification: serde_json::Value =
+        serde_json::from_str(&notifications.try_recv().unwrap()).unwrap();
+    assert_eq!(notification["NotificationContainer"]["type"], "timeline");
+    assert_eq!(
+        notification["NotificationContainer"]["TimelineEntry"][0]["sectionID"],
+        "1"
+    );
+    assert_eq!(
+        notification["NotificationContainer"]["TimelineEntry"][0]["itemID"],
+        rating_key.to_string()
+    );
+    assert_eq!(
+        notification["NotificationContainer"]["TimelineEntry"][0]["state"],
+        9
+    );
+    let reconnect_notification: serde_json::Value =
+        serde_json::from_str(&super::plex_stale_media_notification(&fixture.state).unwrap())
+            .unwrap();
+    assert_eq!(
+        reconnect_notification["NotificationContainer"]["TimelineEntry"][0]["itemID"],
+        rating_key.to_string()
+    );
+
+    let stale_item = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/library/metadata/{rating_key}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(stale_item.status(), StatusCode::OK);
+    let stale_item: serde_json::Value =
+        serde_json::from_slice(&to_bytes(stale_item.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(stale_item["MediaContainer"]["size"], 0);
+
+    let sections = send(
+        &fixture.app,
+        Method::GET,
+        "/library/sections",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(sections.status(), StatusCode::OK);
+    let shows = send(
+        &fixture.app,
+        Method::GET,
+        "/library/sections/1/all?type=2",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(shows.status(), StatusCode::OK);
+    let shows: serde_json::Value =
+        serde_json::from_slice(&to_bytes(shows.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(shows["MediaContainer"]["totalSize"], 1);
+}
+
+#[tokio::test]
 async fn manual_scan_adds_new_tv_episode_to_plex_inventory() {
     let fixture = tv_fixture();
     let season = fixture.root.join("media/Example Show/Season 01");
@@ -664,6 +745,38 @@ async fn manual_scan_adds_new_tv_episode_to_plex_inventory() {
     let shows = json["MediaContainer"]["Metadata"].as_array().unwrap();
     assert_eq!(shows.len(), 1);
     assert_eq!(shows[0]["leafCount"], 3);
+}
+
+#[tokio::test]
+async fn other_libraries_skip_tmdb_metadata_matching() {
+    let fixture = fixture();
+    fixture.config.lock().unwrap().libraries[0].kind = "other".to_owned();
+
+    let scan = send(
+        &fixture.app,
+        Method::POST,
+        "/settings/libraries/0/scan",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(scan.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        scan.headers()[header::LOCATION],
+        "/settings?metadata_matched=0"
+    );
+
+    let manual_match = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/media/scan",
+        "library=0&path=Demo.mkv&title=Demo",
+    )
+    .await;
+    assert_eq!(manual_match.status(), StatusCode::SEE_OTHER);
+    assert!(manual_match.headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .contains("TMDB"));
 }
 
 #[tokio::test]
@@ -1710,6 +1823,113 @@ async fn deleting_a_library_removes_its_settings_but_keeps_media_files() {
     let sections_json: serde_json::Value =
         serde_json::from_slice(&to_bytes(sections.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(sections_json["MediaContainer"]["size"], 0);
+}
+
+#[tokio::test]
+async fn library_creation_keeps_settings_open_and_publishes_stable_scan_metadata() {
+    let fixture = fixture();
+    let media_root = fixture.root.join("media");
+    let form = format!(
+        "name=TV&kind=tv&path%5B%5D={}",
+        media_root.to_string_lossy()
+    );
+    let response = send_form(&fixture.app, Method::POST, "/settings/libraries", &form).await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response.headers()[header::LOCATION].to_str().unwrap();
+    assert!(location.contains("add_library=true"));
+    assert!(location.contains("library_open=1"));
+
+    let settings = send(&fixture.app, Method::GET, location, Body::empty()).await;
+    let settings_body = to_bytes(settings.into_body(), usize::MAX).await.unwrap();
+    let settings_body = String::from_utf8(settings_body.to_vec()).unwrap();
+    assert!(settings_body.contains("Library created and added to Plex discovery."));
+    assert!(settings_body.contains("id=\"folder-picker\""));
+    assert!(settings_body.contains("params.get('add_library')==='true'"));
+    assert!(settings_body.contains("mplex-folder-selected"));
+    assert!(!settings_body.contains("<strong>Scan all libraries</strong>"));
+    let browser = send(&fixture.app, Method::GET, "/settings/browse", Body::empty()).await;
+    let browser_body = to_bytes(browser.into_body(), usize::MAX).await.unwrap();
+    let browser_body = String::from_utf8(browser_body.to_vec()).unwrap();
+    assert!(browser_body.contains("window.parent.postMessage"));
+    assert!(browser_body.contains("mplex-folder-selected"));
+
+    let providers = send(&fixture.app, Method::GET, "/media/providers", Body::empty()).await;
+    let providers: serde_json::Value =
+        serde_json::from_slice(&to_bytes(providers.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let sections_feature = providers["MediaContainer"]["MediaProvider"][0]["Feature"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|feature| feature["key"] == "/library/sections")
+        .unwrap();
+    let tv = sections_feature["Directory"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|directory| directory["title"] == "TV")
+        .unwrap();
+    let tv_uuid = tv["uuid"].as_str().unwrap().to_owned();
+    assert_eq!(tv["scannedAt"], 0);
+    let updated_at_before_scan = providers["MediaContainer"]["updatedAt"].as_u64().unwrap();
+
+    assert_eq!(
+        crate::scan_library_inventory(&fixture.state, 1)
+            .await
+            .unwrap(),
+        1
+    );
+    let providers = send(&fixture.app, Method::GET, "/media/providers", Body::empty()).await;
+    let providers: serde_json::Value =
+        serde_json::from_slice(&to_bytes(providers.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let sections_feature = providers["MediaContainer"]["MediaProvider"][0]["Feature"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|feature| feature["key"] == "/library/sections")
+        .unwrap();
+    let tv = sections_feature["Directory"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|directory| directory["title"] == "TV")
+        .unwrap();
+    assert!(tv["scannedAt"].as_u64().unwrap() > 0);
+    assert_eq!(tv["uuid"], tv_uuid);
+    let updated_at_after_scan = providers["MediaContainer"]["updatedAt"].as_u64().unwrap();
+    assert!(
+        updated_at_after_scan > updated_at_before_scan,
+        "updatedAt did not advance: before={updated_at_before_scan}, after={updated_at_after_scan}"
+    );
+
+    let response = send(
+        &fixture.app,
+        Method::POST,
+        "/settings/libraries/0/delete",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let providers = send(&fixture.app, Method::GET, "/media/providers", Body::empty()).await;
+    let providers: serde_json::Value =
+        serde_json::from_slice(&to_bytes(providers.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let sections_feature = providers["MediaContainer"]["MediaProvider"][0]["Feature"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|feature| feature["key"] == "/library/sections")
+        .unwrap();
+    let directories = sections_feature["Directory"].as_array().unwrap();
+    assert_eq!(directories.len(), 2);
+    let tv = directories
+        .iter()
+        .find(|directory| directory["title"] == "TV")
+        .unwrap();
+    assert_eq!(tv["key"], "/library/sections/1");
+    assert_eq!(tv["uuid"], tv_uuid);
+    assert!(providers["MediaContainer"]["updatedAt"].as_u64().unwrap() > updated_at_after_scan);
 }
 
 #[test]
