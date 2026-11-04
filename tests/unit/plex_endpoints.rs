@@ -1265,6 +1265,42 @@ async fn plex_continue_watching_hub_tracks_progress_and_remove_action() {
         section_hubs["MediaContainer"]["Hub"][0]["title"],
         "Continue Watching"
     );
+    let section_shelves = section_hubs["MediaContainer"]["Hub"].as_array().unwrap();
+    assert!(section_shelves.iter().any(|hub| {
+        hub["key"]
+            .as_str()
+            .is_some_and(|key| key.ends_with("/recentlyAdded"))
+    }));
+    assert!(!section_shelves
+        .iter()
+        .any(|hub| hub["title"] == "Recommended"));
+
+    let recommended = send(
+        &fixture.app,
+        Method::GET,
+        "/hubs/sections/1/recommended",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(recommended.status(), StatusCode::NOT_FOUND);
+
+    let providers = send(&fixture.app, Method::GET, "/media/providers", Body::empty()).await;
+    let providers: serde_json::Value =
+        serde_json::from_slice(&to_bytes(providers.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let directories = providers
+        .pointer("/MediaContainer/MediaProvider/0/Feature/0/Directory")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    let movie_directory = directories
+        .iter()
+        .find(|directory| directory["type"] == "movie")
+        .unwrap();
+    let pivots = movie_directory["Pivot"].as_array().unwrap();
+    assert_eq!(pivots[0]["id"], "recommended");
+    assert!(!pivots.iter().any(|pivot| pivot["id"] == "continueWatching"));
+    assert!(!pivots.iter().any(|pivot| pivot["id"] == "recentlyAdded"));
     let continue_hub = section_hubs["MediaContainer"]["Hub"]
         .as_array()
         .unwrap()
@@ -1554,6 +1590,49 @@ async fn continue_watching_shows_only_the_first_unwatched_episode_per_show() {
         .as_str()
         .unwrap()
         .contains("S01E01.Pilot.mkv"));
+
+    let section_hubs = send(&fixture.app, Method::GET, "/hubs/sections/1", Body::empty()).await;
+    let section_hubs: serde_json::Value = serde_json::from_slice(
+        &to_bytes(section_hubs.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let hubs = section_hubs["MediaContainer"]["Hub"].as_array().unwrap();
+    assert_eq!(hubs[0]["title"], "Continue Watching");
+    assert!(hubs.iter().any(|hub| {
+        hub["key"]
+            .as_str()
+            .is_some_and(|key| key.ends_with("/recentlyAdded"))
+    }));
+    assert!(!hubs.iter().any(|hub| hub["title"] == "Recommended"));
+
+    let recommended = send(
+        &fixture.app,
+        Method::GET,
+        "/hubs/sections/1/recommended",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(recommended.status(), StatusCode::NOT_FOUND);
+
+    let providers = send(&fixture.app, Method::GET, "/media/providers", Body::empty()).await;
+    let providers: serde_json::Value =
+        serde_json::from_slice(&to_bytes(providers.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let directories = providers
+        .pointer("/MediaContainer/MediaProvider/0/Feature/0/Directory")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    let tv_directory = directories
+        .iter()
+        .find(|directory| directory["type"] == "show")
+        .unwrap();
+    let pivots = tv_directory["Pivot"].as_array().unwrap();
+    assert_eq!(pivots[0]["id"], "recommended");
+    assert!(!pivots.iter().any(|pivot| pivot["id"] == "continueWatching"));
+    assert!(!pivots.iter().any(|pivot| pivot["id"] == "recentlyAdded"));
 }
 
 #[tokio::test]

@@ -10344,6 +10344,11 @@ async fn plex_media_providers(State(state): State<AppState>) -> Response {
                     let section = index + 1;
                     let (_, scanned_at, library_updated_at) =
                         library_publication_state(&state, &library.name, section);
+                    let pivots = serde_json::json!([
+                        {"id": "recommended", "key": format!("/hubs/sections/{section}"), "type": "hub", "title": "Recommended", "context": "content.discover", "symbol": "star"},
+                        {"id": "library", "key": format!("/library/sections/{section}/all?type={}", if library.kind == "tv" { 2 } else { 1 }), "type": "list", "title": "Library", "context": "content.library", "symbol": "library"},
+                        {"id": "collections", "key": format!("/library/sections/{section}/collections"), "type": "list", "title": "Collections", "context": "content.collections", "symbol": "stack"}
+                    ]);
                     serde_json::json!({
                         "agent": if library.kind == "tv" { "tv.plex.agents.series" } else { "tv.plex.agents.movie" },
                         "scanner": if library.kind == "tv" { "Plex TV Series" } else { "Plex Movie" },
@@ -10357,11 +10362,7 @@ async fn plex_media_providers(State(state): State<AppState>) -> Response {
                         "refreshing": false,
                         "scannedAt": scanned_at,
                         "updatedAt": library_updated_at,
-                        "Pivot": [
-                            {"id": "recommended", "key": format!("/hubs/sections/{section}"), "type": "hub", "title": "Recommended", "context": "content.discover", "symbol": "star"},
-                            {"id": "library", "key": format!("/library/sections/{section}/all?type={}", if library.kind == "tv" { 2 } else { 1 }), "type": "list", "title": "Library", "context": "content.library", "symbol": "library"},
-                            {"id": "collections", "key": format!("/library/sections/{section}/collections"), "type": "list", "title": "Collections", "context": "content.collections", "symbol": "stack"}
-                        ]
+                        "Pivot": pivots
                     })
                 })
                 .collect::<Vec<_>>()
@@ -10843,6 +10844,9 @@ async fn plex_hubs_response(
         return StatusCode::NOT_FOUND.into_response();
     }
     let media_index = media_snapshot(state);
+    if only_hub == Some("recommended") && only_section.is_some() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
 
     let mut hubs = Vec::new();
     for (index, library) in libraries.iter().enumerate() {
@@ -10889,7 +10893,8 @@ async fn plex_hubs_response(
         } else {
             &recently_added
         };
-        for category in plex_hub_categories(rated_count > 0, only_hub) {
+        let categories = plex_hub_categories(rated_count > 0, only_hub);
+        for category in categories {
             if category == "recommended" {
                 hubs.push(
                     plex_recommendation_hub(
@@ -10952,13 +10957,10 @@ async fn plex_hubs_response(
     plex_json(serde_json::json!({"MediaContainer": container}))
 }
 
-fn plex_hub_categories(has_rated_items: bool, requested: Option<&str>) -> Vec<&'static str> {
+fn plex_hub_categories(_has_rated_items: bool, requested: Option<&str>) -> Vec<&'static str> {
     match requested {
-        Some("recommended") => vec!["recommended"],
-        Some("recentlyAdded") => vec!["recentlyAdded"],
+        Some("recentlyAdded") | None => vec!["recentlyAdded"],
         Some(_) => Vec::new(),
-        None if has_rated_items => vec!["recommended", "recentlyAdded"],
-        None => vec!["recommended"],
     }
 }
 
