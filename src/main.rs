@@ -603,6 +603,7 @@ fn build_app(state: AppState) -> Router {
             get(plex_section_hub),
         )
         .route("/library/sections", get(plex_sections))
+        .route("/system/scanners/:section", get(plex_system_scanners))
         .route("/library/sections/:section", get(plex_section))
         .route(
             "/library/sections/:section/refresh",
@@ -1330,6 +1331,37 @@ fn library_publication_state(
                 .ok()
         })
         .unwrap_or((fallback_section as i64, 0, 0))
+}
+
+fn plex_library_section_details(
+    state: &AppState,
+    library_id: i64,
+) -> (u64, Vec<serde_json::Value>) {
+    let Ok(connection) = state.db.lock() else {
+        return (0, Vec::new());
+    };
+    let created_at = connection
+        .query_row(
+            "SELECT added_at FROM library_groups WHERE id = ?1",
+            [library_id],
+            |row| row.get::<_, u64>(0),
+        )
+        .unwrap_or_default();
+    let Ok(mut statement) = connection
+        .prepare("SELECT id, path FROM library_folders WHERE library_id = ?1 ORDER BY id")
+    else {
+        return (created_at, Vec::new());
+    };
+    let Ok(locations) = statement.query_map([library_id], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    }) else {
+        return (created_at, Vec::new());
+    };
+    let locations = locations
+        .filter_map(Result::ok)
+        .map(|(id, path)| serde_json::json!({"id": id, "path": path}))
+        .collect();
+    (created_at, locations)
 }
 
 fn library_catalog_updated_at(state: &AppState) -> u64 {
@@ -10151,10 +10183,41 @@ async fn plex_sections(State(state): State<AppState>) -> Response {
     plex_json(serde_json::json!({
         "MediaContainer": {
             "size": sections.0,
-            "updatedAt": library_catalog_updated_at(&state),
+            "allowSync": false,
+            "title1": "Plex Library",
             "Directory": sections.1
         }
     }))
+}
+
+async fn plex_system_scanners(
+    State(state): State<AppState>,
+    Path(section): Path<usize>,
+) -> Response {
+    let Some(library) = section
+        .checked_sub(1)
+        .and_then(|index| state.config.lock().ok()?.libraries.get(index).cloned())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let scanners = if library.kind == "tv" {
+        ["Plex TV Series", "Plex Series Scanner"]
+    } else {
+        ["Plex Movie", "Plex Video Files"]
+    };
+    let scanner_rows = scanners
+        .iter()
+        .map(|name| format!("<Scanner name=\"{name}\" />"))
+        .collect::<String>();
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><MediaContainer>{scanner_rows}</MediaContainer>"
+    );
+    let mut response = body.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/xml"),
+    );
+    plex_protocol_response(response)
 }
 
 async fn plex_myplex_account(State(state): State<AppState>) -> Response {
@@ -10474,6 +10537,7 @@ fn plex_library_provider_features(directories: Vec<serde_json::Value>) -> Vec<se
             "scrobbleKey": "/:/scrobble",
             "unscrobbleKey": "/:/unscrobble"
         }),
+        serde_json::json!({"type": "manage"}),
     ]
 }
 
@@ -14434,24 +14498,35 @@ fn plex_section_directories(state: &AppState) -> (usize, Vec<serde_json::Value>)
         .lock()
         .map(|config| config.libraries.clone())
         .unwrap_or_default();
+    let content_changed_at = library_catalog_updated_at(state);
     let directories_json = libraries
         .iter()
         .enumerate()
         .map(|(index, library)| {
             let section = index + 1;
-            let (_, scanned_at, updated_at) =
+            let (stable_id, scanned_at, updated_at) =
                 library_publication_state(state, &library.name, section);
+            let (created_at, locations) = plex_library_section_details(state, stable_id);
             serde_json::json!({
-                "key": format!("/library/sections/{section}"),
+                "allowSync": true,
+                "filters": true,
+                "refreshing": false,
+                "key": section.to_string(),
                 "type": plex_kind(&library.kind),
                 "title": library.name,
                 "agent": if library.kind == "tv" { "tv.plex.agents.series" } else { "tv.plex.agents.movie" },
                 "scanner": if library.kind == "tv" { "Plex TV Series" } else { "Plex Movie" },
                 "language": "en-US",
+                "metadataAgentProviderGroupId": if library.kind == "tv" { 2 } else { 1 },
                 "uuid": plex_library_uuid(state, &library.name, section),
-                "scannedAt": scanned_at,
                 "updatedAt": updated_at,
-                "refreshing": false
+                "createdAt": created_at,
+                "scannedAt": scanned_at,
+                "content": true,
+                "directory": true,
+                "contentChangedAt": content_changed_at,
+                "hidden": 0,
+                "Location": locations
             })
         })
         .collect::<Vec<_>>();

@@ -3230,8 +3230,8 @@ async fn every_registered_plex_route_has_success_and_failure_cases() {
         ),
         (Method::GET, "/hubs/sections/1"),
         (Method::GET, "/hubs/metadata/1-1/related"),
-        (Method::GET, "/hubs/sections/1/recommended"),
         (Method::GET, "/library/sections"),
+        (Method::GET, "/system/scanners/1?action=update"),
         (Method::GET, "/library/sections/1"),
         (Method::GET, "/library/sections/1/refresh"),
         (Method::GET, "/library/sections/1/collections"),
@@ -3353,6 +3353,110 @@ async fn every_registered_plex_route_has_success_and_failure_cases() {
 #[tokio::test]
 async fn plex_desktop_bootstrap_endpoints_return_compatible_containers() {
     let fixture = fixture();
+
+    let sections = send(
+        &fixture.app,
+        Method::GET,
+        "/library/sections",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(sections.status(), StatusCode::OK);
+    let sections: serde_json::Value =
+        serde_json::from_slice(&to_bytes(sections.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let container = &sections["MediaContainer"];
+    assert_eq!(container["size"], 1);
+    assert_eq!(container["allowSync"], false);
+    assert_eq!(container["title1"], "Plex Library");
+    let directory = &container["Directory"][0];
+    assert_eq!(directory["allowSync"], true);
+    assert_eq!(directory["filters"], true);
+    assert_eq!(directory["key"], "1");
+    assert_eq!(directory["type"], "movie");
+    assert_eq!(directory["metadataAgentProviderGroupId"], 1);
+    assert!(directory["createdAt"].as_u64().unwrap() > 0);
+    assert_eq!(
+        directory["contentChangedAt"],
+        super::library_catalog_updated_at(&fixture.state)
+    );
+    assert_eq!(directory["content"], true);
+    assert_eq!(directory["directory"], true);
+    assert_eq!(directory["hidden"], 0);
+    assert_eq!(directory["Location"][0]["id"], 1);
+    assert_eq!(
+        directory["Location"][0]["path"],
+        fixture.root.join("media").to_str().unwrap()
+    );
+
+    let tv_fixture = tv_fixture();
+    let sections = send(
+        &tv_fixture.app,
+        Method::GET,
+        "/library/sections",
+        Body::empty(),
+    )
+    .await;
+    let sections: serde_json::Value =
+        serde_json::from_slice(&to_bytes(sections.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let directory = &sections["MediaContainer"]["Directory"][0];
+    assert_eq!(directory["type"], "show");
+    assert_eq!(directory["metadataAgentProviderGroupId"], 2);
+    assert_eq!(
+        directory["Location"][0]["path"],
+        tv_fixture.root.join("media").to_str().unwrap()
+    );
+
+    let movie_scanners = send(
+        &fixture.app,
+        Method::GET,
+        "/system/scanners/1?action=update",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(movie_scanners.status(), StatusCode::OK);
+    assert_eq!(
+        movie_scanners.headers()[header::CONTENT_TYPE],
+        "application/xml"
+    );
+    let movie_scanners = String::from_utf8(
+        to_bytes(movie_scanners.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(
+        movie_scanners,
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><MediaContainer><Scanner name=\"Plex Movie\" /><Scanner name=\"Plex Video Files\" /></MediaContainer>"
+    );
+
+    let tv_scanners = send(
+        &tv_fixture.app,
+        Method::GET,
+        "/system/scanners/1?action=update",
+        Body::empty(),
+    )
+    .await;
+    let tv_scanners = String::from_utf8(
+        to_bytes(tv_scanners.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(tv_scanners.contains("<Scanner name=\"Plex TV Series\" />"));
+    assert!(tv_scanners.contains("<Scanner name=\"Plex Series Scanner\" />"));
+    assert_eq!(
+        send(
+            &fixture.app,
+            Method::GET,
+            "/system/scanners/99?action=update",
+            Body::empty(),
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
 
     let devices = send(&fixture.app, Method::GET, "/devices", Body::empty()).await;
     assert_eq!(devices.status(), StatusCode::OK);

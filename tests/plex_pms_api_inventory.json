@@ -2,7 +2,7 @@
   "spec_title": "Plex Media Server",
   "spec_version": "1.2.3",
   "source": "https://developer.plex.tv/pms/",
-  "operation_count": 260,
+  "operation_count": 261,
   "operations": [
     {
       "method": "GET",
@@ -1823,6 +1823,13 @@
       "operation_id": "updaterPutApply",
       "summary": "Applying updates",
       "expected_status": 404
+    },
+    {
+      "method": "GET",
+      "path": "/system/scanners/{sectionId}",
+      "operation_id": "systemScannersGet",
+      "summary": "List scanners for a library section",
+      "expected_status": 200
     }
   ]
 }

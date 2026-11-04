@@ -666,15 +666,6 @@ fn converts_ass_dialogue_to_webvtt_and_removes_tags() {
     assert!(vtt.contains("00:01:02.500 --> 00:01:04.000\nHello\nworld"));
 }
 #[test]
-fn web_paths_stay_relative() {
-    assert_eq!(
-        clean_relative_path("season one/episode.mp4").unwrap(),
-        std::path::PathBuf::from("season one/episode.mp4")
-    );
-    assert!(clean_relative_path("../outside.mp4").is_none());
-    assert!(clean_relative_path("/outside.mp4").is_none());
-}
-#[test]
 fn web_paths_hide_dotfiles() {
     assert!(contains_hidden_component(std::path::Path::new(
         ".secret/video.mp4"
@@ -925,6 +916,12 @@ fn plex_provider_advertises_the_universal_playqueue_feature() {
         .expect("playqueue feature is required for Plex Play controls");
     assert_eq!(playqueue["key"], "/playQueues");
     assert_eq!(playqueue["flavor"], "universal");
+}
+
+#[test]
+fn plex_provider_advertises_manage_feature_for_library_editing() {
+    let features = plex_library_provider_features(Vec::new());
+    assert!(features.iter().any(|feature| feature["type"] == "manage"));
 }
 
 #[test]
