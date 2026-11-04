@@ -1,6 +1,15 @@
-# mplex
 
-`mplex` is a Rust project to build a fully functional Plex Media Server replacement. The project is past MVP: the target is compatibility with the documented PMS API and real Plex clients, including full playback behavior. Jellyfin-compatible endpoints are out of scope. The built-in web client and Settings pages are Harbringer's own control surface, separate from the Plex protocol.
+```
+|              |         o
+|---.,---.,---.|---.,---..,---.,---.,---.,---.
+|   |,---||    |   ||    ||   ||   ||---'|
+`   '`---^`    `---'`    ``   '`---|`---'`
+                               `---'`
+```
+
+# Harbringer
+
+`harbringer` is a Rust project to build a fully functional Plex Media Server replacement. The project is past MVP: the target is compatibility with the documented PMS API and real Plex clients, including full playback behavior. Jellyfin-compatible endpoints are out of scope. The built-in web client and Settings pages are Harbringer's own control surface, separate from the Plex protocol.
 
 Direct file serving must remain independent of metadata availability and external services. Full Plex replacement requires the API behavior, playback negotiation, media support, discovery, account/session handling, and client-visible features Plex clients rely on. Media inspection, remuxing, and transcoding must use portable in-process Rust libraries rather than installed command-line tools. The same backend should support seekable media sources supplied by applications such as Weaver and Scryer, including on-demand playback while an NZB is still being acquired.
 

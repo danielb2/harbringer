@@ -6394,7 +6394,6 @@ struct WebPath {
     play: Option<String>,
     episode: Option<String>,
     view: Option<String>,
-    show_id: Option<String>,
     season: Option<u32>,
 }
 
@@ -10567,8 +10566,8 @@ async fn plex_continue_watching_hub(
         "hubKey": "/hubs/continueWatching",
         "title": "Continue Watching",
         "type": "mixed",
-        "hubIdentifier": "home.continueWatching",
-        "context": "home.continueWatching",
+        "hubIdentifier": "home.continue",
+        "context": "hub.home.continue",
         "size": metadata.len(),
         "more": total_size > count,
         "style": "shelf",

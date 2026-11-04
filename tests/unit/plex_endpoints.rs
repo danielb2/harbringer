@@ -1244,6 +1244,14 @@ async fn plex_continue_watching_hub_tracks_progress_and_remove_action() {
         hub["MediaContainer"]["Hub"][0]["Metadata"][0]["viewOffset"],
         4000
     );
+    assert_eq!(
+        hub["MediaContainer"]["Hub"][0]["hubIdentifier"],
+        "home.continue"
+    );
+    assert_eq!(
+        hub["MediaContainer"]["Hub"][0]["context"],
+        "hub.home.continue"
+    );
 
     let removed = send(
         &fixture.app,
