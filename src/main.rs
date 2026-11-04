@@ -1167,7 +1167,10 @@ async fn scan_library_inventory(state: &AppState, library_id: usize) -> Result<u
         let response = scan_library_metadata(
             State(state.clone()),
             Path(library_id),
-            Query(ScanQuery { force: Some(false) }),
+            Query(ScanQuery {
+                force: Some(false),
+                path: None,
+            }),
         )
         .await;
         info!(library = %library.name, status = %response.status(), "automatic metadata detection finished");
@@ -1719,6 +1722,7 @@ fn plex_device_jwt(signing_key: &SigningKey, kid: &str, client_id: &str) -> Stri
 #[derive(Deserialize, Default)]
 struct ScanQuery {
     force: Option<bool>,
+    path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3363,6 +3367,13 @@ async fn scan_library_metadata(
         .map(|media| (media.path.clone(), media.id.clone()))
         .collect::<HashMap<_, _>>();
     let forced = scan_query.force.unwrap_or(false);
+    let target_path = match scan_query.path.as_deref() {
+        Some(path) => match clean_relative_path(path) {
+            Some(path) => Some(path),
+            None => return settings_error("Media path is invalid"),
+        },
+        None => None,
+    };
     info!(library = %library.name, forced, "metadata scan started");
     for folder in &library.folders {
         let mut files = match scan_media(folder).await {
@@ -3383,6 +3394,13 @@ async fn scan_library_metadata(
             groups.entry(group_path).or_default().push(media);
         }
         for (group_path, group) in groups {
+            if let Some(target_path) = &target_path {
+                let group_relative = group_path.strip_prefix(folder).unwrap_or(&group_path);
+                if group_relative != target_path {
+                    continue;
+                }
+            }
+
             let group_title = metadata_group_title(&group_path, folder);
             if !forced {
                 let media_key = database_media_key(library_id + 1, &group[0].id);
@@ -3455,6 +3473,24 @@ async fn scan_library_metadata(
                             }
                         }
                     }
+                    if let Some(token) = token {
+                        let media_key = database_media_key(library_id + 1, &group[0].id);
+                        if let Err(error) = download_tmdb_artwork(
+                            &client,
+                            token,
+                            folder,
+                            &group_path,
+                            &media_key,
+                            &metadata,
+                            &state,
+                            false,
+                        )
+                        .await
+                        {
+                            warn!(library = %library.name, title = %group_title, error = %error, "TMDB artwork refresh failed");
+                        }
+                    }
+
                     matched += 1;
                     continue;
                 }
@@ -3490,6 +3526,7 @@ async fn scan_library_metadata(
                                 &media_key,
                                 &metadata,
                                 &state,
+                                true,
                             )
                             .await;
                         }
@@ -3621,6 +3658,7 @@ async fn scan_library_metadata(
                     &media_key,
                     result,
                     &state,
+                    true,
                 )
                 .await
                 {
@@ -3670,6 +3708,7 @@ async fn scan_library_metadata(
                     &media_key,
                     result,
                     &state,
+                    true,
                 )
                 .await
                 {
@@ -3938,6 +3977,7 @@ async fn tv_match_select(
         &database_media_key(selection.library + 1, &episodes[0].id),
         &metadata,
         &state,
+        true,
     )
     .await
     {
@@ -4060,6 +4100,7 @@ async fn scan_media_metadata(
             &media_key,
             result,
             &state,
+            true,
         )
         .await;
     }
@@ -5208,6 +5249,7 @@ async fn download_tmdb_artwork(
     media_key: &str,
     metadata: &serde_json::Value,
     state: &AppState,
+    replace_existing: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let media_directory = if group_path.is_file() {
         group_path.parent().unwrap_or(folder)
@@ -5221,6 +5263,11 @@ async fn download_tmdb_artwork(
             info!(artwork = kind, "TMDB match has no artwork path");
             continue;
         };
+        let local = artwork.join(format!("{kind}.jpg"));
+        if !replace_existing && tokio::fs::metadata(&local).await.is_ok() {
+            continue;
+        }
+
         info!(
             artwork = kind,
             image_path = path,
@@ -5244,7 +5291,6 @@ async fn download_tmdb_artwork(
             continue;
         }
         let bytes = response.bytes().await?;
-        let local = artwork.join(format!("{kind}.jpg"));
         tokio::fs::write(&local, &bytes).await?;
         record_artwork(&state.db, media_key, kind, &local);
         info!(
@@ -5820,13 +5866,24 @@ async fn plex_section_refresh(
     if !library_exists {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match scan_library_inventory(&state, library_id).await {
-        Ok(_) => StatusCode::OK.into_response(),
-        Err(error) => {
-            warn!(section, %error, "Plex library scan failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+    if let Err(error) = scan_library_inventory(&state, library_id).await {
+        warn!(section, %error, "Plex library scan failed");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    let metadata_response = scan_library_metadata(
+        State(state.clone()),
+        Path(library_id),
+        Query(ScanQuery {
+            force: Some(false),
+            path: None,
+        }),
+    )
+    .await;
+    if !metadata_response.status().is_success() && !metadata_response.status().is_redirection() {
+        warn!(section, status = %metadata_response.status(), "Plex metadata refresh failed");
+        return metadata_response;
+    }
+    StatusCode::OK.into_response()
 }
 
 async fn delete_library(
@@ -8225,7 +8282,8 @@ fn media_poster_card(
             .map(|component| component.as_os_str().to_string_lossy())
             .unwrap_or_default();
         format!(
-            "<button type=\"button\" data-fix-match data-library=\"{library}\" data-path=\"{}\">Fix Match</button>",
+            "<button type=\"button\" data-refresh-metadata data-library=\"{library}\" data-path=\"{}\">Refresh metadata</button><button type=\"button\" data-fix-match data-library=\"{library}\" data-path=\"{}\">Fix Match</button>",
+            html(&show_path),
             html(&show_path)
         )
     } else {
@@ -8416,6 +8474,37 @@ document.addEventListener("click", async event => {
   }
   const button = event.target.closest("[data-watch-action]");
   const fixMatchButton = event.target.closest("[data-fix-match]");
+  const refreshMetadataButton = event.target.closest("[data-refresh-metadata]");
+  if (refreshMetadataButton) {
+    event.preventDefault();
+    const originalLabel = refreshMetadataButton.textContent;
+    refreshMetadataButton.disabled = true;
+    refreshMetadataButton.textContent = "Refreshing…";
+    try {
+      const response = await fetch(
+        `/settings/libraries/${refreshMetadataButton.dataset.library}/scan?path=${encodeURIComponent(refreshMetadataButton.dataset.path)}`,
+        { method: "POST", redirect: "follow" }
+      );
+      const resultUrl = new URL(response.url);
+      const error = resultUrl.searchParams.get("error");
+      if (!response.ok || error) throw new Error(error || "Could not refresh metadata.");
+      window.location.reload();
+    } catch (error) {
+      refreshMetadataButton.disabled = false;
+      refreshMetadataButton.textContent = originalLabel;
+      let status = refreshMetadataButton.closest(".media-card-menu-items")?.querySelector(".media-card-menu-status");
+      if (!status) {
+        status = document.createElement("span");
+        status.className = "media-card-menu-status";
+        status.setAttribute("role", "status");
+        status.style.cssText = "padding:.45rem .65rem;color:#fca5a5;font-size:.72rem";
+        refreshMetadataButton.closest(".media-card-menu-items")?.append(status);
+      }
+      status.textContent = error.message || "Could not refresh metadata. Try again.";
+    }
+    return;
+  }
+
   if (fixMatchButton) {
     event.preventDefault();
     document.querySelectorAll(".media-card-menu[open]").forEach(openMenu => openMenu.removeAttribute("open"));

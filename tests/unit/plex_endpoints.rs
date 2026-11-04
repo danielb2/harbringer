@@ -1845,6 +1845,9 @@ async fn tv_show_cards_display_the_season_count() {
     ));
 
     assert!(body.contains("class=\"media-card-subtitle\">1 season</span>"));
+    assert!(body.contains(
+        "data-refresh-metadata data-library=\"0\" data-path=\"Example Show\">Refresh metadata</button>"
+    ));
     assert!(!body.contains("class=\"metadata-panel\""));
     assert!(body.contains(
         "data-fix-match data-library=\"0\" data-path=\"Example Show\">Fix Match</button>"
