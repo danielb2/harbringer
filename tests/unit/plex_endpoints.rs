@@ -1831,6 +1831,85 @@ async fn tv_season_navigation_renders_episode_poster_cards() {
 }
 
 #[tokio::test]
+async fn flat_tv_files_still_navigate_as_show_season_and_episode() {
+    let fixture = tv_fixture();
+    {
+        let mut media = fixture.state.media.write().unwrap();
+        let mut flat_media = media.as_ref().clone();
+        for item in &mut flat_media {
+            let file_name = item.path.file_name().unwrap();
+            let flat_path = fixture.root.join("media/Example Show").join(file_name);
+            std::fs::write(&flat_path, b"0123456789abcdef").unwrap();
+            item.path = flat_path;
+        }
+        *media = Arc::new(flat_media);
+    }
+    assert!(super::media_snapshot(&fixture.state).iter().all(|media| {
+        media.path.parent() == Some(fixture.root.join("media/Example Show").as_path())
+    }));
+    assert!(super::media_snapshot(&fixture.state).iter().all(|media| {
+        super::tv_episode_info(&fixture.root.join("media"), &media.path).is_some()
+    }));
+
+    let show_response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&path=Example%20Show",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(show_response.status(), StatusCode::OK);
+    let show_body = String::from_utf8(
+        to_bytes(show_response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(show_body.contains("Season 01"));
+    assert!(show_body.contains("path=Example%20Show&amp;season=1"));
+
+    let season_response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&path=Example%20Show&season=1",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(season_response.status(), StatusCode::OK);
+    let season_body = String::from_utf8(
+        to_bytes(season_response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(season_body.contains("Pilot"));
+    assert!(season_body.contains("Next"));
+    assert!(
+        season_body.contains("season=1&amp;episode=Example%20Show%2FExample.Show.S01E01.Pilot.mkv")
+    );
+
+    let episode_response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&path=Example%20Show&season=1&episode=Example%20Show%2FExample.Show.S01E01.Pilot.mkv",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(episode_response.status(), StatusCode::OK);
+    let episode_body = String::from_utf8(
+        to_bytes(episode_response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(episode_body.contains("<video"));
+    assert!(episode_body.contains("Pilot"));
+}
+
+#[tokio::test]
 async fn tv_show_cards_display_the_season_count() {
     let fixture = tv_fixture();
     let response = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;

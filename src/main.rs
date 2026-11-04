@@ -4676,6 +4676,24 @@ fn tv_episode_info(root: &PathBuf, media: &std::path::Path) -> Option<TvEpisodeI
     })
 }
 
+fn tv_season_directory(
+    show_directory: &std::path::Path,
+    season: u32,
+    episode_path: &std::path::Path,
+) -> PathBuf {
+    let physical_directory = episode_path.parent();
+    if physical_directory
+        .and_then(std::path::Path::file_name)
+        .and_then(|name| name.to_str())
+        .and_then(parse_tv_season_directory)
+        == Some(season)
+    {
+        physical_directory.unwrap_or(show_directory).to_path_buf()
+    } else {
+        show_directory.join(format!("Season {season:02}"))
+    }
+}
+
 struct PlexTvShowGroup<'a> {
     title: String,
     rating_key: String,
@@ -5703,15 +5721,24 @@ async fn ensure_tv_season_metadata(
         }
     }
     for (season, episodes) in seasons {
-        let Some(season_directory) = episodes.first().and_then(|media| media.path.parent()) else {
+        let Some(episode_path) = episodes.first().map(|media| media.path.as_path()) else {
             continue;
         };
+        let Some(show_name) = episode_path
+            .strip_prefix(folder)
+            .ok()
+            .and_then(|path| path.components().next())
+        else {
+            continue;
+        };
+        let show_directory = folder.join(show_name.as_os_str());
+        let season_directory = tv_season_directory(&show_directory, season, episode_path);
         let media_key = database_media_key(library_key, &episodes[0].id);
         let result = if sidecar_mode {
             download_tmdb_season_artwork(
                 client,
                 token,
-                season_directory,
+                &season_directory,
                 show_metadata,
                 season,
                 &media_key,
@@ -6330,6 +6357,7 @@ struct WebPath {
     episode: Option<String>,
     view: Option<String>,
     show_id: Option<String>,
+    season: Option<u32>,
 }
 
 fn selected_library_root(state: &AppState, library: Option<usize>) -> PathBuf {
@@ -6745,11 +6773,12 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
         String::new()
     };
     let tv_season_view = library_kind.as_deref() == Some("tv")
-        && relative
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(parse_tv_season_directory)
-            .is_some();
+        && (query.season.is_some()
+            || relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(parse_tv_season_directory)
+                .is_some());
     let tv_show_view = library_kind.as_deref() == Some("tv")
         && relative.components().count() == 1
         && !tv_season_view;
@@ -6790,33 +6819,73 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
         } else {
             None
         };
-        let show_metadata = tv_show_view
-            .then(|| matched_tv_show_metadata(&s, &media_index, &directory))
+        let show_metadata_directory = library_root.join(&relative);
+        let show_metadata = (tv_show_view || query.season.is_some())
+            .then(|| matched_tv_show_metadata(&s, &media_index, &show_metadata_directory))
             .flatten();
-        let database_metadata = (!sidecar_mode).then_some(show_metadata.as_ref()).flatten();
+        let database_metadata = (tv_show_view && !sidecar_mode)
+            .then_some(show_metadata.as_ref())
+            .flatten();
+        let panel_directory = query
+            .season
+            .map(|season| tv_season_directory(&directory, season, &directory))
+            .unwrap_or_else(|| directory.clone());
         let mut panel = media_info_panel(
-            &directory,
+            &panel_directory,
             database_metadata,
             tv_show_view,
             cover_url.as_deref(),
         )
         .await;
         if tv_season_view && !panel.contains("class=\"metadata-description\"") {
-            let season = relative
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(parse_tv_season_directory);
-            let show_directory = directory.parent();
+            let season = query.season.or_else(|| {
+                relative
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(parse_tv_season_directory)
+            });
+            let show_directory = if query.season.is_some() {
+                Some(directory.as_path())
+            } else {
+                directory.parent()
+            };
             if let (Some(season), Some(show_directory)) = (season, show_directory) {
-                let show_metadata = matched_tv_show_metadata(&s, &media_index, show_directory);
+                let show_metadata_directory = library_root.join(if query.season.is_some() {
+                    relative.as_path()
+                } else {
+                    relative.parent().unwrap_or(std::path::Path::new(""))
+                });
+                let show_metadata =
+                    matched_tv_show_metadata(&s, &media_index, &show_metadata_directory);
+                let representative_path = media_index
+                    .iter()
+                    .find(|media| {
+                        media
+                            .path
+                            .strip_prefix(&library_root)
+                            .is_ok_and(|path| path.starts_with(&relative))
+                            && tv_episode_info(&library_root, &media.path)
+                                .is_some_and(|episode| episode.season == season)
+                    })
+                    .map(|media| media.path.clone())
+                    .unwrap_or_else(|| show_directory.to_path_buf());
+                let season_directory =
+                    tv_season_directory(show_directory, season, &representative_path);
                 let season_metadata = if sidecar_mode {
-                    read_sidecar_info(&directory)
+                    read_sidecar_info(&season_directory)
                         .await
                         .and_then(|info| info.get("metadata_json").cloned())
                 } else {
                     media_index
                         .iter()
-                        .filter(|media| media.path.parent() == Some(directory.as_path()))
+                        .filter(|media| {
+                            media
+                                .path
+                                .strip_prefix(&library_root)
+                                .is_ok_and(|path| path.starts_with(&relative))
+                                && tv_episode_info(&library_root, &media.path)
+                                    .is_some_and(|episode| episode.season == season)
+                        })
                         .find_map(|media| {
                             let (library_id, _) = media_library(&s, media)?;
                             let key = format!("{library_id}-{}", media.id);
@@ -6848,7 +6917,10 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     };
     let mut directories = Vec::new();
     let mut files = Vec::new();
-    if !library_top_level || files_view {
+    let virtual_tv_view = !files_view
+        && library_kind.as_deref() == Some("tv")
+        && (tv_show_view || query.season.is_some());
+    if (!library_top_level || files_view) && !virtual_tv_view {
         let mut entries = match tokio::fs::read_dir(&directory).await {
             Ok(entries) => entries,
             Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -6915,6 +6987,116 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
         .library
         .map(|index| plex_section_metadata(&s, index + 1))
         .unwrap_or_default();
+    let mut virtual_seasons = BTreeMap::<u32, Vec<&Media>>::new();
+    if virtual_tv_view {
+        for media in media_index.iter() {
+            if !media
+                .path
+                .strip_prefix(&library_root)
+                .is_ok_and(|path| path.starts_with(&relative))
+            {
+                continue;
+            }
+            if let Some(episode) = tv_episode_info(&library_root, &media.path) {
+                virtual_seasons
+                    .entry(episode.season)
+                    .or_default()
+                    .push(media);
+            }
+        }
+        for episodes in virtual_seasons.values_mut() {
+            episodes.sort_by_key(|media| {
+                tv_episode_info(&library_root, &media.path)
+                    .map(|episode| episode.episode)
+                    .unwrap_or(u32::MAX)
+            });
+        }
+    }
+    if tv_show_view {
+        let show_path = relative.to_string_lossy();
+        for (season, episodes) in &virtual_seasons {
+            let Some(representative) = episodes.first() else {
+                continue;
+            };
+            let href = format!(
+                "/?library={}&path={}&season={season}",
+                query.library.unwrap_or_default(),
+                url_encode(&show_path)
+            );
+            let representative_path = representative
+                .path
+                .strip_prefix(&library_root)
+                .unwrap_or(std::path::Path::new(""));
+            folder_cards.push_str(&media_poster_card(
+                Some(&representative.id),
+                &href,
+                &format!("Season {season:02}"),
+                Some(&format!("{} episodes", episodes.len())),
+                None,
+                average_media_progress(episodes, &section_metadata),
+                representative_path,
+                query.library.unwrap_or_default(),
+                false,
+                false,
+                "item",
+                false,
+            ));
+        }
+        has_content = !folder_cards.is_empty();
+    }
+    if query.season.is_some() && selected_relative.is_none() {
+        for episode in virtual_seasons
+            .get(&query.season.unwrap_or_default())
+            .into_iter()
+            .flatten()
+        {
+            let Some(episode_path) = episode.path.strip_prefix(&library_root).ok() else {
+                continue;
+            };
+            let item_metadata = section_metadata.get(&episode.id);
+            let (episode_title, episode_number) =
+                tv_episode_card_labels(&library_root, &episode.path, item_metadata);
+            let title = episode_title.unwrap_or_else(|| episode.title.clone());
+            let href = format!(
+                "/?library={}&path={}&season={}&episode={}",
+                query.library.unwrap_or_default(),
+                url_encode(&relative.to_string_lossy()),
+                query.season.unwrap_or_default(),
+                url_encode(&episode_path.to_string_lossy())
+            );
+            items.push_str(&media_poster_card(
+                Some(&episode.id),
+                &href,
+                &title,
+                episode_number.as_deref(),
+                relative.file_name().and_then(|name| name.to_str()),
+                item_metadata.map(media_card_progress).unwrap_or_default(),
+                episode_path,
+                query.library.unwrap_or_default(),
+                true,
+                true,
+                "item",
+                false,
+            ));
+        }
+        has_content = virtual_seasons.contains_key(&query.season.unwrap_or_default());
+    } else if query.season.is_some() {
+        if let Some(selected_relative) = selected_relative.as_ref() {
+            if let Some(media) = media_index
+                .iter()
+                .find(|media| media.path == library_root.join(selected_relative))
+            {
+                if let (Some(name), Some(path)) = (media.path.file_name(), Some(media.path.clone()))
+                {
+                    files.push((
+                        name.to_string_lossy().into_owned(),
+                        selected_relative.clone(),
+                        path,
+                    ));
+                }
+            }
+        }
+    }
     if library_top_level && !files_view {
         if let (Some(library_index), Some(library)) = (query.library, library_config.as_ref()) {
             let media = media_index
@@ -6949,12 +7131,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                         .episodes
                         .iter()
                         .filter_map(|episode| {
-                            episode
-                                .path
-                                .parent()
-                                .and_then(std::path::Path::file_name)
-                                .and_then(|name| name.to_str())
-                                .and_then(parse_tv_season_directory)
+                            tv_episode_info(&library_root, &episode.path).map(|info| info.season)
                         })
                         .collect::<BTreeSet<_>>()
                         .len();
@@ -8105,9 +8282,12 @@ async fn episode_info_panel(
                 read_database_metadata(state, &format!("{library_id}-{}", media.id))
             })
     };
-    let season_directory = path.parent().unwrap_or(root);
+    let season_directory = show_directory
+        .as_deref()
+        .map(|directory| tv_season_directory(directory, episode_info.season, &path))
+        .unwrap_or_else(|| path.parent().unwrap_or(root).to_path_buf());
     let season_metadata = if sidecar_mode {
-        read_sidecar_info(season_directory)
+        read_sidecar_info(&season_directory)
             .await
             .and_then(|info| info.get("metadata_json").cloned())
     } else {

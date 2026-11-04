@@ -87,9 +87,10 @@ Harbringer's Plex API coverage is incomplete. Media IDs remain stable for unchan
 - [ ] can play in plex mobile
 - [ ] can play in plezy
 
-## Sources
+## References
 
 - https://developer.plex.tv/pms/
+- https://support.plex.tv/articles/naming-and-organizing-your-tv-show-files/
 - https://github.com/edde746/plezy - a plex client
 - https://github.com/braedonsaunders/ether/ - a plex server for non-stored content
 - https://github.com/debridmediamanager/rex - like ether but in rust
