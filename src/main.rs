@@ -3480,7 +3480,7 @@ async fn scan_library_metadata(
                         }
                     }
                     if sidecar_mode {
-                        if !metadata_sidecar_info_path(&group_path).is_file()
+                        if (kind == "tv" || !metadata_sidecar_info_path(&group_path).is_file())
                             && store_metadata_sidecar(
                                 folder,
                                 &group_path,
@@ -4676,6 +4676,20 @@ fn tv_episode_info(root: &PathBuf, media: &std::path::Path) -> Option<TvEpisodeI
     })
 }
 
+fn tv_season_number(root: &PathBuf, media_path: &std::path::Path) -> Option<u32> {
+    tv_episode_info(root, media_path)
+        .map(|episode| episode.season)
+        .or_else(|| {
+            media_path
+                .strip_prefix(root)
+                .ok()?
+                .components()
+                .filter_map(|component| component.as_os_str().to_str())
+                .find_map(parse_tv_season_directory)
+        })
+        .or(Some(1))
+}
+
 fn tv_season_directory(
     show_directory: &std::path::Path,
     season: u32,
@@ -4835,6 +4849,21 @@ fn parse_tv_episode_marker(stem: &str) -> Option<(Option<u32>, (u32, Option<u32>
         };
         return Some((Some(season), (episode, episode_end), marker_end));
     }
+    for start in 0..bytes.len() {
+        if start + 7 > bytes.len() || !bytes[start..start + 7].eq_ignore_ascii_case(b"episode") {
+            continue;
+        }
+        let mut number_start = start + 7;
+        while bytes
+            .get(number_start)
+            .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'.' | b'-' | b'#'))
+        {
+            number_start += 1;
+        }
+        if let Some((episode, marker_end)) = parse_digits(bytes, number_start) {
+            return Some((None, (episode, None), marker_end));
+        }
+    }
     None
 }
 
@@ -4875,18 +4904,22 @@ async fn store_metadata_sidecar(
     };
     let directory = media_directory.join(".mplex");
     tokio::fs::create_dir_all(&directory).await?;
+    let tv_show =
+        metadata.get("first_air_date").is_some() || metadata.get("number_of_seasons").is_some();
     let path = media
         .path
         .strip_prefix(folder)
         .unwrap_or(&media.path)
         .to_string_lossy();
-    let episode = tv_episode_info(folder, &media.path);
+    let episode = (!tv_show)
+        .then(|| tv_episode_info(folder, &media.path))
+        .flatten();
     let show_id = read_sidecar_info(media_directory)
         .await
         .and_then(|value| value.get("show_id")?.as_str().map(str::to_owned));
     let info = MediaInfo {
         title: title.to_owned(),
-        media_path: path.into_owned(),
+        media_path: (!tv_show).then(|| path.into_owned()),
         description: json_string(metadata, "overview"),
         release_date: json_string(metadata, "release_date"),
         first_air_date: json_string(metadata, "first_air_date"),
@@ -4897,7 +4930,11 @@ async fn store_metadata_sidecar(
         episode_end: episode.as_ref().and_then(|value| value.episode_end),
         episode_title: episode.and_then(|value| value.episode_title),
         metadata_json: metadata.clone(),
-        technical: inspect_media(&media.path).await,
+        technical: if tv_show {
+            None
+        } else {
+            inspect_media(&media.path).await
+        },
         show_id,
     };
     let contents = serde_json::to_string_pretty(&info).map_err(std::io::Error::other)?;
@@ -4907,7 +4944,8 @@ async fn store_metadata_sidecar(
 #[derive(Serialize)]
 struct MediaInfo {
     title: String,
-    media_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media_path: Option<String>,
     description: String,
     release_date: String,
     first_air_date: String,
@@ -5716,8 +5754,8 @@ async fn ensure_tv_season_metadata(
 ) -> Result<(), String> {
     let mut seasons = BTreeMap::<u32, Vec<&Media>>::new();
     for media in group {
-        if let Some(episode) = tv_episode_info(folder, &media.path) {
-            seasons.entry(episode.season).or_default().push(media);
+        if let Some(season) = tv_season_number(folder, &media.path) {
+            seasons.entry(season).or_default().push(media);
         }
     }
     for (season, episodes) in seasons {
@@ -6864,8 +6902,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                             .path
                             .strip_prefix(&library_root)
                             .is_ok_and(|path| path.starts_with(&relative))
-                            && tv_episode_info(&library_root, &media.path)
-                                .is_some_and(|episode| episode.season == season)
+                            && tv_season_number(&library_root, &media.path) == Some(season)
                     })
                     .map(|media| media.path.clone())
                     .unwrap_or_else(|| show_directory.to_path_buf());
@@ -6883,8 +6920,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                                 .path
                                 .strip_prefix(&library_root)
                                 .is_ok_and(|path| path.starts_with(&relative))
-                                && tv_episode_info(&library_root, &media.path)
-                                    .is_some_and(|episode| episode.season == season)
+                                && tv_season_number(&library_root, &media.path) == Some(season)
                         })
                         .find_map(|media| {
                             let (library_id, _) = media_library(&s, media)?;
@@ -6997,11 +7033,8 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             {
                 continue;
             }
-            if let Some(episode) = tv_episode_info(&library_root, &media.path) {
-                virtual_seasons
-                    .entry(episode.season)
-                    .or_default()
-                    .push(media);
+            if let Some(season) = tv_season_number(&library_root, &media.path) {
+                virtual_seasons.entry(season).or_default().push(media);
             }
         }
         for episodes in virtual_seasons.values_mut() {
@@ -7130,9 +7163,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                     let season_count = show
                         .episodes
                         .iter()
-                        .filter_map(|episode| {
-                            tv_episode_info(&library_root, &episode.path).map(|info| info.season)
-                        })
+                        .filter_map(|episode| tv_season_number(&library_root, &episode.path))
                         .collect::<BTreeSet<_>>()
                         .len();
                     let season_label = format!(

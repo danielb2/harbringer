@@ -1833,11 +1833,14 @@ async fn tv_season_navigation_renders_episode_poster_cards() {
 #[tokio::test]
 async fn flat_tv_files_still_navigate_as_show_season_and_episode() {
     let fixture = tv_fixture();
+    let file_names = [
+        "04 Episode 3 - Tales of the Gold Monkey 1982  -Türkçe Altyazılı-D3A1oEjHlyM.mkv",
+        "05 Episode 4 - Tales of the Gold Monkey 1982  -Türkçe Altyazılı-m-pfIkToDtE.mkv",
+    ];
     {
         let mut media = fixture.state.media.write().unwrap();
         let mut flat_media = media.as_ref().clone();
-        for item in &mut flat_media {
-            let file_name = item.path.file_name().unwrap();
+        for (item, file_name) in flat_media.iter_mut().zip(file_names) {
             let flat_path = fixture.root.join("media/Example Show").join(file_name);
             std::fs::write(&flat_path, b"0123456789abcdef").unwrap();
             item.path = flat_path;
@@ -1848,7 +1851,7 @@ async fn flat_tv_files_still_navigate_as_show_season_and_episode() {
         media.path.parent() == Some(fixture.root.join("media/Example Show").as_path())
     }));
     assert!(super::media_snapshot(&fixture.state).iter().all(|media| {
-        super::tv_episode_info(&fixture.root.join("media"), &media.path).is_some()
+        super::tv_season_number(&fixture.root.join("media"), &media.path) == Some(1)
     }));
 
     let show_response = send(
@@ -1884,19 +1887,16 @@ async fn flat_tv_files_still_navigate_as_show_season_and_episode() {
             .to_vec(),
     )
     .unwrap();
-    assert!(season_body.contains("Pilot"));
-    assert!(season_body.contains("Next"));
-    assert!(
-        season_body.contains("season=1&amp;episode=Example%20Show%2FExample.Show.S01E01.Pilot.mkv")
-    );
+    assert!(season_body.contains("Tales of the Gold Monkey 1982"));
+    assert!(season_body.contains("S1 · E3"));
+    assert!(season_body.contains("S1 · E4"));
 
-    let episode_response = send(
-        &fixture.app,
-        Method::GET,
-        "/?library=0&path=Example%20Show&season=1&episode=Example%20Show%2FExample.Show.S01E01.Pilot.mkv",
-        Body::empty(),
-    )
-    .await;
+    let episode_path = format!("Example Show/{}", file_names[0]);
+    let episode_url = format!(
+        "/?library=0&path=Example%20Show&season=1&episode={}",
+        super::url_encode(&episode_path)
+    );
+    let episode_response = send(&fixture.app, Method::GET, &episode_url, Body::empty()).await;
     assert_eq!(episode_response.status(), StatusCode::OK);
     let episode_body = String::from_utf8(
         to_bytes(episode_response.into_body(), usize::MAX)
@@ -1906,7 +1906,40 @@ async fn flat_tv_files_still_navigate_as_show_season_and_episode() {
     )
     .unwrap();
     assert!(episode_body.contains("<video"));
-    assert!(episode_body.contains("Pilot"));
+    assert!(episode_body.contains("Tales of the Gold Monkey"));
+}
+
+#[tokio::test]
+async fn show_sidecar_stores_show_metadata_without_a_representative_episode_path() {
+    let fixture = tv_fixture();
+    let media = super::media_snapshot(&fixture.state)[0].clone();
+    let folder = fixture.root.join("media");
+    let show_directory = folder.join("Example Show");
+    let metadata = serde_json::json!({
+        "id": 42,
+        "overview": "Show overview",
+        "first_air_date": "1982-09-22",
+        "number_of_seasons": 1,
+        "number_of_episodes": 22
+    });
+    super::store_metadata_sidecar(
+        &folder,
+        &show_directory,
+        "Tales of the Gold Monkey",
+        &media,
+        &metadata,
+    )
+    .await
+    .unwrap();
+
+    let sidecar = std::fs::read(show_directory.join(".mplex/data.json")).unwrap();
+    let sidecar: serde_json::Value = serde_json::from_slice(&sidecar).unwrap();
+    assert_eq!(sidecar["title"], "Tales of the Gold Monkey");
+    assert_eq!(sidecar["metadata_json"]["number_of_episodes"], 22);
+    assert!(sidecar.get("media_path").is_none());
+    assert!(sidecar.get("season").is_none());
+    assert!(sidecar.get("episode").is_none());
+    assert!(sidecar.get("technical").is_none());
 }
 
 #[tokio::test]
