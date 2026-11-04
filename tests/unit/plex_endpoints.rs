@@ -1253,6 +1253,36 @@ async fn plex_continue_watching_hub_tracks_progress_and_remove_action() {
         "hub.home.continue"
     );
 
+    let section_hubs = send(&fixture.app, Method::GET, "/hubs/sections/1", Body::empty()).await;
+    assert_eq!(section_hubs.status(), StatusCode::OK);
+    let section_hubs: serde_json::Value = serde_json::from_slice(
+        &to_bytes(section_hubs.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        section_hubs["MediaContainer"]["Hub"][0]["title"],
+        "Continue Watching"
+    );
+    let continue_hub = section_hubs["MediaContainer"]["Hub"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hub| hub["title"] == "Continue Watching")
+        .unwrap();
+    assert_eq!(continue_hub["key"], "/hubs/sections/1/continueWatching");
+    assert_eq!(continue_hub["Metadata"][0]["ratingKey"], "1048577");
+
+    let section_continue = send(
+        &fixture.app,
+        Method::GET,
+        "/hubs/sections/1/continueWatching",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(section_continue.status(), StatusCode::OK);
+
     let removed = send(
         &fixture.app,
         Method::PUT,

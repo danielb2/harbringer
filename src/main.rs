@@ -10491,6 +10491,12 @@ async fn plex_continue_watching_hub(
     State(state): State<AppState>,
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
+    let only_section = query
+        .get("section")
+        .and_then(|section| section.parse::<usize>().ok());
+    if query.contains_key("section") && only_section.is_none() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     let count = query
         .get("count")
         .and_then(|value| value.parse::<usize>().ok())
@@ -10526,6 +10532,10 @@ async fn plex_continue_watching_hub(
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let media_index = media_snapshot(&state);
+    if only_section.is_some_and(|section| section == 0 || section > libraries.len()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     let mut items = Vec::new();
     for (media_key, position, duration) in progress {
         let found = libraries.iter().enumerate().find_map(|(index, library)| {
@@ -10547,7 +10557,12 @@ async fn plex_continue_watching_hub(
             })
         });
         if let Some(item) = found {
-            items.push(item);
+            if only_section
+                .map(|section| section == item.3)
+                .unwrap_or(true)
+            {
+                items.push(item);
+            }
         }
     }
     let total_size = items.len();
@@ -10561,9 +10576,13 @@ async fn plex_continue_watching_hub(
             metadata.push(item);
         }
     }
+    let hub_key = only_section.map_or_else(
+        || "/hubs/continueWatching".to_owned(),
+        |section| format!("/hubs/sections/{section}/continueWatching"),
+    );
     let hub = serde_json::json!({
-        "key": "/hubs/continueWatching",
-        "hubKey": "/hubs/continueWatching",
+        "key": hub_key,
+        "hubKey": hub_key,
         "title": "Continue Watching",
         "type": "mixed",
         "hubIdentifier": "home.continue",
@@ -10713,8 +10732,12 @@ async fn plex_section_hubs(
 async fn plex_section_hub(
     State(state): State<AppState>,
     Path((section, hub)): Path<(usize, String)>,
-    Query(query): Query<BTreeMap<String, String>>,
+    Query(mut query): Query<BTreeMap<String, String>>,
 ) -> Response {
+    if hub == "continueWatching" {
+        query.insert("section".to_owned(), section.to_string());
+        return plex_continue_watching_hub(State(state), Query(query)).await;
+    }
     if !matches!(hub.as_str(), "recommended" | "recentlyAdded") {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -10819,6 +10842,23 @@ async fn plex_hubs_response(
         }
     }
 
+    if let Some(section) = only_section.filter(|_| only_hub.is_none()) {
+        let mut query = BTreeMap::new();
+        query.insert("section".to_owned(), section.to_string());
+        let response = plex_continue_watching_hub(State(state.clone()), Query(query)).await;
+        if !response.status().is_success() {
+            return response;
+        }
+        let body = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+            Ok(body) => body,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let continue_hub = match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(body) => body["MediaContainer"]["Hub"][0].clone(),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        hubs.insert(0, continue_hub);
+    }
     let mut container = serde_json::json!({"size": hubs.len(), "Hub": hubs});
     container["allowSync"] = serde_json::json!(false);
     container["identifier"] = serde_json::json!("com.plexapp.plugins.library");
