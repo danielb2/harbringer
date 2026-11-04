@@ -14,10 +14,11 @@ use super::{
     plex_search_result_entries, plex_search_type_matches, plex_stream_id,
     plex_stream_id_and_format, plex_track_label, plex_tv_episode_parents, plex_tv_season_groups,
     plex_tv_season_json, plex_tv_show_groups, plex_tv_show_json, plex_video_json,
-    plex_video_resolution, render_database_info_panel, render_toml_details,
-    render_tv_show_metadata_details, sidebar_nav_with_library_links, sidebar_nav_with_settings,
-    srt_to_vtt, technical_duration_ms, technical_tracks, tv_show_title, vtt_to_srt, ConfigLibrary,
-    HeaderMap, HeaderValue, Media, PathBuf, PlexStreamSelection, TvEpisodeInfo, Uri,
+    plex_video_resolution, render_database_info_panel, render_season_description_panel,
+    render_toml_details, render_tv_show_metadata_details, sidebar_nav_with_library_links,
+    sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms, technical_tracks,
+    tv_metadata_with_season_details, tv_show_title, vtt_to_srt, ConfigLibrary, HeaderMap,
+    HeaderValue, Media, PathBuf, PlexStreamSelection, TvEpisodeInfo, Uri,
 };
 #[test]
 fn plex_playback_ids_resolve_rating_keys_and_metadata_paths() {
@@ -433,6 +434,65 @@ fn database_metadata_renders_movie_and_episode_information() {
     assert!(episode_panel.contains("Episode summary"));
     assert!(episode_panel.contains("season</strong><span>1"));
     assert!(!episode_panel.contains("Series summary"));
+
+    let season_fallback = serde_json::json!({
+        "name": "Example Show",
+        "mplex_show_description": "Show summary",
+        "mplex_season_description": "Season summary",
+        "mplex_episode_metadata": {"name": "Pilot", "overview": ""}
+    });
+    let season_panel = render_database_info_panel(&season_fallback, Some(&episode_info));
+    assert!(season_panel.contains("Season description"));
+    assert!(season_panel.contains("Season summary"));
+    assert!(!season_panel.contains("Show summary"));
+
+    let show_fallback = serde_json::json!({
+        "name": "Example Show",
+        "mplex_show_description": "Show summary",
+        "mplex_episode_title": "Pilot",
+        "mplex_episode_metadata": {"name": "Pilot", "overview": ""}
+    });
+    let show_panel = render_database_info_panel(&show_fallback, Some(&episode_info));
+    assert!(show_panel.contains("Show description"));
+    assert!(show_panel.contains("Show summary"));
+    let show_view_metadata = serde_json::json!({
+        "name": "Example Show",
+        "overview": "Show summary",
+        "mplex_season_description": "Season summary",
+        "mplex_episode_title": "Pilot"
+    });
+    let show_view_panel = render_database_info_panel(&show_view_metadata, None);
+    assert!(show_view_panel.contains("<h2>Example Show</h2>"));
+    assert!(show_view_panel.contains("Show summary"));
+    assert!(!show_view_panel.contains("Season summary"));
+    assert!(!show_view_panel.contains("<h2>Pilot</h2>"));
+
+    let show_metadata = serde_json::json!({"overview": "Show summary"});
+    let empty_season = serde_json::json!({"name": "Season One", "overview": ""});
+    let season_panel = render_season_description_panel(&empty_season, 1, Some(&show_metadata));
+    assert!(season_panel.contains("Show description"));
+    assert!(season_panel.contains("Show summary"));
+}
+
+#[test]
+fn tv_season_metadata_persists_episode_details_as_json() {
+    let show = serde_json::json!({"id": 42, "overview": "Show summary"});
+    let season = serde_json::json!({
+        "overview": "Season summary",
+        "episodes": [
+            {"episode_number": 1, "name": "Pilot", "overview": "Pilot summary"},
+            {"episode_number": 2, "name": "Next", "overview": "Next summary"}
+        ]
+    });
+    let stored = tv_metadata_with_season_details(&show, &season, Some(2));
+    assert_eq!(
+        stored["mplex_season_description"],
+        serde_json::json!("Season summary")
+    );
+    assert_eq!(stored["mplex_season_metadata_fetched"], true);
+    assert_eq!(stored["mplex_episode_metadata"]["name"], "Next");
+    assert_eq!(stored["mplex_episode_metadata"]["overview"], "Next summary");
+    assert!(stored["mplex_episode_metadata"].is_object());
 }
 
 #[test]

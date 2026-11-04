@@ -3534,6 +3534,25 @@ async fn scan_library_metadata(
                     }
 
                     matched += 1;
+                    if kind == "tv" {
+                        if let Some(token) = token {
+                            if let Err(error) = ensure_tv_season_metadata(
+                                &client,
+                                token,
+                                folder,
+                                &group,
+                                library_id + 1,
+                                &metadata,
+                                sidecar_mode,
+                                &state,
+                                false,
+                            )
+                            .await
+                            {
+                                warn!(library = %library.name, title = %group_title, error = %error, "TV season metadata scan failed");
+                            }
+                        }
+                    }
                     continue;
                 }
                 let previous = if sidecar_mode {
@@ -3583,6 +3602,25 @@ async fn scan_library_metadata(
                         }
                     }
                     matched += 1;
+                    if kind == "tv" {
+                        if let Some(token) = token {
+                            if let Err(error) = ensure_tv_season_metadata(
+                                &client,
+                                token,
+                                folder,
+                                &group,
+                                library_id + 1,
+                                &metadata,
+                                sidecar_mode,
+                                &state,
+                                false,
+                            )
+                            .await
+                            {
+                                warn!(library = %library.name, title = %group_title, error = %error, "TV season metadata scan failed");
+                            }
+                        }
+                    }
                     continue;
                 }
             }
@@ -3706,38 +3744,6 @@ async fn scan_library_metadata(
                 {
                     warn!(library = %library.name, title = %group_title, error = %error, "TMDB artwork download failed");
                 }
-                if kind == "tv" {
-                    let mut seasons = BTreeMap::<PathBuf, (u32, String)>::new();
-                    for media in &group {
-                        let Some(episode) = tv_episode_info(folder, &media.path) else {
-                            continue;
-                        };
-                        let Some(season_path) = media.path.parent() else {
-                            continue;
-                        };
-                        seasons.entry(season_path.to_path_buf()).or_insert_with(|| {
-                            (
-                                episode.season,
-                                database_media_key(library_id + 1, &media.id),
-                            )
-                        });
-                    }
-                    for (season_path, (season, media_key)) in seasons {
-                        if let Err(error) = download_tmdb_season_artwork(
-                            &client,
-                            token,
-                            &season_path,
-                            result,
-                            season,
-                            &media_key,
-                            &state,
-                        )
-                        .await
-                        {
-                            warn!(library = %library.name, title = %group_title, season, error = %error, "TMDB season artwork download failed");
-                        }
-                    }
-                }
             }
             if !sidecar_mode {
                 let representative = &group[0];
@@ -3758,6 +3764,23 @@ async fn scan_library_metadata(
                 }
             }
             matched += 1;
+            if kind == "tv" {
+                if let Err(error) = ensure_tv_season_metadata(
+                    &client,
+                    token,
+                    folder,
+                    &group,
+                    library_id + 1,
+                    result,
+                    sidecar_mode,
+                    &state,
+                    forced,
+                )
+                .await
+                {
+                    warn!(library = %library.name, title = %group_title, error = %error, "TV season metadata scan failed");
+                }
+            }
         }
     }
     info!(library = %library.name, matched, "metadata scan finished");
@@ -3841,6 +3864,23 @@ async fn refresh_matched_metadata(
     .await
     {
         warn!(title = %group_title, error = %error, "TMDB artwork refresh failed");
+    }
+    if kind == "tv" {
+        if let Err(error) = ensure_tv_season_metadata(
+            client,
+            token,
+            folder,
+            group,
+            library_id + 1,
+            &refreshed,
+            sidecar_mode,
+            state,
+            true,
+        )
+        .await
+        {
+            warn!(title = %group_title, error = %error, "TV season metadata refresh failed");
+        }
     }
     Ok(())
 }
@@ -4049,7 +4089,8 @@ async fn tv_match_select(
     };
     let media_kind = if library.kind == "tv" { "tv" } else { "movie" };
     info!(library = %library.name, title = %title, tmdb_id = selection.tmdb_id, "metadata fix-match selection started");
-    let response = match reqwest::Client::new()
+    let client = reqwest::Client::new();
+    let response = match client
         .get(format!(
             "https://api.themoviedb.org/3/{media_kind}/{}",
             selection.tmdb_id
@@ -4125,7 +4166,7 @@ async fn tv_match_select(
         }
     }
     if let Err(error) = download_tmdb_artwork(
-        &reqwest::Client::new(),
+        &client,
         &token,
         &root,
         &media_directory,
@@ -4137,6 +4178,23 @@ async fn tv_match_select(
     .await
     {
         warn!(library = %library.name, title = %title, error = %error, "Fix-match artwork download failed");
+    }
+    if media_kind == "tv" {
+        if let Err(error) = ensure_tv_season_metadata(
+            &client,
+            &token,
+            &root,
+            &media_items,
+            selection.library + 1,
+            &metadata,
+            config.metadata_storage == "sidecar",
+            &state,
+            true,
+        )
+        .await
+        {
+            warn!(library = %library.name, title = %title, error = %error, "TV season metadata update failed");
+        }
     }
     let artwork_directory = media_directory.join(".mplex");
     for media in &media_items {
@@ -5473,7 +5531,17 @@ async fn download_tmdb_season_artwork(
     season: u32,
     media_key: &str,
     state: &AppState,
+    replace_existing: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !replace_existing
+        && read_sidecar_info(season_directory)
+            .await
+            .and_then(|info| info.get("metadata_json").cloned())
+            .is_some_and(|metadata| metadata.is_object())
+    {
+        return Ok(());
+    }
+
     let Some(show_id) = show_metadata.get("id").and_then(|value| value.as_i64()) else {
         return Ok(());
     };
@@ -5516,6 +5584,158 @@ async fn download_tmdb_season_artwork(
     let local = artwork.join("cover.jpg");
     tokio::fs::write(&local, image.bytes().await?).await?;
     record_artwork(&state.db, media_key, "season-cover", &local);
+    Ok(())
+}
+
+async fn download_tmdb_season_database(
+    client: &reqwest::Client,
+    token: &str,
+    folder: &PathBuf,
+    show_metadata: &serde_json::Value,
+    season: u32,
+    episodes: &[&Media],
+    library_key: usize,
+    state: &AppState,
+    replace_existing: bool,
+) -> Result<(), String> {
+    let Some(show_id) = show_metadata.get("id").and_then(serde_json::Value::as_i64) else {
+        return Ok(());
+    };
+    if !replace_existing
+        && episodes.iter().all(|media| {
+            read_database_metadata(state, &database_media_key(library_key, &media.id))
+                .and_then(|metadata| metadata.get("mplex_season_metadata_fetched").cloned())
+                .and_then(|value| value.as_bool())
+                == Some(true)
+        })
+    {
+        return Ok(());
+    }
+    let response = client
+        .get(format!(
+            "https://api.themoviedb.org/3/tv/{show_id}/season/{season}"
+        ))
+        .bearer_auth(token)
+        .query(&[("language", "en-US")])
+        .send()
+        .await
+        .map_err(|error| format!("Could not fetch season {season}: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "TMDB returned {} for season {season}",
+            response.status()
+        ));
+    }
+    let season_metadata = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| format!("TMDB returned invalid details for season {season}: {error}"))?;
+    for media in episodes {
+        let key = database_media_key(library_key, &media.id);
+        let metadata = read_database_metadata(state, &key)
+            .unwrap_or_else(|| tv_metadata_for_media(show_metadata, folder, &media.path, "tv"));
+        let metadata = tv_metadata_with_season_details(
+            &metadata,
+            &season_metadata,
+            tv_episode_info(folder, &media.path).map(|episode| episode.episode),
+        );
+        if !write_database_metadata(state, &key, &metadata) {
+            return Err(format!(
+                "Could not save season {season} details for {}",
+                media.path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn tv_metadata_with_season_details(
+    metadata: &serde_json::Value,
+    season_metadata: &serde_json::Value,
+    episode_number: Option<u32>,
+) -> serde_json::Value {
+    let mut metadata = metadata.clone();
+    let Some(object) = metadata.as_object_mut() else {
+        return metadata;
+    };
+    object.insert(
+        "mplex_season_description".to_owned(),
+        serde_json::Value::String(json_string(season_metadata, "overview")),
+    );
+    object.insert(
+        "mplex_season_metadata_fetched".to_owned(),
+        serde_json::Value::Bool(true),
+    );
+    object.remove("mplex_episode_metadata");
+    if let Some(episode_number) = episode_number {
+        if let Some(details) = season_metadata
+            .get("episodes")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("episode_number")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(episode_number as u64)
+                })
+            })
+        {
+            object.insert("mplex_episode_metadata".to_owned(), details.clone());
+        }
+    }
+    metadata
+}
+
+async fn ensure_tv_season_metadata(
+    client: &reqwest::Client,
+    token: &str,
+    folder: &PathBuf,
+    group: &[Media],
+    library_key: usize,
+    show_metadata: &serde_json::Value,
+    sidecar_mode: bool,
+    state: &AppState,
+    replace_existing: bool,
+) -> Result<(), String> {
+    let mut seasons = BTreeMap::<u32, Vec<&Media>>::new();
+    for media in group {
+        if let Some(episode) = tv_episode_info(folder, &media.path) {
+            seasons.entry(episode.season).or_default().push(media);
+        }
+    }
+    for (season, episodes) in seasons {
+        let Some(season_directory) = episodes.first().and_then(|media| media.path.parent()) else {
+            continue;
+        };
+        let media_key = database_media_key(library_key, &episodes[0].id);
+        let result = if sidecar_mode {
+            download_tmdb_season_artwork(
+                client,
+                token,
+                season_directory,
+                show_metadata,
+                season,
+                &media_key,
+                state,
+                replace_existing,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        } else {
+            download_tmdb_season_database(
+                client,
+                token,
+                folder,
+                show_metadata,
+                season,
+                &episodes,
+                library_key,
+                state,
+                replace_existing,
+            )
+            .await
+        };
+        result?;
+    }
     Ok(())
 }
 
@@ -6559,8 +6779,9 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             )
             .await
         }
-    } else if sidecar_mode || tv_season_view {
+    } else if sidecar_mode || tv_season_view || tv_show_view {
         let cover_url = if tv_show_view
+            && sidecar_mode
             && tokio::fs::metadata(directory.join(".mplex/cover.jpg"))
                 .await
                 .is_ok()
@@ -6569,7 +6790,59 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
         } else {
             None
         };
-        media_info_panel(&directory, None, tv_show_view, cover_url.as_deref()).await
+        let show_metadata = tv_show_view
+            .then(|| matched_tv_show_metadata(&s, &media_index, &directory))
+            .flatten();
+        let database_metadata = (!sidecar_mode).then_some(show_metadata.as_ref()).flatten();
+        let mut panel = media_info_panel(
+            &directory,
+            database_metadata,
+            tv_show_view,
+            cover_url.as_deref(),
+        )
+        .await;
+        if tv_season_view && !panel.contains("class=\"metadata-description\"") {
+            let season = relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(parse_tv_season_directory);
+            let show_directory = directory.parent();
+            if let (Some(season), Some(show_directory)) = (season, show_directory) {
+                let show_metadata = matched_tv_show_metadata(&s, &media_index, show_directory);
+                let season_metadata = if sidecar_mode {
+                    read_sidecar_info(&directory)
+                        .await
+                        .and_then(|info| info.get("metadata_json").cloned())
+                } else {
+                    media_index
+                        .iter()
+                        .filter(|media| media.path.parent() == Some(directory.as_path()))
+                        .find_map(|media| {
+                            let (library_id, _) = media_library(&s, media)?;
+                            let key = format!("{library_id}-{}", media.id);
+                            read_database_metadata(&s, &key)
+                        })
+                        .and_then(|metadata| {
+                            metadata
+                                .get("mplex_season_description")
+                                .cloned()
+                                .map(|overview| {
+                                    serde_json::json!({
+                                        "name": format!("Season {season}"),
+                                        "overview": overview
+                                    })
+                                })
+                        })
+                }
+                .unwrap_or_else(|| serde_json::json!({"name": format!("Season {season}")}));
+                panel = render_season_description_panel(
+                    &season_metadata,
+                    season,
+                    show_metadata.as_ref(),
+                );
+            }
+        }
+        panel
     } else {
         String::new()
     };
@@ -7526,6 +7799,13 @@ async fn media_info_panel(
             .get("description")
             .and_then(serde_json::Value::as_str)
             .filter(|value| !value.is_empty())
+            .or_else(|| {
+                value
+                    .get("metadata_json")
+                    .and_then(|metadata| metadata.get("overview"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.is_empty())
+            })
             .map(|value| format!(r#"<p class="metadata-description">{}</p>"#, html(value)))
             .unwrap_or_default();
         let overview = if hide_episode_fields {
@@ -7635,9 +7915,11 @@ fn render_database_info_panel(
     let title = episode_metadata
         .and_then(|value| value.get("name").and_then(serde_json::Value::as_str))
         .or_else(|| {
-            metadata
-                .get("mplex_episode_title")
-                .and_then(serde_json::Value::as_str)
+            episode.and_then(|_| {
+                metadata
+                    .get("mplex_episode_title")
+                    .and_then(serde_json::Value::as_str)
+            })
         })
         .or_else(|| metadata.get("title").and_then(serde_json::Value::as_str))
         .or_else(|| metadata.get("name").and_then(serde_json::Value::as_str))
@@ -7645,14 +7927,26 @@ fn render_database_info_panel(
     let episode_description = episode_metadata
         .and_then(|value| value.get("overview").and_then(serde_json::Value::as_str))
         .filter(|value| !value.is_empty());
-    let show_description = metadata
-        .get("overview")
+    let season_description = metadata
+        .get("mplex_season_description")
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.is_empty());
-    let (description_label, description) = episode_description
-        .map(|value| ("Episode description", value))
-        .or_else(|| show_description.map(|value| ("Series overview", value)))
-        .unwrap_or(("", ""));
+    let show_description = metadata
+        .get("mplex_show_description")
+        .or_else(|| metadata.get("overview"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty());
+    let (description_label, description) = if episode.is_some() {
+        episode_description
+            .map(|value| ("Episode description", value))
+            .or_else(|| season_description.map(|value| ("Season description", value)))
+            .or_else(|| show_description.map(|value| ("Show description", value)))
+            .unwrap_or(("", ""))
+    } else {
+        show_description
+            .map(|value| ("Show description", value))
+            .unwrap_or(("", ""))
+    };
     let description = if description.is_empty() {
         String::new()
     } else {
@@ -7709,6 +8003,60 @@ fn render_database_info_panel(
     )
 }
 
+fn matched_tv_show_metadata(
+    state: &AppState,
+    media_index: &[Media],
+    show_directory: &std::path::Path,
+) -> Option<serde_json::Value> {
+    read_sidecar_metadata(show_directory).or_else(|| {
+        media_index
+            .iter()
+            .filter(|media| media.path.starts_with(show_directory))
+            .find_map(|media| {
+                let (library_id, _) = media_library(state, media)?;
+                read_database_metadata(state, &format!("{library_id}-{}", media.id))
+            })
+    })
+}
+
+fn render_season_description_panel(
+    metadata: &serde_json::Value,
+    season: u32,
+    show_metadata: Option<&serde_json::Value>,
+) -> String {
+    let season_description = metadata
+        .get("overview")
+        .and_then(serde_json::Value::as_str)
+        .filter(|description| !description.is_empty());
+    let show_description = show_metadata
+        .and_then(|metadata| metadata.get("overview"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|description| !description.is_empty());
+    let (label, description) = season_description
+        .map(|description| ("Season description", description))
+        .or_else(|| show_description.map(|description| ("Show description", description)))
+        .unwrap_or_default();
+    if description.is_empty() {
+        return String::new();
+    }
+    let title = metadata
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|title| !title.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("Season {season}"));
+    let details = format!(
+        r#"<div class="metadata-detail"><strong>season</strong><span>{season}</span></div>"#
+    );
+    format!(
+        r#"<section class="metadata-panel"><h2>{}</h2><p class="metadata-description"><strong>{}</strong>: {}</p><div class="metadata-details">{}</div></section>"#,
+        html(&title),
+        html(label),
+        html(description),
+        details
+    )
+}
+
 async fn episode_info_panel(
     state: &AppState,
     root: &std::path::Path,
@@ -7734,88 +8082,73 @@ async fn episode_info_panel(
         episode_end,
         episode_title: clean_episode_title(&stem[marker_end..]),
     };
+    let media_index = media_snapshot(state);
+    let show_directory = relative
+        .components()
+        .next()
+        .map(|component| root.join(component.as_os_str()));
+    let show_metadata = show_directory
+        .as_deref()
+        .and_then(|directory| matched_tv_show_metadata(state, &media_index, directory));
     let sidecar_mode = state
         .config
         .lock()
         .is_ok_and(|config| config.metadata_storage == "sidecar");
-    let media_index = media_snapshot(state);
-    if !sidecar_mode {
-        let Some(media) = media_index.iter().find(|media| media.path == path) else {
-            return String::new();
-        };
-        let Some((library_id, _)) = media_library(state, media) else {
-            return String::new();
-        };
-        let media_key = format!("{library_id}-{}", media.id);
-        let Some(metadata) = read_database_metadata(state, &media_key) else {
-            return String::new();
-        };
-        return render_database_info_panel(&metadata, Some(&episode_info));
-    }
-    let season_directory = path.parent().unwrap_or(root);
-    let Some(info) = read_sidecar_info(season_directory).await else {
-        return String::new();
-    };
-    let Some(metadata) = info.get("metadata_json") else {
-        return String::new();
-    };
-    let Some(episode_metadata) = metadata
-        .get("episodes")
-        .and_then(|episodes| episodes.as_array())
-        .and_then(|episodes| {
-            episodes.iter().find(|item| {
-                item.get("episode_number").and_then(|value| value.as_u64())
-                    == Some(episode_number as u64)
+    let database_metadata = if sidecar_mode {
+        None
+    } else {
+        media_index
+            .iter()
+            .find(|media| media.path == path)
+            .and_then(|media| {
+                let (library_id, _) = media_library(state, media)?;
+                read_database_metadata(state, &format!("{library_id}-{}", media.id))
             })
-        })
-    else {
-        return String::new();
     };
-    let title = episode_metadata
-        .get("name")
-        .and_then(|value| value.as_str())
-        .unwrap_or("Episode");
-    let description = episode_metadata
-        .get("overview")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.is_empty())
-        .map(|value| format!(r#"<p class="metadata-description">{}</p>"#, html(value)))
-        .unwrap_or_default();
-    let details = [
-        ("episode", format!("{}", episode_number)),
-        (
-            "air date",
-            episode_metadata
-                .get("air_date")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_owned(),
-        ),
-        (
-            "runtime",
-            episode_metadata
-                .get("runtime")
-                .and_then(|value| value.as_i64())
-                .map(|value| format!("{value} minutes"))
-                .unwrap_or_default(),
-        ),
-    ]
-    .into_iter()
-    .filter(|(_, value)| !value.is_empty())
-    .map(|(key, value)| {
-        format!(
-            r#"<div class="metadata-detail"><strong>{}</strong><span>{}</span></div>"#,
-            html(key),
-            html(&value)
-        )
-    })
-    .collect::<String>();
-    format!(
-        r#"<section class="metadata-panel"><h2>{}</h2>{}<div class="metadata-details">{}</div></section>"#,
-        html(title),
-        description,
-        details
-    )
+    let season_directory = path.parent().unwrap_or(root);
+    let season_metadata = if sidecar_mode {
+        read_sidecar_info(season_directory)
+            .await
+            .and_then(|info| info.get("metadata_json").cloned())
+    } else {
+        None
+    };
+    let stored_metadata = season_metadata.as_ref().or(database_metadata.as_ref());
+    let episode_metadata = stored_metadata.and_then(|metadata| {
+        metadata.get("mplex_episode_metadata").cloned().or_else(|| {
+            metadata
+                .get("episodes")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|episodes| {
+                    episodes.iter().find(|item| {
+                        item.get("episode_number")
+                            .and_then(serde_json::Value::as_u64)
+                            == Some(episode_number as u64)
+                    })
+                })
+                .cloned()
+        })
+    });
+    let season_description = season_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("overview"))
+        .cloned()
+        .or_else(|| {
+            database_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("mplex_season_description"))
+                .cloned()
+        });
+    let mut panel_metadata = show_metadata.unwrap_or_else(|| serde_json::json!({}));
+    if let Some(object) = panel_metadata.as_object_mut() {
+        if let Some(description) = &season_description {
+            object.insert("mplex_season_description".to_owned(), description.clone());
+        }
+        if let Some(episode_metadata) = episode_metadata {
+            object.insert("mplex_episode_metadata".to_owned(), episode_metadata);
+        }
+    }
+    render_database_info_panel(&panel_metadata, Some(&episode_info))
 }
 
 fn render_sidecar_details(value: &serde_json::Value, hide_episode_fields: bool) -> String {

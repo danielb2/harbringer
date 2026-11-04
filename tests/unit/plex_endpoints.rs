@@ -1810,6 +1810,9 @@ async fn tv_season_navigation_renders_episode_poster_cards() {
 
     assert!(body.contains("class=\"media-card media-card-tv\""));
     assert!(body.contains("A season description"));
+    let panel = body.find("class=\"metadata-panel\"").unwrap();
+    let items = body.find("class=\"library\"").unwrap();
+    assert!(panel < items);
 
     assert!(body.contains("Poster for Pilot"));
     assert!(body.contains("class=\"media-card-title\" title=\"Pilot\""));
@@ -1856,6 +1859,81 @@ async fn tv_show_cards_display_the_season_count() {
     assert!(body.contains("aria-label=\"Search TV shows\""));
     assert!(body.contains("aria-label=\"Close Fix Match dialog\" title=\"Close\""));
     assert!(body.contains("/web/tv-match/search"));
+}
+
+#[tokio::test]
+async fn tv_show_view_places_show_description_above_the_library_items() {
+    let fixture = tv_fixture();
+    let show_info = fixture.root.join("media/Example Show/.mplex/data.json");
+    std::fs::create_dir_all(show_info.parent().unwrap()).unwrap();
+    std::fs::write(
+        &show_info,
+        r#"{"title":"Example Show","description":"A show description","metadata_json":{"id":42,"overview":"A show description"}}"#,
+    )
+    .unwrap();
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&path=Example%20Show",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let panel = body.find("class=\"metadata-panel\"").unwrap();
+    let items = body.find("class=\"library\"").unwrap();
+    assert!(panel < items);
+    assert!(body.contains("A show description"));
+}
+
+#[tokio::test]
+async fn tv_episode_view_uses_episode_description_in_the_shared_card_location() {
+    let fixture = tv_fixture();
+    let show_info = fixture.root.join("media/Example Show/.mplex/data.json");
+    std::fs::create_dir_all(show_info.parent().unwrap()).unwrap();
+    std::fs::write(
+        &show_info,
+        r#"{"title":"Example Show","description":"A show description","metadata_json":{"id":42,"overview":"A show description"}}"#,
+    )
+    .unwrap();
+    let season_info = fixture
+        .root
+        .join("media/Example Show/Season 01/.mplex/data.json");
+    std::fs::create_dir_all(season_info.parent().unwrap()).unwrap();
+    std::fs::write(
+        &season_info,
+        r#"{"title":"Season One","description":"A season description","metadata_json":{"overview":"A season description","episodes":[{"episode_number":1,"name":"Pilot","overview":"An episode description","air_date":"2025-01-02","runtime":42}]}}"#,
+    )
+    .unwrap();
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&path=Example%20Show%2FSeason%2001&episode=Example%20Show%2FSeason%2001%2FExample.Show.S01E01.Pilot.mkv",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let panel = body.find("class=\"metadata-panel\"").unwrap();
+    let items = body.find("class=\"library\"").unwrap();
+    assert!(panel < items);
+    assert!(body.contains("An episode description"));
+    assert!(!body.contains("A season description"));
+    assert!(!body.contains("A show description"));
 }
 
 #[tokio::test]
