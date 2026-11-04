@@ -6800,7 +6800,11 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     .fix-match-search-row {{ display: flex; flex-wrap: wrap; gap: .5rem; margin: .9rem 0; }}
     .fix-match-search-row input {{ flex: 1 1 16rem; min-width: 0; padding: .6rem .7rem; border: 1px solid #4b5563; border-radius: .4rem; color: #fff; background: #0b1220; font: inherit; }}
     .fix-match-results {{ display: grid; gap: .65rem; }}
-    .fix-match-result {{ padding: .75rem; border: 1px solid #374151; border-radius: .5rem; background: #1f2937; }}
+    .fix-match-result {{ display: flex; align-items: flex-start; gap: .9rem; padding: .75rem; border: 1px solid #374151; border-radius: .5rem; background: #1f2937; }}
+    .fix-match-poster {{ flex: 0 0 76px; width: 76px; height: 114px; object-fit: cover; border-radius: .3rem; background: #111827; }}
+    .fix-match-result-content {{ min-width: 0; }}
+    .fix-match-result h3 {{ margin: 0; }}
+    @media (max-width: 420px) {{ .fix-match-poster {{ flex-basis: 60px; width: 60px; height: 90px; }} .fix-match-result {{ gap: .6rem; }} }}
     .fix-match-result p {{ margin: .35rem 0 .65rem; color: #cbd5e1; font-size: .85rem; line-height: 1.45; }}
     .fix-match-status {{ min-height: 1.5rem; color: #cbd5e1; }}
 
@@ -8340,6 +8344,13 @@ const searchTvMatches = async () => {
     payload.results.forEach(result => {
       const item = document.createElement("div");
       item.className = "fix-match-result";
+      const poster = document.createElement("img");
+      poster.className = "fix-match-poster";
+      poster.alt = "";
+      poster.loading = "lazy";
+      if (result.poster_path) poster.src = `https://image.tmdb.org/t/p/w185${result.poster_path}`;
+      const content = document.createElement("div");
+      content.className = "fix-match-result-content";
       const heading = document.createElement("h3");
       const year = result.first_air_date ? ` (${result.first_air_date.slice(0, 4)})` : "";
       heading.textContent = `${result.title}${year}`;
@@ -8349,7 +8360,8 @@ const searchTvMatches = async () => {
       select.type = "button";
       select.dataset.matchId = String(result.id);
       select.textContent = "Use this match";
-      item.append(heading, overview, select);
+      content.append(heading, overview, select);
+      item.append(poster, content);
       fixMatchResults.append(item);
     });
   } catch (error) {
