@@ -298,10 +298,16 @@ fn untagged_audio_track_still_has_a_readable_label() {
 
 #[test]
 fn sidecar_metadata_json_loads_without_database_state() {
-    let info = r#"metadata_json = '{"id":42,"title":"Portable match"}'"#;
-    let metadata = parse_sidecar_metadata(info).unwrap();
+    let json_info = serde_json::json!({
+        "title": "Portable match",
+        "metadata_json": {"id": 42, "title": "Portable match"}
+    })
+    .to_string();
+    let metadata = parse_sidecar_metadata(&json_info).unwrap();
     assert_eq!(metadata["id"], 42);
     assert_eq!(metadata["title"], "Portable match");
+
+    assert_eq!(parse_sidecar_metadata("metadata_json = 'not JSON'"), None);
     assert_eq!(parse_sidecar_metadata("title = 'Unmatched media'"), None);
 }
 #[test]
@@ -379,6 +385,7 @@ fn missing_poster_markup_uses_a_readable_fallback() {
         0.0,
         std::path::Path::new("Missing Show/Episode.mkv"),
         0,
+        true,
         true,
         "show",
         false,

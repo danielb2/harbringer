@@ -1784,11 +1784,11 @@ async fn tv_season_navigation_renders_episode_poster_cards() {
     std::fs::write(&unindexed_episode, b"0123456789abcdef").unwrap();
     let season_info = fixture
         .root
-        .join("media/Example Show/Season 01/.mplex/info.toml");
+        .join("media/Example Show/Season 01/.mplex/data.json");
     std::fs::create_dir_all(season_info.parent().unwrap()).unwrap();
     std::fs::write(
         &season_info,
-        "title = \"Season One\"\ndescription = \"A season description\"\n",
+        r#"{"title":"Season One","description":"A season description"}"#,
     )
     .unwrap();
 
@@ -1856,6 +1856,22 @@ async fn tv_show_cards_display_the_season_count() {
     assert!(body.contains("aria-label=\"Search TV shows\""));
     assert!(body.contains("aria-label=\"Close Fix Match dialog\" title=\"Close\""));
     assert!(body.contains("/web/tv-match/search"));
+}
+
+#[tokio::test]
+async fn movie_fix_match_accepts_movie_paths_without_calling_tmdb() {
+    let fixture = fixture();
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/web/tv-match/search?library=0&path=Demo.mkv&query=Demo",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("Add a TMDB bearer token"));
 }
 
 #[tokio::test]
@@ -1980,6 +1996,11 @@ fn media_cards_use_the_selected_media_poster_and_path() {
         false,
     );
     assert!(!movie_card.contains("Remove from Continue Watching"));
+    assert!(movie_card.contains(
+        "data-refresh-metadata data-library=\"0\" data-path=\"Films\">Refresh metadata</button>"
+    ));
+    assert!(movie_card
+        .contains("data-fix-match data-library=\"0\" data-path=\"Films\">Fix Match</button>"));
     let continue_card = super::media_card(
         &movie,
         &movie_config,
