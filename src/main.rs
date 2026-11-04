@@ -1170,6 +1170,7 @@ async fn scan_library_inventory(state: &AppState, library_id: usize) -> Result<u
             Query(ScanQuery {
                 force: Some(false),
                 path: None,
+                refresh: None,
             }),
         )
         .await;
@@ -1723,6 +1724,7 @@ fn plex_device_jwt(signing_key: &SigningKey, kid: &str, client_id: &str) -> Stri
 struct ScanQuery {
     force: Option<bool>,
     path: Option<String>,
+    refresh: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -3367,6 +3369,7 @@ async fn scan_library_metadata(
         .map(|media| (media.path.clone(), media.id.clone()))
         .collect::<HashMap<_, _>>();
     let forced = scan_query.force.unwrap_or(false);
+    let refreshing = scan_query.refresh.unwrap_or(false);
     let target_path = match scan_query.path.as_deref() {
         Some(path) => match clean_relative_path(path) {
             Some(path) => Some(path),
@@ -3374,7 +3377,10 @@ async fn scan_library_metadata(
         },
         None => None,
     };
-    info!(library = %library.name, forced, "metadata scan started");
+    if refreshing && target_path.is_none() {
+        return settings_error("Refresh requires a media path");
+    }
+    info!(library = %library.name, forced, refreshing, "metadata scan started");
     for folder in &library.folders {
         let mut files = match scan_media(folder).await {
             Ok(files) => files,
@@ -3402,6 +3408,26 @@ async fn scan_library_metadata(
             }
 
             let group_title = metadata_group_title(&group_path, folder);
+            if refreshing {
+                if let Err(error) = refresh_matched_metadata(
+                    &state,
+                    &client,
+                    token,
+                    folder,
+                    &group_path,
+                    &group_title,
+                    &group,
+                    library_id,
+                    kind,
+                    sidecar_mode,
+                )
+                .await
+                {
+                    return settings_error(&error);
+                }
+                matched += 1;
+                continue;
+            }
             if !forced {
                 let media_key = database_media_key(library_id + 1, &group[0].id);
                 let selected = if sidecar_mode {
@@ -3737,6 +3763,86 @@ async fn scan_library_metadata(
     info!(library = %library.name, matched, "metadata scan finished");
     let suffix = if forced { "&metadata_forced=true" } else { "" };
     Redirect::to(&format!("/settings?metadata_matched={matched}{suffix}")).into_response()
+}
+
+async fn refresh_matched_metadata(
+    state: &AppState,
+    client: &reqwest::Client,
+    token: Option<&str>,
+    folder: &PathBuf,
+    group_path: &std::path::Path,
+    group_title: &str,
+    group: &[Media],
+    library_id: usize,
+    kind: &str,
+    sidecar_mode: bool,
+) -> Result<(), String> {
+    let media_key = database_media_key(library_id + 1, &group[0].id);
+    let sidecar_metadata = read_sidecar_metadata(group_path);
+    let database_metadata = read_database_metadata(state, &media_key);
+    let metadata = if sidecar_mode {
+        sidecar_metadata.or(database_metadata)
+    } else {
+        database_metadata.or(sidecar_metadata)
+    }
+    .filter(|metadata| {
+        metadata
+            .get("id")
+            .and_then(serde_json::Value::as_i64)
+            .is_some()
+    })
+    .ok_or_else(|| "Refresh requires an existing metadata match".to_owned())?;
+    let token =
+        token.ok_or_else(|| "Add a TMDB bearer token before refreshing metadata".to_owned())?;
+    let details = if kind == "tv" {
+        tmdb_tv_show_details(client, token, &metadata)
+            .await
+            .ok_or_else(|| "Could not refresh the matched TV show from TMDB".to_owned())?
+    } else {
+        let id = metadata["id"].as_i64().unwrap_or_default();
+        let response = client
+            .get(format!("https://api.themoviedb.org/3/movie/{id}"))
+            .bearer_auth(token)
+            .query(&[("language", "en-US")])
+            .send()
+            .await
+            .map_err(|_| "Could not reach TMDB to refresh the matched movie".to_owned())?;
+        if !response.status().is_success() {
+            return Err("TMDB could not refresh the matched movie".to_owned());
+        }
+        response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|_| "TMDB returned invalid movie details".to_owned())?
+    };
+    if details.get("id").and_then(serde_json::Value::as_i64)
+        != metadata.get("id").and_then(serde_json::Value::as_i64)
+    {
+        return Err("TMDB returned details for a different match".to_owned());
+    }
+    let refreshed = merge_tv_show_details(&metadata, &details);
+    if sidecar_mode {
+        store_metadata_sidecar(folder, group_path, group_title, &group[0], &refreshed)
+            .await
+            .map_err(|_| "Could not save refreshed metadata sidecar".to_owned())?;
+        clear_group_database_metadata(state, library_id, group);
+    } else {
+        for media in group {
+            let item_metadata = tv_metadata_for_media(&refreshed, folder, &media.path, kind);
+            let key = database_media_key(library_id + 1, &media.id);
+            if !write_database_metadata(state, &key, &item_metadata) {
+                return Err("Could not save refreshed metadata".to_owned());
+            }
+        }
+    }
+    if let Err(error) = download_tmdb_artwork(
+        client, token, folder, group_path, &media_key, &refreshed, state, true,
+    )
+    .await
+    {
+        warn!(title = %group_title, error = %error, "TMDB artwork refresh failed");
+    }
+    Ok(())
 }
 
 fn tv_match_target(
@@ -5937,6 +6043,7 @@ async fn plex_section_refresh(
         Query(ScanQuery {
             force: Some(false),
             path: None,
+            refresh: None,
         }),
     )
     .await;
@@ -8547,7 +8654,7 @@ document.addEventListener("click", async event => {
     refreshMetadataButton.textContent = "Refreshing…";
     try {
       const response = await fetch(
-        `/settings/libraries/${refreshMetadataButton.dataset.library}/scan?path=${encodeURIComponent(refreshMetadataButton.dataset.path)}`,
+        `/settings/libraries/${refreshMetadataButton.dataset.library}/scan?path=${encodeURIComponent(refreshMetadataButton.dataset.path)}&refresh=true`,
         { method: "POST", redirect: "follow" }
       );
       const resultUrl = new URL(response.url);

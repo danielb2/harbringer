@@ -1875,6 +1875,40 @@ async fn movie_fix_match_accepts_movie_paths_without_calling_tmdb() {
 }
 
 #[tokio::test]
+async fn refresh_metadata_requires_and_preserves_existing_match() {
+    let fixture = fixture();
+    super::scan_library_inventory(&fixture.state, 0)
+        .await
+        .unwrap();
+    let media = super::media_snapshot(&fixture.state)
+        .iter()
+        .find(|media| media.path.ends_with("Demo.mkv"))
+        .unwrap()
+        .clone();
+    let refresh_url = "/settings/libraries/0/scan?path=Demo.mkv&refresh=true";
+    let response = send(&fixture.app, Method::POST, refresh_url, Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(response.headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .contains("Refresh%20requires%20an%20existing%20metadata%20match"));
+    let media_key = super::database_media_key(1, &media.id);
+    assert!(super::read_database_metadata(&fixture.state, &media_key).is_none());
+
+    assert!(super::write_database_metadata(
+        &fixture.state,
+        &media_key,
+        &serde_json::json!({"id": 4242, "title": "Selected movie"})
+    ));
+    let response = send(&fixture.app, Method::POST, refresh_url, Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        super::read_database_metadata(&fixture.state, &media_key).unwrap()["id"],
+        4242
+    );
+}
+
+#[tokio::test]
 async fn tv_fix_match_rejects_invalid_show_paths_without_calling_tmdb() {
     let fixture = tv_fixture();
     let response = send(
