@@ -1535,6 +1535,25 @@ async fn continue_watching_shows_only_the_first_unwatched_episode_per_show() {
     assert!(continue_cards.contains("Example.Show.S01E01.Pilot.mkv"));
     assert!(!continue_cards.contains("Example.Show.S01E02.Next.mkv"));
     assert_eq!(continue_cards.matches("class=\"media-card ").count(), 1);
+
+    let plex_hub = send(
+        &fixture.app,
+        Method::GET,
+        "/hubs/continueWatching",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(plex_hub.status(), StatusCode::OK);
+    let plex_hub: serde_json::Value =
+        serde_json::from_slice(&to_bytes(plex_hub.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let episodes = plex_hub["MediaContainer"]["Hub"][0]["Metadata"]
+        .as_array()
+        .unwrap();
+    assert_eq!(episodes.len(), 1);
+    assert!(episodes[0]["Media"][0]["Part"][0]["file"]
+        .as_str()
+        .unwrap()
+        .contains("S01E01.Pilot.mkv"));
 }
 
 #[tokio::test]

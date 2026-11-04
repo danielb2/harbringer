@@ -10535,10 +10535,96 @@ async fn plex_continue_watching_hub(
     if only_section.is_some_and(|section| section == 0 || section > libraries.len()) {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let progress_state = {
+        let Ok(connection) = state.db.lock() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        let mut statement = match connection.prepare(
+            "SELECT media_key, watched, hidden_from_continue, updated_at FROM watch_progress WHERE user_id = ?1",
+        ) {
+            Ok(statement) => statement,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let rows = match statement.query_map([USER_ID], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        match rows.collect::<rusqlite::Result<Vec<_>>>() {
+            Ok(progress) => progress,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    };
+    let mut watched_paths = std::collections::HashSet::new();
+    let mut hidden_paths = std::collections::HashSet::new();
+    let mut last_activity = std::collections::HashMap::new();
+    for (path, watched, hidden, updated_at) in progress_state {
+        if watched {
+            watched_paths.insert(path.clone());
+        }
+        if hidden {
+            hidden_paths.insert(path);
+            continue;
+        }
+        last_activity.insert(path, updated_at);
+    }
 
+    let mut tv_episode_paths = std::collections::HashSet::new();
+    for library in libraries.iter().filter(|library| library.kind == "tv") {
+        for root in &library.folders {
+            for media in media_index.iter() {
+                let Ok(relative) = media.path.strip_prefix(root) else {
+                    continue;
+                };
+                if tv_episode_info(root, &media.path).is_some() {
+                    tv_episode_paths.insert(relative.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    let mut candidates = next_tv_episode_paths(
+        &libraries,
+        media_index.as_ref(),
+        &watched_paths,
+        &hidden_paths,
+        &last_activity,
+    );
+    candidates.extend(
+        progress
+            .iter()
+            .filter(|(path, _, _)| !tv_episode_paths.contains(path))
+            .map(|(path, _, _)| {
+                (
+                    path.clone(),
+                    last_activity.get(path).copied().unwrap_or_default(),
+                )
+            }),
+    );
+    candidates.sort_by(|(left_path, left_time), (right_path, right_time)| {
+        right_time
+            .cmp(left_time)
+            .then_with(|| left_path.cmp(right_path))
+    });
+    let progress_by_path = progress
+        .iter()
+        .map(|(path, position, duration)| (path.clone(), (*position, *duration)))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut seen = std::collections::HashSet::new();
     let mut items = Vec::new();
-    for (media_key, position, duration) in progress {
+    for (media_key, activity) in candidates {
+        if !seen.insert(media_key.clone()) {
+            continue;
+        }
         let found = libraries.iter().enumerate().find_map(|(index, library)| {
+            if only_section.is_some_and(|section| section != index + 1) {
+                return None;
+            }
             media_index.iter().find_map(|media| {
                 if !media_in_library(media, library) {
                     return None;
@@ -10548,26 +10634,20 @@ async fn plex_continue_watching_hub(
                     .iter()
                     .find(|folder| media.path.starts_with(folder))?;
                 let relative = media.path.strip_prefix(root).ok()?;
-                (relative.to_string_lossy() == media_key).then_some((
-                    media.id.clone(),
-                    position,
-                    duration,
-                    index + 1,
-                ))
+                (relative.to_string_lossy() == media_key).then_some((media.id.clone(), index + 1))
             })
         });
-        if let Some(item) = found {
-            if only_section
-                .map(|section| section == item.3)
-                .unwrap_or(true)
-            {
-                items.push(item);
-            }
+        if let Some((media_id, section)) = found {
+            let (position, duration) = progress_by_path
+                .get(&media_key)
+                .copied()
+                .unwrap_or((0, None));
+            items.push((media_id, position, duration, section, activity));
         }
     }
     let total_size = items.len();
     let mut metadata = Vec::new();
-    for (media_id, position, duration, _) in items.into_iter().take(count) {
+    for (media_id, position, duration, _, _) in items.into_iter().take(count) {
         if let Some(mut item) = plex_metadata_item_json(&state, &media_id).await {
             item["viewOffset"] = serde_json::json!(position);
             if let Some(duration) = duration {
