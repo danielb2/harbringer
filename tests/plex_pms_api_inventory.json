@@ -765,7 +765,7 @@
       "path": "/library/sections/{sectionId}",
       "operation_id": "librarySectionPutSection",
       "summary": "Edit a library section",
-      "expected_status": 405
+      "expected_status": 200
     },
     {
       "method": "GET",

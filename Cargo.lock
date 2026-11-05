@@ -1240,6 +1240,7 @@ dependencies = [
  "chrono",
  "clap",
  "ed25519-dalek",
+ "form_urlencoded",
  "get_if_addrs",
  "hyper",
  "hyper-util",

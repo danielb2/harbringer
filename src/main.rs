@@ -6,7 +6,7 @@ use axum::{
     body::Body,
     extract::{
         ws::{Message, WebSocketUpgrade},
-        Form, FromRequestParts, Path, Query, RawForm, State,
+        Form, FromRequestParts, Path, Query, RawForm, RawQuery, State,
     },
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     middleware::{self, Next},
@@ -604,7 +604,12 @@ fn build_app(state: AppState) -> Router {
         )
         .route("/library/sections", get(plex_sections))
         .route("/system/scanners/:section", get(plex_system_scanners))
-        .route("/library/sections/:section", get(plex_section))
+        .route("/system/agents", get(plex_system_agents))
+
+        .route(
+            "/library/sections/:section",
+            get(plex_section).put(plex_update_section),
+        )
         .route(
             "/library/sections/:section/refresh",
             get(plex_section_refresh).post(plex_section_refresh),
@@ -10220,6 +10225,96 @@ async fn plex_system_scanners(
     plex_protocol_response(response)
 }
 
+async fn plex_system_agents(RawQuery(raw_query): RawQuery) -> Response {
+    let media_type = raw_query.as_deref().and_then(|query| {
+        form_urlencoded::parse(query.as_bytes())
+            .find(|(key, _)| key == "mediaType")
+            .map(|(_, value)| value.into_owned())
+    });
+    if !matches!(media_type.as_deref(), Some("1" | "2")) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    const LANGUAGES: &[(&str, &str)] = &[
+        ("ar-SA", "Arabic (Saudi Arabia)"),
+        ("bg-BG", "Bulgarian"),
+        ("ca-ES", "Catalan"),
+        ("zh-CN", "Chinese"),
+        ("zh-HK", "Chinese (Hong Kong)"),
+        ("zh-TW", "Chinese (Taiwan)"),
+        ("hr-HR", "Croatian"),
+        ("cs-CZ", "Czech"),
+        ("da-DK", "Danish"),
+        ("nl-NL", "Dutch"),
+        ("en-US", "English"),
+        ("en-AU", "English (Australia)"),
+        ("en-CA", "English (Canada)"),
+        ("en-GB", "English (UK)"),
+        ("et-EE", "Estonian"),
+        ("fi-FI", "Finnish"),
+        ("fr-FR", "French"),
+        ("fr-CA", "French (Canada)"),
+        ("de-DE", "German"),
+        ("el-GR", "Greek"),
+        ("he-IL", "Hebrew"),
+        ("hi-IN", "Hindi"),
+        ("hu-HU", "Hungarian"),
+        ("is-IS", "Icelandic"),
+        ("id-ID", "Indonesian"),
+        ("it-IT", "Italian"),
+        ("ja-JP", "Japanese"),
+        ("ko-KR", "Korean"),
+        ("lv-LV", "Latvian"),
+        ("lt-LT", "Lithuanian"),
+        ("nb-NO", "Norwegian Bokm&#229;l"),
+        ("fa-IR", "Persian"),
+        ("pl-PL", "Polish"),
+        ("pt-BR", "Portuguese"),
+        ("pt-PT", "Portuguese (Portugal)"),
+        ("ro-RO", "Romanian"),
+        ("ru-RU", "Russian"),
+        ("sk-SK", "Slovak"),
+        ("es-ES", "Spanish"),
+        ("es-MX", "Spanish (Mexico)"),
+        ("sv-SE", "Swedish"),
+        ("th-TH", "Thai"),
+        ("tr-TR", "Turkish"),
+        ("uk-UA", "Ukrainian"),
+        ("vi-VN", "Vietnamese"),
+    ];
+    const AGENTS: &[(&str, &str, &str)] = &[
+        ("tv.plex.agents.movie", "Plex Movie", "1"),
+        ("tv.plex.agents.none", "Plex Personal Media", "4"),
+        ("tv.plex.agents.nfo.movie", "Plex NFO Movie", "5"),
+    ];
+
+    let mut body =
+        String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><MediaContainer size=\"3\">");
+    for (identifier, name, id) in AGENTS {
+        body.push_str(&format!(
+            "<Agent identifier=\"{identifier}\" name=\"{name}\" hasPrefs=\"0\" id=\"{id}\">"
+        ));
+        for (code, title) in LANGUAGES {
+            if *code == "en-US" {
+                body.push_str(&format!(
+                    "<Language code=\"{code}\" title=\"{title}\" default=\"1\" />"
+                ));
+            } else {
+                body.push_str(&format!("<Language code=\"{code}\" title=\"{title}\" />"));
+            }
+        }
+        body.push_str("</Agent>");
+    }
+    body.push_str("</MediaContainer>");
+
+    let mut response = body.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/xml"),
+    );
+    plex_protocol_response(response)
+}
+
 async fn plex_myplex_account(State(state): State<AppState>) -> Response {
     let profile = plex_cloud_profile(&state).await;
     let mut account = serde_json::json!({
@@ -11837,21 +11932,188 @@ async fn plex_section(State(state): State<AppState>, Path(section): Path<usize>)
     }))
 }
 
-async fn plex_section_prefs(State(state): State<AppState>, Path(section): Path<usize>) -> Response {
+async fn plex_update_section(
+    State(state): State<AppState>,
+    Path(section): Path<usize>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let mut agent = None;
+    let mut locations = Vec::new();
+    for (key, value) in form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes()) {
+        match key.as_ref() {
+            "agent" => agent = Some(value.into_owned()),
+            "locations" => locations.push(value.into_owned()),
+            _ => {}
+        }
+    }
+    let Some(index) = section.checked_sub(1) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let Some(library) = state
         .config
         .lock()
         .ok()
-        .and_then(|config| config.libraries.get(section.saturating_sub(1)).cloned())
+        .and_then(|config| config.libraries.get(index).cloned())
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let expected_agent = if library.kind == "tv" {
+        "tv.plex.agents.series"
+    } else {
+        "tv.plex.agents.movie"
+    };
+    if agent.as_deref() != Some(expected_agent) || locations.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let mut requested_locations = Vec::new();
+    for location in locations {
+        let requested = PathBuf::from(location.trim());
+        let Ok(metadata) = tokio::fs::metadata(&requested).await else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        if !metadata.is_dir() {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        let Ok(canonical) = tokio::fs::canonicalize(requested).await else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        if !requested_locations.contains(&canonical) {
+            requested_locations.push(canonical);
+        }
+    }
+
+    let mut existing_locations = Vec::new();
+    for folder in &library.folders {
+        existing_locations.push(
+            tokio::fs::canonicalize(folder)
+                .await
+                .unwrap_or_else(|_| folder.clone()),
+        );
+    }
+
+    let Ok(mut config) = state.config.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Some(current_library) = config.libraries.get(index) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if current_library.name != library.name
+        || current_library.kind != library.kind
+        || current_library.folders != library.folders
+    {
+        return StatusCode::CONFLICT.into_response();
+    }
+    let mut updated_config = config.clone();
+    let folders = &mut updated_config.libraries[index].folders;
+    let mut changed = false;
+    for location in requested_locations {
+        if !existing_locations.contains(&location) {
+            folders.push(location.clone());
+            existing_locations.push(location);
+            changed = true;
+        }
+    }
+    if !changed {
+        return StatusCode::OK.into_response();
+    }
+
+    let Ok(mut connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(transaction) = connection.transaction() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if sync_config_libraries(&transaction, &updated_config).is_err()
+        || save_config(&state.config_path, &updated_config).is_err()
+        || transaction.commit().is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    *config = updated_config;
+    StatusCode::OK.into_response()
+}
+
+async fn plex_section_prefs(State(state): State<AppState>, Path(section): Path<usize>) -> Response {
+    let Some(library) = section.checked_sub(1).and_then(|index| {
+        state
+            .config
+            .lock()
+            .ok()
+            .and_then(|config| config.libraries.get(index).cloned())
+    }) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let make_setting = |id: &str, kind: &str, value: &str| {
+        let mut setting = serde_json::json!({
+            "id": id,
+            "label": id,
+            "summary": "",
+            "type": kind,
+            "default": value,
+            "value": value,
+            "hidden": false,
+            "advanced": false,
+            "group": ""
+        });
+        let enum_values = match id {
+            "hidden" => Some("0:Include on home screen and in global search|1:Exclude from home screen|2:Exclude from home screen and global search"),
+            "episodeSort" => Some("-1:Oldest first|1:Newest first"),
+            "showOrdering" => Some("tmdbAiring:The Movie Database|aired:TheTVDB"),
+            "collectionMode" => Some("0:Hide collections and show items|1:Hide items in collections|2:Show both"),
+            "flattenSeasons" => Some("0:Show|2:Hide for single-season series|1:Hide"),
+            "enableAdMarkerGeneration" => Some("0:Disabled|1:For recorded items|2:For all items"),
+            _ => None,
+        };
+        if let Some(enum_values) = enum_values {
+            setting["enumValues"] = serde_json::json!(enum_values);
+        }
+        setting
+    };
+
+    let common_settings = [
+        ("hidden", "int", "0"),
+        ("country", "text", "US"),
+        ("originalTitles", "bool", "false"),
+        ("localizedArtwork", "bool", "true"),
+        ("useLocalAssets", "bool", "true"),
+        ("respectTags", "bool", "false"),
+        ("useExternalExtras", "bool", "true"),
+        ("skipNonTrailerExtras", "bool", "false"),
+        ("useRedbandTrailers", "bool", "false"),
+        ("includeExtrasWithLocalizedSubtitles", "bool", "false"),
+        ("includeAdultContent", "bool", "false"),
+        ("enableBIFGeneration", "bool", "true"),
+        ("collectionMode", "int", "2"),
+        ("enableIntroMarkerGeneration", "bool", "true"),
+        ("enableCreditsMarkerGeneration", "bool", "true"),
+        ("enableAdMarkerGeneration", "int", "1"),
+        ("enableVoiceActivityGeneration", "bool", "true"),
+        ("enableLoudnessAnalysis", "bool", "true"),
+    ];
+    let mut settings: Vec<serde_json::Value> = common_settings
+        .iter()
+        .map(|(id, kind, value)| make_setting(id, kind, value))
+        .collect();
+
+    if library.kind == "tv" {
+        for (id, kind, value) in [
+            ("episodeSort", "text", "-1"),
+            ("showOrdering", "text", "tmdbAiring"),
+            ("useSeasonTitles", "bool", "false"),
+            ("flattenSeasons", "int", "0"),
+        ] {
+            settings.push(make_setting(id, kind, value));
+        }
+    }
+
     plex_json(serde_json::json!({
         "MediaContainer": {
-            "size": 0,
+            "size": settings.len(),
             "librarySectionID": section,
             "librarySectionTitle": library.name,
-            "Setting": []
+            "Setting": settings
         }
     }))
 }

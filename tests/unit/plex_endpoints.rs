@@ -3351,6 +3351,196 @@ async fn every_registered_plex_route_has_success_and_failure_cases() {
 }
 
 #[tokio::test]
+async fn plex_section_prefs_returns_library_settings_for_movies_and_tv() {
+    for (fixture, expected_size, expected_tv_setting) in
+        [(fixture(), 18, false), (tv_fixture(), 22, true)]
+    {
+        let response = send(
+            &fixture.app,
+            Method::GET,
+            "/library/sections/1/prefs",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let settings = body["MediaContainer"]["Setting"].as_array().unwrap();
+        assert_eq!(body["MediaContainer"]["size"], expected_size);
+        assert_eq!(settings.len(), expected_size);
+        assert_eq!(
+            settings
+                .iter()
+                .any(|setting| setting["id"] == "episodeSort"),
+            expected_tv_setting
+        );
+        assert!(settings.iter().any(|setting| {
+            setting["id"] == "collectionMode"
+                && setting["enumValues"]
+                    .as_str()
+                    .unwrap()
+                    .contains("2:Show both")
+        }));
+        assert!(settings.iter().all(|setting| {
+            setting["value"].is_string()
+                && setting["default"].is_string()
+                && setting["hidden"] == false
+                && setting["advanced"] == false
+                && setting["group"] == ""
+        }));
+    }
+}
+
+#[tokio::test]
+async fn plex_system_agents_returns_movie_languages_as_xml() {
+    let fixture = fixture();
+    let mut bodies = Vec::new();
+    for uri in [
+        "/system/agents?mediaType=1&",
+        "/system/agents?mediaType=2&action=update&X-Plex-Token=test",
+    ] {
+        let response = send(&fixture.app, Method::GET, uri, Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/xml");
+        bodies.push(
+            String::from_utf8(
+                to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap(),
+        );
+    }
+    assert_eq!(bodies[0], bodies[1]);
+    let body = &bodies[0];
+    assert!(
+        body.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?><MediaContainer size=\"3\">")
+    );
+    assert_eq!(body.matches("<Agent ").count(), 3);
+    assert_eq!(body.matches("<Language ").count(), 135);
+    assert_eq!(body.matches("default=\"1\"").count(), 3);
+    assert!(body.contains("identifier=\"tv.plex.agents.movie\" name=\"Plex Movie\""));
+    assert!(body.contains("code=\"en-US\" title=\"English\" default=\"1\""));
+    assert!(body.contains("code=\"nb-NO\" title=\"Norwegian Bokm&#229;l\""));
+
+    assert_eq!(
+        send(&fixture.app, Method::GET, "/system/agents", Body::empty())
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        send(
+            &fixture.app,
+            Method::GET,
+            "/system/agents?mediaType=3",
+            Body::empty(),
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn plex_section_put_adds_locations_and_preserves_existing_folders() {
+    let fixture = fixture();
+    let existing = fixture.root.join("media");
+    let added = fixture.root.join("more-media");
+    let duplicate = fixture.root.join("more-media-2");
+    std::fs::create_dir_all(&added).unwrap();
+    std::fs::create_dir_all(&duplicate).unwrap();
+    let added = tokio::fs::canonicalize(added).await.unwrap();
+    let duplicate = tokio::fs::canonicalize(duplicate).await.unwrap();
+
+    let uri = format!(
+        "/library/sections/1?agent=tv.plex.agents.movie&locations={}&locations={}&locations={}",
+        existing.display(),
+        added.display(),
+        duplicate.display()
+    );
+    let response = send(&fixture.app, Method::PUT, &uri, Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    {
+        let config = fixture.config.lock().unwrap();
+        assert_eq!(
+            config.libraries[0].folders,
+            vec![existing.clone(), added.clone(), duplicate.clone()]
+        );
+    }
+
+    let sections = send(
+        &fixture.app,
+        Method::GET,
+        "/library/sections",
+        Body::empty(),
+    )
+    .await;
+    let sections: serde_json::Value =
+        serde_json::from_slice(&to_bytes(sections.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        sections["MediaContainer"]["Directory"][0]["Location"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+
+    let missing_agent = send(
+        &fixture.app,
+        Method::PUT,
+        &format!("/library/sections/1?locations={}", added.display()),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(missing_agent.status(), StatusCode::BAD_REQUEST);
+
+    let invalid_location = send(
+        &fixture.app,
+        Method::PUT,
+        "/library/sections/1?agent=tv.plex.agents.movie&locations=%2Fdoes-not-exist",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(invalid_location.status(), StatusCode::BAD_REQUEST);
+
+    let unknown_section = send(
+        &fixture.app,
+        Method::PUT,
+        &format!(
+            "/library/sections/99?agent=tv.plex.agents.movie&locations={}",
+            added.display()
+        ),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(unknown_section.status(), StatusCode::NOT_FOUND);
+
+    let tv_fixture = tv_fixture();
+    let tv_folder = tv_fixture.root.join("more-tv");
+    std::fs::create_dir_all(&tv_folder).unwrap();
+    let tv_folder = tokio::fs::canonicalize(tv_folder).await.unwrap();
+    let response = send(
+        &tv_fixture.app,
+        Method::PUT,
+        &format!(
+            "/library/sections/1?agent=tv.plex.agents.series&locations={}",
+            tv_folder.display()
+        ),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        tv_fixture.config.lock().unwrap().libraries[0].folders.len(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn plex_desktop_bootstrap_endpoints_return_compatible_containers() {
     let fixture = fixture();
 
@@ -3821,7 +4011,7 @@ async fn every_official_pms_openapi_operation_has_a_real_router_test() {
             .expect("checked-in PMS API inventory must be valid JSON");
     assert_eq!(inventory.spec_version, "1.2.3");
     assert_eq!(inventory.operations.len(), inventory.operation_count);
-    assert_eq!(inventory.operation_count, 260);
+    assert_eq!(inventory.operation_count, 261);
 
     let fixture = fixture();
     // `expected_status` is the checked-in baseline, including expected
@@ -3847,6 +4037,11 @@ async fn every_official_pms_openapi_operation_has_a_real_router_test() {
             "transcodeStart" => uri.push_str("?path=%2Flibrary%2Fmetadata%2F1-1"),
             "transcodeDecision" => uri.push_str("?ratingKey=1-1"),
             "imageTranscode" => uri.push_str("?url=%2Flibrary%2Fmetadata%2F1-1%2Fthumb"),
+            "librarySectionPutSection" => uri.push_str(&format!(
+                "?agent=tv.plex.agents.movie&locations={}",
+                fixture.root.join("media").display()
+            )),
+
             _ => {}
         }
         let request = Request::builder()
