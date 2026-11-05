@@ -54,7 +54,7 @@ services:
 Or run it directly without Compose:
 
 ```sh
-docker run -p 32400:32400 -v "./config:/config" -v "./media:/media:ro" ghcr.io/danielb2/harbringer:latest
+docker run --name harbringer -p 32400:32400 -v "./config:/config" -v "./media:/media:ro" ghcr.io/danielb2/harbringer:latest
 ```
 
 Open `http://localhost:32400/`. In **Settings**, add `/media` as a library folder.
