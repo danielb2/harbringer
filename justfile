@@ -8,5 +8,15 @@ dev bind="0.0.0.0:32400":
 test:
     cargo test
 
+publish:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    owner="$(gh repo view --json owner --jq .owner.login)"
+    username="$(gh api user --jq .login)"
+    image="ghcr.io/${owner}/harbringer:latest"
+    gh auth token | docker login ghcr.io --username "$username" --password-stdin
+    docker build -t "$image" .
+    docker push "$image"
+
 restart:
     kill -HUP (pgrep -x mplex)

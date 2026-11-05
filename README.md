@@ -35,6 +35,32 @@ Harbringer reads its settings from `./config/config.toml` and creates its state 
 
 Open `http://<server>:32400/` in a browser on your network. Use **Settings** to create a library and add a folder on the server. Run **Scan all libraries** to index the files, or leave automatic scanning enabled.
 
+### Docker Compose
+
+Save this as `compose.yaml` and start Harbringer with `docker compose up -d`:
+
+```yaml
+services:
+  harbringer:
+    image: ghcr.io/danielb2/harbringer:latest
+    ports:
+      - "32400:32400"
+    volumes:
+      - ./config:/config
+      - ./media:/media:ro
+    restart: unless-stopped
+```
+
+Or run it directly without Compose:
+
+```sh
+docker run -p 32400:32400 -v "./config:/config" -v "./media:/media:ro" ghcr.io/danielb2/harbringer:latest
+```
+
+Open `http://localhost:32400/`. In **Settings**, add `/media` as a library folder.
+
+The media mount is read-only by default while Harbringer is in alpha. For disposable test media, remove `:ro` (`./media:/media`) to let server actions delete files.
+
 Harbringer currently indexes visible `.mp4`, `.m4v`, `.mkv`, and `.webm` files. The **Files** view also shows other visible files in your library folders.
 
 ## Connect a Plex app

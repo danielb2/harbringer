@@ -88,6 +88,11 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 
 ## Gap log
 
+### 2026-11-05
+
+- Added Docker Compose and `docker run` examples to the README with persistent configuration and a read-only media mount by default; noted that users can remove `:ro` for disposable test media. Validation: `just --list` passed; the examples were not run.
+
+
 ### 2026-11-03
 
 - Settings uses one Save changes action for a library's name, scan schedule, and Home visibility. Scan actions stay beside scan settings, and Add folder stays beside Folders to keep related controls compact. Folder additions can be canceled, and existing folders can be detached without deleting media. Library and folder removal now run in the background and preserve scroll position; library deletion refreshes only the library list and sidebar. This avoids the full-page reload that previously snapped Settings to the top. The modal server-folder browser and open-panel state remain in place.
