@@ -784,6 +784,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "harbringer"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "clap",
+ "ed25519-dalek",
+ "form_urlencoded",
+ "get_if_addrs",
+ "hyper",
+ "hyper-util",
+ "isolang",
+ "rand_core 0.6.4",
+ "rcgen",
+ "reqwest",
+ "rusqlite",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sha2",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "toml",
+ "tower",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+ "vuio-media-info",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1229,41 +1264,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "mplex"
-version = "0.1.0"
-dependencies = [
- "axum",
- "base64 0.22.1",
- "chrono",
- "clap",
- "ed25519-dalek",
- "form_urlencoded",
- "get_if_addrs",
- "hyper",
- "hyper-util",
- "isolang",
- "rand_core 0.6.4",
- "rcgen",
- "reqwest",
- "rusqlite",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "sha2",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "toml",
- "tower",
- "tower-http 0.5.2",
- "tracing",
- "tracing-subscriber",
- "vuio-media-info",
 ]
 
 [[package]]

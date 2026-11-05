@@ -1,5 +1,5 @@
 [package]
-name = "mplex"
+name = "harbringer"
 version = "0.1.0"
 edition = "2021"
 description = "A Rust Plex Media Server replacement"
