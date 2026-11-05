@@ -1,12 +1,4 @@
-```
-|              |         o
-|---.,---.,---.|---.,---..,---.,---.,---.,---.
-|   |,---||    |   ||    ||   ||   ||---'|
-`   '`---^`    `---'`    ``   '`---|`---'`
-                               `---'`
-```
-
-# Harbringer
+![logo](./logo.avif)
 
 Harbringer is a self-hosted media server for organizing and streaming your personal video library. It scans folders on your computer or NAS, organizes movies and TV shows into libraries, and adds available metadata and artwork. You can browse and play supported media in its built-in web client or connect compatible Plex clients.
 
