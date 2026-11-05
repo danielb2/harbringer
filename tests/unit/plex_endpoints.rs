@@ -3433,6 +3433,22 @@ async fn plex_playback_endpoints_cover_success_and_failure_paths() {
 }
 
 #[tokio::test]
+async fn myplex_claim_and_reachability_require_a_claimed_account() {
+    let fixture = fixture();
+    let claim = send(&fixture.app, Method::POST, "/myplex/claim", Body::empty()).await;
+    assert_eq!(claim.status(), StatusCode::UNAUTHORIZED);
+
+    let reachability = send(
+        &fixture.app,
+        Method::PUT,
+        "/myplex/refreshReachability",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(reachability.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn every_registered_plex_route_has_success_and_failure_cases() {
     let fixture = fixture();
     let queue = send(

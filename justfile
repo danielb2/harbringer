@@ -8,6 +8,9 @@ dev bind="0.0.0.0:32400":
 test:
     cargo test
 
+image:
+    docker build -t harbringer:latest .
+
 publish:
     #!/usr/bin/env bash
     set -euo pipefail

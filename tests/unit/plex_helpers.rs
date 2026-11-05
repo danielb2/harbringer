@@ -10,8 +10,8 @@ use super::{
     plex_media_id, plex_paged_children, plex_part_id, plex_photo_source, plex_play_queue_response,
     plex_play_queue_source_uri, plex_presence_url, plex_publish_urls, plex_query_media_id,
     plex_queue_item_without_playback_decision, plex_ranked_tv_shows, plex_rating_key,
-    plex_rating_key_from_source, plex_safe_numeric_id, plex_search_hubs, plex_search_rank,
-    plex_search_result_entries, plex_search_type_matches, plex_stream_id,
+    plex_rating_key_from_source, plex_request_token, plex_safe_numeric_id, plex_search_hubs,
+    plex_search_rank, plex_search_result_entries, plex_search_type_matches, plex_stream_id,
     plex_stream_id_and_format, plex_track_label, plex_tv_episode_parents, plex_tv_season_groups,
     plex_tv_season_json, plex_tv_show_groups, plex_tv_show_json, plex_video_json,
     plex_video_resolution, render_database_info_panel, render_season_description_panel,
@@ -20,6 +20,19 @@ use super::{
     tv_metadata_with_season_details, tv_show_title, vtt_to_srt, ConfigLibrary, HeaderMap,
     HeaderValue, Media, PathBuf, PlexStreamSelection, TvEpisodeInfo, Uri,
 };
+
+#[test]
+fn plex_request_token_reads_header_or_query_parameter() {
+    let headers = HeaderMap::new();
+    let uri = "/myplex/claim?X-Plex-Token=query-token"
+        .parse::<Uri>()
+        .unwrap();
+    assert_eq!(plex_request_token(&headers, &uri), Some("query-token"));
+
+    let mut headers = HeaderMap::new();
+    headers.insert("X-Plex-Token", HeaderValue::from_static("header-token"));
+    assert_eq!(plex_request_token(&headers, &uri), Some("header-token"));
+}
 #[test]
 fn plex_playback_ids_resolve_rating_keys_and_metadata_paths() {
     assert_eq!(

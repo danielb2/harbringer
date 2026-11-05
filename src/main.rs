@@ -589,6 +589,8 @@ fn build_app(state: AppState) -> Router {
         .route("/settings/browse", get(settings_browse))
         .route("/identity", get(plex_identity))
         .route("/myplex/account", get(plex_myplex_account))
+        .route("/myplex/claim", post(plex_myplex_claim))
+        .route("/myplex/refreshReachability", put(plex_refresh_reachability))
         .route("/accounts", get(plex_accounts))
         .route("/devices", get(plex_devices))
         .route("/accounts/:id", get(plex_account))
@@ -2311,7 +2313,7 @@ async fn claim_and_publish_plex_server(
         .header("X-Plex-Version", "1.43.4.10903-e5521bd8c")
         .header("X-Plex-Platform", "MacOSX")
         .header("X-Plex-Platform-Version", std::env::consts::ARCH)
-        .header("X-Plex-Device-Name", "harbringer")
+        .header("X-Plex-Device-Name", server_name(state))
         .header("X-Plex-Device", "MacOSX")
         .header("X-Plex-Provides", "server")
         .header(
@@ -2340,7 +2342,7 @@ async fn claim_and_publish_plex_server(
         .header("X-Plex-Version", "1.43.4.10903-e5521bd8c")
         .header("X-Plex-Platform", "MacOSX")
         .header("X-Plex-Platform-Version", std::env::consts::ARCH)
-        .header("X-Plex-Device-Name", "harbringer")
+        .header("X-Plex-Device-Name", server_name(state))
         .header("X-Plex-Device", "MacOSX")
         .header("X-Plex-Provides", "server")
         .header(
@@ -2394,7 +2396,7 @@ async fn publish_plex_connections(
         .header("X-Plex-Version", "1.43.4.10903-e5521bd8c")
         .header("X-Plex-Platform", "MacOSX")
         .header("X-Plex-Platform-Version", std::env::consts::ARCH)
-        .header("X-Plex-Device-Name", "harbringer")
+        .header("X-Plex-Device-Name", server_name(state))
         .header("X-Plex-Device", "MacOSX")
         .header("X-Plex-Model", std::env::consts::ARCH)
         .header(
@@ -2487,7 +2489,7 @@ async fn plex_account_id(
         .header("X-Plex-Platform", "MacOSX")
         .header("X-Plex-Product", "Plex Media Server")
         .header("X-Plex-Platform-Version", std::env::consts::ARCH)
-        .header("X-Plex-Device-Name", "harbringer")
+        .header("X-Plex-Device-Name", server_name(state))
         .header("X-Plex-Device", "MacOSX")
         .header("X-Plex-Model", std::env::consts::ARCH)
         .header("X-Plex-Device-Vendor", "Apple")
@@ -2536,7 +2538,7 @@ async fn run_plex_presence(client: &reqwest::Client, state: &AppState, server_to
             .header("X-Plex-Platform", "MacOSX")
             .header("X-Plex-Product", "Plex Media Server")
             .header("X-Plex-Platform-Version", std::env::consts::ARCH)
-            .header("X-Plex-Device-Name", "harbringer")
+            .header("X-Plex-Device-Name", server_name(state))
             .header("X-Plex-Device", "MacOSX")
             .header("X-Plex-Model", std::env::consts::ARCH)
             .header("X-Plex-Device-Vendor", "Apple")
@@ -2598,14 +2600,16 @@ async fn plex_connectivity_check(
         .header("X-Plex-Platform", "MacOSX")
         .header("X-Plex-Product", "Plex Media Server")
         .header("X-Plex-Platform-Version", std::env::consts::ARCH)
-        .header("X-Plex-Device-Name", "harbringer")
+        .header("X-Plex-Device-Name", server_name(state))
         .header("X-Plex-Device", "MacOSX")
         .header("X-Plex-Model", std::env::consts::ARCH)
         .header("X-Plex-Device-Vendor", "Apple")
         .body(Vec::new())
         .send()
         .await
-        .map_err(|error| format!("could not request Plex connectivity check: {error}"))?;
+        .map_err(|error| format!("could not request Plex connectivity check: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Plex rejected the connectivity check: {error}"))?;
     info!(status = %response.status(), "Plex connectivity check response");
     Ok(())
 }
@@ -2661,7 +2665,7 @@ async fn publish_plex_device(
         .header("X-Plex-Version", version)
         .header("X-Plex-Platform", "MacOSX")
         .header("X-Plex-Platform-Version", std::env::consts::ARCH)
-        .header("X-Plex-Device-Name", "harbringer")
+        .header("X-Plex-Device-Name", server_name(state))
         .header("X-Plex-Device", "MacOSX")
         .header("X-Plex-Model", std::env::consts::ARCH)
         .header("X-Plex-Device-Vendor", "Apple")
@@ -10732,6 +10736,78 @@ async fn plex_myplex_account(State(state): State<AppState>) -> Response {
         }
     }
     plex_json(serde_json::json!({"MyPlexAccount": account}))
+}
+
+async fn plex_myplex_claim(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let Some(account_token) = plex_request_token(&headers, &uri).filter(|token| !token.is_empty())
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+
+    let (server_token, claimed, error) =
+        match claim_and_publish_plex_server(&state, account_token).await {
+            Ok(result) => result,
+            Err(error) => return (StatusCode::BAD_GATEWAY, error).into_response(),
+        };
+    let Ok(connection) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if connection
+        .execute(
+            "UPDATE server_identity SET plex_account_token = ?1, claimed = ?2, plex_last_error = ?3 WHERE id = 1",
+            (&server_token, claimed, error.as_deref()),
+        )
+        .is_err()
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    drop(connection);
+    if !claimed {
+        return (
+            StatusCode::BAD_GATEWAY,
+            error.unwrap_or_else(|| "Plex server claim failed".to_owned()),
+        )
+            .into_response();
+    }
+    let response = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><MyPlex authToken=\"{}\" />",
+        xml_escape(&server_token)
+    );
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/xml; charset=utf-8")
+        .body(Body::from(response))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn plex_refresh_reachability(State(state): State<AppState>) -> Response {
+    let server_token = state.db.lock().ok().and_then(|connection| {
+        connection
+            .query_row(
+                "SELECT plex_account_token FROM server_identity WHERE id = 1 AND claimed = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+    });
+    let Some(server_token) = server_token else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if let Err(error) =
+        plex_connectivity_check(&reqwest::Client::new(), &state, &server_token).await
+    {
+        warn!(error = %error, "Plex reachability refresh failed");
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/xml; charset=utf-8")
+        .body(Body::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><MediaContainer size=\"0\" />",
+        ))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn plex_accounts(State(state): State<AppState>) -> Response {
