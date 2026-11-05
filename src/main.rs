@@ -1139,19 +1139,54 @@ async fn scan_library_inventory(state: &AppState, library_id: usize) -> Result<u
         .iter()
         .map(|media| media.id.as_str())
         .collect::<HashSet<_>>();
-    let removed_media = current
+    let previous_count = current
         .iter()
-        .filter(|media| belongs_to_library(media) && !scanned_ids.contains(media.id.as_str()))
+        .filter(|media| belongs_to_library(media))
+        .count();
+    let retained_media = current
+        .iter()
+        .filter(|media| {
+            belongs_to_library(media)
+                && !scanned_ids.contains(media.id.as_str())
+                && media.path.is_file()
+                && media_type(&media.path).is_some()
+        })
         .cloned()
         .collect::<Vec<_>>();
+    for media in &retained_media {
+        warn!(
+            library = %library.name,
+            id = %media.id,
+            path = %media.path.display(),
+            "retaining existing media omitted by library scan"
+        );
+    }
+    let removed_media = current
+        .iter()
+        .filter(|media| {
+            belongs_to_library(media)
+                && !scanned_ids.contains(media.id.as_str())
+                && !media.path.exists()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    info!(
+        library = %library.name,
+        previous_count,
+        scanned_count,
+        retained_count = retained_media.len(),
+        removed_count = removed_media.len(),
+        "library inventory scan completed"
+    );
     let insertion_index = current
         .iter()
         .position(belongs_to_library)
         .unwrap_or(current.len());
-    let mut updated = Vec::with_capacity(current.len() + scanned_count);
+    let mut updated = Vec::with_capacity(current.len() + scanned_count + retained_media.len());
     for (index, media) in current.iter().enumerate() {
         if index == insertion_index {
             updated.extend(scanned.iter().cloned());
+            updated.extend(retained_media.iter().cloned());
         }
         if !belongs_to_library(media) {
             updated.push(media.clone());
@@ -1159,6 +1194,7 @@ async fn scan_library_inventory(state: &AppState, library_id: usize) -> Result<u
     }
     if insertion_index == current.len() {
         updated.extend(scanned);
+        updated.extend(retained_media);
     }
     {
         let mut media = state
@@ -11408,78 +11444,10 @@ async fn plex_continue_watching_hub(
     }))
 }
 
-fn plex_stale_media_notification(state: &AppState) -> Option<String> {
-    let active_media_ids = media_snapshot(state)
-        .iter()
-        .map(|media| media.id.clone())
-        .collect::<HashSet<_>>();
-    let connection = state.db.lock().ok()?;
-    let mut statement = connection
-        .prepare("SELECT library_section, media_key, canonical_path FROM media_identity")
-        .ok()?;
-    let entries = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })
-        .ok()?
-        .filter_map(Result::ok)
-        .filter_map(|(section, media_key, path)| {
-            let section = u64::try_from(section).ok()?;
-            if section == 0 || active_media_ids.contains(&media_key) {
-                return None;
-            }
-            let item_id = media_key
-                .split_once('-')
-                .filter(|(media_section, _)| media_section.parse::<u64>().ok() == Some(section))
-                .and_then(|(_, item_id)| item_id.parse::<u64>().ok())?;
-            let rating_key = (section << 20) | item_id;
-            let title = path.rsplit(['/', '\\']).next().unwrap_or(&path);
-            Some(serde_json::json!({
-                "identifier": "com.plexapp.plugins.library",
-                "sectionID": section.to_string(),
-                "itemID": rating_key.to_string(),
-                "type": 1,
-                "title": title,
-                "state": 9,
-                "updatedAt": SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-            }))
-        })
-        .collect::<Vec<_>>();
-    if entries.is_empty() {
-        return None;
-    }
-    Some(
-        serde_json::json!({
-            "NotificationContainer": {
-                "type": "timeline",
-                "size": entries.len(),
-                "TimelineEntry": entries
-            }
-        })
-        .to_string(),
-    )
-}
-
 fn plex_notification_response(upgrade: WebSocketUpgrade, state: AppState) -> Response {
     upgrade
         .on_upgrade(move |mut socket| async move {
             let mut notifications = state.plex_notifications.subscribe();
-            if let Some(notification) = plex_stale_media_notification(&state) {
-                if socket
-                    .send(Message::Text(notification.into()))
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
             let mut heartbeat = tokio::time::interval_at(
                 tokio::time::Instant::now() + Duration::from_secs(10),
                 Duration::from_secs(10),

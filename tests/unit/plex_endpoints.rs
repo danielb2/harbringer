@@ -930,6 +930,37 @@ async fn manual_scan_updates_web_and_plex_inventory_without_changing_existing_id
 }
 
 #[tokio::test]
+async fn scans_keep_existing_supported_media_omitted_by_scan() {
+    let fixture = fixture();
+    let omitted_dir = fixture.root.join("media/.scanner-hidden");
+    std::fs::create_dir_all(&omitted_dir).unwrap();
+    let omitted_path = omitted_dir.join("Demo.mkv");
+    std::fs::write(&omitted_path, b"video").unwrap();
+    let mut media = fixture.state.media.write().unwrap();
+    let mut items = media.as_ref().clone();
+    let mut stale_item = items[0].clone();
+    stale_item.id = "1-2".to_owned();
+    stale_item.title = "Demo hidden".to_owned();
+    stale_item.path = omitted_path.clone();
+    items.push(stale_item);
+    *media = Arc::new(items);
+    drop(media);
+
+    let mut notifications = fixture.state.plex_notifications.subscribe();
+    let scan = send(&fixture.app, Method::POST, "/settings/scan", Body::empty()).await;
+    assert_eq!(scan.status(), StatusCode::SEE_OTHER);
+    assert!(omitted_path.exists());
+    assert!(fixture
+        .state
+        .media
+        .read()
+        .unwrap()
+        .iter()
+        .any(|media| media.id == "1-2" && media.path == omitted_path));
+    assert!(notifications.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn stale_episode_request_rescans_without_hiding_its_library() {
     let fixture = tv_fixture();
     {
@@ -964,13 +995,6 @@ async fn stale_episode_request_rescans_without_hiding_its_library() {
         notification["NotificationContainer"]["TimelineEntry"][0]["state"],
         9
     );
-    let reconnect_notification: serde_json::Value =
-        serde_json::from_str(&super::plex_stale_media_notification(&fixture.state).unwrap())
-            .unwrap();
-    assert_eq!(
-        reconnect_notification["NotificationContainer"]["TimelineEntry"][0]["itemID"],
-        rating_key.to_string()
-    );
 
     let stale_item = send(
         &fixture.app,
@@ -1004,6 +1028,61 @@ async fn stale_episode_request_rescans_without_hiding_its_library() {
     let shows: serde_json::Value =
         serde_json::from_slice(&to_bytes(shows.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(shows["MediaContainer"]["totalSize"], 1);
+}
+
+#[tokio::test]
+async fn notification_websocket_does_not_replay_historical_media_as_deleted() {
+    let fixture = tv_fixture();
+    let stale_path = fixture.root.join("media/.ignored/old-episode.mkv");
+    std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
+    std::fs::write(&stale_path, b"video").unwrap();
+    let canonical_path = std::fs::canonicalize(&stale_path).unwrap();
+    fixture
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO media_identity (library_section, canonical_path, media_key) VALUES (?1, ?2, ?3)",
+            rusqlite::params![1, canonical_path.to_string_lossy(), "1-999"],
+        )
+        .unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = fixture.app.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let websocket_key = base64::engine::general_purpose::STANDARD.encode([0_u8; 16]);
+    let request = format!(
+        "GET /:/websocket/notifications HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: {websocket_key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut response = Vec::new();
+    let mut byte = [0_u8; 1];
+    while !response.ends_with(b"\r\n\r\n") {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_exact(&mut byte),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        response.push(byte[0]);
+    }
+    assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 101"));
+
+    let mut frame = [0_u8; 2];
+    assert!(tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        stream.read(&mut frame)
+    )
+    .await
+    .is_err());
+    server.abort();
 }
 
 #[tokio::test]
