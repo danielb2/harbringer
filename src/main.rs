@@ -4816,6 +4816,11 @@ struct PlexTvShowGroup<'a> {
     episodes: Vec<&'a Media>,
 }
 
+struct PlexTvEpisodeGroup<'a> {
+    episode: Option<u32>,
+    files: Vec<&'a Media>,
+}
+
 fn tv_show_title(root: &PathBuf, media: &std::path::Path) -> String {
     let relative = media.strip_prefix(root).unwrap_or(media);
     let components = relative
@@ -12249,38 +12254,53 @@ async fn plex_search_items(
                 if !plex_search_type_matches(query, "episode") {
                     continue;
                 }
-                for (media_index, media) in show.episodes.iter().enumerate() {
-                    let episode_metadata = metadata.get(&media.id);
-                    let episode_filename_title = tv_episode_display_name(&media.title);
-                    let episode_title = episode_metadata
-                        .and_then(|value| value.get("mplex_episode_title"))
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or(&episode_filename_title);
-                    let Some(rank) = plex_episode_search_rank(
-                        term,
-                        episode_title,
-                        episode_filename_title.as_str(),
-                        show_rank,
-                    ) else {
-                        continue;
-                    };
-                    let episode_info = library
-                        .folders
-                        .iter()
-                        .find(|root| media.path.starts_with(root))
-                        .and_then(|root| tv_episode_info(root, &media.path));
-                    let season = episode_info
-                        .as_ref()
-                        .map(|episode| episode.season)
-                        .unwrap_or(1);
-                    let episode = episode_info
-                        .as_ref()
-                        .map(|episode| episode.episode)
-                        .unwrap_or(media_index as u32 + 1);
-                    let mut item = plex_video_json(media, section, library, episode_metadata);
-                    plex_tv_episode_parents(&mut item, &show, season, episode, &show_guid);
-                    add_plex_technical_metadata(state, &mut item, media).await;
-                    results.push((rank, episode_title.to_lowercase(), item));
+                let episode_groups = plex_tv_season_groups(&show, &library.folders);
+                for (season, episodes) in episode_groups {
+                    for (index, episode_group) in episodes.iter().enumerate() {
+                        let Some(representative) = episode_group.files.first() else {
+                            continue;
+                        };
+                        let episode_metadata = metadata.get(&representative.id);
+                        let episode_filename_title = tv_episode_display_name(&representative.title);
+                        let episode_title = episode_metadata
+                            .and_then(|value| value.get("mplex_episode_title"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(&episode_filename_title);
+                        let rank = episode_group
+                            .files
+                            .iter()
+                            .filter_map(|file| {
+                                let filename_title = tv_episode_display_name(&file.title);
+                                let title = metadata
+                                    .get(&file.id)
+                                    .and_then(|value| value.get("mplex_episode_title"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or(&filename_title);
+                                plex_episode_search_rank(
+                                    term,
+                                    title,
+                                    filename_title.as_str(),
+                                    show_rank,
+                                )
+                            })
+                            .min();
+                        let Some(rank) = rank else {
+                            continue;
+                        };
+                        let item = plex_tv_episode_json(
+                            state,
+                            episode_group,
+                            &show,
+                            season,
+                            episode_group.episode.unwrap_or(index as u32 + 1),
+                            section,
+                            library,
+                            &metadata,
+                            &show_guid,
+                        )
+                        .await;
+                        results.push((rank, episode_title.to_lowercase(), item));
+                    }
                 }
             }
         } else if plex_search_type_matches(query, "movie") {
@@ -13470,28 +13490,23 @@ async fn plex_library_all(
                     }
                 }
                 if include_type("4", "episode", false) {
-                    for (index, episode) in show.episodes.iter().enumerate() {
-                        let episode_info = library
-                            .folders
-                            .iter()
-                            .find(|root| episode.path.starts_with(root))
-                            .and_then(|root| tv_episode_info(root, &episode.path));
-                        let season = episode_info.as_ref().map(|info| info.season).unwrap_or(1);
-                        let episode_number = episode_info
-                            .as_ref()
-                            .map(|info| info.episode)
-                            .unwrap_or(index as u32 + 1);
-                        let mut item =
-                            plex_video_json(episode, section, library, metadata.get(&episode.id));
-                        plex_tv_episode_parents(
-                            &mut item,
-                            &show,
-                            season,
-                            episode_number,
-                            &show_guid,
-                        );
-                        add_plex_technical_metadata(&state, &mut item, episode).await;
-                        items.push(item);
+                    for (season, episodes) in &seasons {
+                        for (index, episode) in episodes.iter().enumerate() {
+                            let episode_number = episode.episode.unwrap_or(index as u32 + 1);
+                            let item = plex_tv_episode_json(
+                                &state,
+                                episode,
+                                &show,
+                                *season,
+                                episode_number,
+                                section,
+                                library,
+                                &metadata,
+                                &show_guid,
+                            )
+                            .await;
+                            items.push(item);
+                        }
                     }
                 }
             }
@@ -13774,25 +13789,24 @@ async fn plex_tv_all(
 fn plex_tv_season_groups<'a>(
     show: &PlexTvShowGroup<'a>,
     roots: &[PathBuf],
-) -> BTreeMap<u32, Vec<&'a Media>> {
-    let mut seasons = BTreeMap::<u32, Vec<&Media>>::new();
+) -> BTreeMap<u32, Vec<PlexTvEpisodeGroup<'a>>> {
+    let mut episode_groups = BTreeMap::<(u32, u32, String), Vec<&Media>>::new();
     for media in &show.episodes {
-        let season = roots
+        let episode_info = roots
             .iter()
             .find(|root| media.path.starts_with(root))
-            .and_then(|root| tv_episode_info(root, &media.path))
-            .map(|episode| episode.season)
-            .unwrap_or(1);
-        seasons.entry(season).or_default().push(media);
+            .and_then(|root| tv_episode_info(root, &media.path));
+        let key = episode_info
+            .map(|episode| (episode.season, episode.episode, String::new()))
+            .unwrap_or_else(|| (1, u32::MAX, media.id.clone()));
+        episode_groups.entry(key).or_default().push(media);
     }
-    for episodes in seasons.values_mut() {
-        episodes.sort_by_key(|media| {
-            roots
-                .iter()
-                .find(|root| media.path.starts_with(root))
-                .and_then(|root| tv_episode_info(root, &media.path))
-                .map(|episode| (episode.episode, media.title.to_lowercase()))
-                .unwrap_or((u32::MAX, media.title.to_lowercase()))
+    let mut seasons = BTreeMap::<u32, Vec<PlexTvEpisodeGroup>>::new();
+    for ((season, episode, _), mut files) in episode_groups {
+        files.sort_by_key(|media| media.id.clone());
+        seasons.entry(season).or_default().push(PlexTvEpisodeGroup {
+            episode: (episode != u32::MAX).then_some(episode),
+            files,
         });
     }
     seasons
@@ -13819,17 +13833,21 @@ fn plex_tv_show_json(
     item["title"] = serde_json::json!(title);
     item["titleSort"] = serde_json::json!(title.to_lowercase());
     item["originalTitle"] = serde_json::json!(title);
-    item["childCount"] = serde_json::json!(plex_tv_season_groups(show, &library.folders).len());
-    item["leafCount"] = serde_json::json!(show.episodes.len());
-    let viewed_episodes = show
-        .episodes
+    let episode_groups = plex_tv_season_groups(show, &library.folders);
+    item["childCount"] = serde_json::json!(episode_groups.len());
+    let episode_groups = episode_groups.values().flatten().collect::<Vec<_>>();
+    let leaf_count = episode_groups.len();
+    item["leafCount"] = serde_json::json!(leaf_count);
+    let viewed_episodes = episode_groups
         .iter()
-        .filter(|episode| {
-            metadata
-                .get(&episode.id)
-                .and_then(|metadata| metadata.get("mplex_view_count"))
-                .and_then(serde_json::Value::as_i64)
-                .is_some_and(|view_count| view_count > 0)
+        .filter(|group| {
+            group.files.iter().any(|episode| {
+                metadata
+                    .get(&episode.id)
+                    .and_then(|metadata| metadata.get("mplex_view_count"))
+                    .and_then(serde_json::Value::as_i64)
+                    .is_some_and(|view_count| view_count > 0)
+            })
         })
         .count();
     item["viewedLeafCount"] = serde_json::json!(viewed_episodes);
@@ -13845,6 +13863,96 @@ fn plex_tv_show_json(
         object.remove("grandparentTitle");
     }
     item
+}
+
+async fn plex_tv_episode_json(
+    state: &AppState,
+    group: &PlexTvEpisodeGroup<'_>,
+    show: &PlexTvShowGroup<'_>,
+    season: u32,
+    episode_number: u32,
+    section: usize,
+    library: &ConfigLibrary,
+    metadata: &HashMap<String, serde_json::Value>,
+    show_guid: &str,
+) -> serde_json::Value {
+    let mut episode_item = None;
+    let mut media_items = Vec::with_capacity(group.files.len());
+    for file in &group.files {
+        let mut file_item = plex_video_json(file, section, library, metadata.get(&file.id));
+        add_plex_technical_metadata(state, &mut file_item, file).await;
+        if episode_item.is_none() {
+            episode_item = Some(file_item.clone());
+        }
+        if let Some(media) = file_item
+            .get("Media")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|media| media.first())
+        {
+            media_items.push(media.clone());
+        }
+    }
+    let Some(mut item) = episode_item else {
+        return serde_json::Value::Null;
+    };
+    item["Media"] = serde_json::json!(media_items);
+    plex_tv_episode_parents(&mut item, show, season, episode_number, show_guid);
+    if let Some(show_title) = group
+        .files
+        .first()
+        .and_then(|file| metadata.get(&file.id))
+        .and_then(|metadata| metadata.get("name"))
+        .and_then(serde_json::Value::as_str)
+    {
+        item["grandparentTitle"] = serde_json::json!(show_title);
+    }
+    item
+}
+
+async fn plex_tv_episode_json_for_media(
+    state: &AppState,
+    media_items: &[Media],
+    media: &Media,
+    section: usize,
+    library: &ConfigLibrary,
+    metadata: &HashMap<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if library.kind != "tv" {
+        return None;
+    }
+    let shows = plex_tv_show_groups(
+        section,
+        &library.folders,
+        media_items
+            .iter()
+            .filter(|candidate| media_in_library(candidate, library)),
+    );
+    let show = shows
+        .iter()
+        .find(|show| show.episodes.iter().any(|episode| episode.id == media.id))?;
+    let show_guid = plex_tv_show_guid(show, metadata);
+    let seasons = plex_tv_season_groups(show, &library.folders);
+    let (season, index, episode) = seasons.iter().find_map(|(season, episodes)| {
+        episodes
+            .iter()
+            .enumerate()
+            .find(|(_, episode)| episode.files.iter().any(|file| file.id == media.id))
+            .map(|(index, episode)| (*season, index, episode))
+    })?;
+    Some(
+        plex_tv_episode_json(
+            state,
+            episode,
+            show,
+            season,
+            episode.episode.unwrap_or(index as u32 + 1),
+            section,
+            library,
+            metadata,
+            &show_guid,
+        )
+        .await,
+    )
 }
 
 fn plex_tv_season_json(
@@ -14077,17 +14185,20 @@ async fn plex_item(
                 .remove(&season)
                 .unwrap_or_default();
             let mut episodes = Vec::with_capacity(season_episodes.len());
-            for (index, media) in season_episodes.iter().enumerate() {
-                let episode_number = library
-                    .folders
-                    .iter()
-                    .find(|root| media.path.starts_with(root))
-                    .and_then(|root| tv_episode_info(root, &media.path))
-                    .map(|episode| episode.episode)
-                    .unwrap_or(index as u32 + 1);
-                let mut item = plex_video_json(media, section, &library, metadata.get(&media.id));
-                plex_tv_episode_parents(&mut item, &show, season, episode_number, &show_guid);
-                add_plex_technical_metadata(&s, &mut item, media).await;
+            for (index, episode) in season_episodes.iter().enumerate() {
+                let episode_number = episode.episode.unwrap_or(index as u32 + 1);
+                let item = plex_tv_episode_json(
+                    &s,
+                    episode,
+                    &show,
+                    season,
+                    episode_number,
+                    section,
+                    &library,
+                    &metadata,
+                    &show_guid,
+                )
+                .await;
                 episodes.push(item);
             }
             if wants_children {
@@ -14223,44 +14334,22 @@ async fn plex_item(
         return StatusCode::NOT_FOUND.into_response();
     };
     let metadata_by_id = plex_section_metadata(&s, section);
-    let mut video = plex_video_json(&media, section, &library, metadata_by_id.get(&media.id));
-    if library.kind == "tv" {
-        let groups = plex_tv_show_groups(
-            section,
-            &library.folders,
-            media_index
-                .iter()
-                .filter(|candidate| media_in_library(candidate, &library)),
-        );
-        if let Some(show) = groups
-            .into_iter()
-            .find(|show| show.episodes.iter().any(|episode| episode.id == media.id))
-        {
-            let episode_info = library
-                .folders
-                .iter()
-                .find(|root| media.path.starts_with(root))
-                .and_then(|root| tv_episode_info(root, &media.path));
-            let season = episode_info
-                .as_ref()
-                .map(|episode| episode.season)
-                .unwrap_or(1);
-            let episode = episode_info
-                .as_ref()
-                .map(|episode| episode.episode)
-                .unwrap_or(1);
-            let show_guid = plex_tv_show_guid(&show, &metadata_by_id);
-            plex_tv_episode_parents(&mut video, &show, season, episode, &show_guid);
-            if let Some(show_title) = metadata_by_id
-                .get(&media.id)
-                .and_then(|metadata| metadata.get("name"))
-                .and_then(serde_json::Value::as_str)
-            {
-                video["grandparentTitle"] = serde_json::json!(show_title);
-            }
-        }
-    }
-    add_plex_technical_metadata(&s, &mut video, &media).await;
+    let mut video = if let Some(video) = plex_tv_episode_json_for_media(
+        &s,
+        media_index.as_ref(),
+        &media,
+        section,
+        &library,
+        &metadata_by_id,
+    )
+    .await
+    {
+        video
+    } else {
+        let mut video = plex_video_json(&media, section, &library, metadata_by_id.get(&media.id));
+        add_plex_technical_metadata(&s, &mut video, &media).await;
+        video
+    };
     // Plex for Mac refetches the selected item after creating the queue and
     // bases its playability check on this metadata response as well.
     plex_mark_direct_play(&mut video);
@@ -15292,8 +15381,23 @@ async fn plex_create_play_queue(
         return StatusCode::NOT_FOUND.into_response();
     };
     let metadata = plex_section_metadata(&state, section);
-    let mut item = plex_video_json(&media, section, &library, metadata.get(&media.id));
-    add_plex_technical_metadata(&state, &mut item, &media).await;
+    let media_index = media_snapshot(&state);
+    let mut item = if let Some(item) = plex_tv_episode_json_for_media(
+        &state,
+        media_index.as_ref(),
+        &media,
+        section,
+        &library,
+        &metadata,
+    )
+    .await
+    {
+        item
+    } else {
+        let mut item = plex_video_json(&media, section, &library, metadata.get(&media.id));
+        add_plex_technical_metadata(&state, &mut item, &media).await;
+        item
+    };
     let direct_play = query.get("directPlay").map(String::as_str) != Some("0");
     if direct_play {
         plex_mark_direct_play(&mut item);
@@ -15375,8 +15479,23 @@ async fn plex_playback_decision(
     };
 
     let metadata_by_id = plex_section_metadata(&state, section);
-    let mut video = plex_video_json(&media, section, &library, metadata_by_id.get(&media.id));
-    add_plex_technical_metadata(&state, &mut video, &media).await;
+    let media_index = media_snapshot(&state);
+    let mut video = if let Some(video) = plex_tv_episode_json_for_media(
+        &state,
+        media_index.as_ref(),
+        &media,
+        section,
+        &library,
+        &metadata_by_id,
+    )
+    .await
+    {
+        video
+    } else {
+        let mut video = plex_video_json(&media, section, &library, metadata_by_id.get(&media.id));
+        add_plex_technical_metadata(&state, &mut video, &media).await;
+        video
+    };
     let library_uuid = plex_library_uuid(&state, &library.name, section);
     if query.get("directPlay").map(String::as_str) != Some("0") {
         plex_mark_direct_play(&mut video);

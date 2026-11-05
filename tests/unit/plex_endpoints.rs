@@ -1114,6 +1114,147 @@ async fn manual_scan_adds_new_tv_episode_to_plex_inventory() {
 }
 
 #[tokio::test]
+async fn duplicate_tv_episode_files_are_versions_of_one_plex_item() {
+    let fixture = tv_fixture();
+    let duplicate_path = fixture
+        .root
+        .join("media/Example Show/Season 01/Example.Show.S01E02.Next-copy.mkv");
+    std::fs::write(&duplicate_path, b"alternate-version").unwrap();
+
+    let scan = send(&fixture.app, Method::POST, "/settings/scan", Body::empty()).await;
+    assert_eq!(scan.status(), StatusCode::SEE_OTHER);
+
+    let show_response = send(
+        &fixture.app,
+        Method::GET,
+        "/library/sections/1/all",
+        Body::empty(),
+    )
+    .await;
+    let show_json: serde_json::Value = serde_json::from_slice(
+        &to_bytes(show_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(show_json["MediaContainer"]["Metadata"][0]["leafCount"], 2);
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/library/all?type=4",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let items = json["MediaContainer"]["Metadata"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    let episode = items
+        .iter()
+        .find(|item| item["index"].as_u64() == Some(2))
+        .unwrap();
+    let media = episode["Media"].as_array().unwrap();
+    assert_eq!(media.len(), 2);
+    assert_ne!(media[0]["id"], media[1]["id"]);
+    let part_ids = media
+        .iter()
+        .map(|source| source["Part"][0]["id"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_ne!(part_ids[0], part_ids[1]);
+
+    let original_path = fixture
+        .root
+        .join("media/Example Show/Season 01/Example.Show.S01E02.Next.mkv")
+        .to_string_lossy()
+        .into_owned();
+    let original_path_copy = duplicate_path.to_string_lossy().into_owned();
+    let mut listed_paths = Vec::new();
+    for source in media {
+        let part = &source["Part"][0];
+        let path = part["file"].as_str().unwrap();
+        listed_paths.push(path.to_owned());
+        let expected_bytes = if path == original_path.as_str() {
+            b"0123456789abcdef".as_slice()
+        } else if path == original_path_copy.as_str() {
+            b"alternate-version".as_slice()
+        } else {
+            panic!("unexpected episode file path: {path}");
+        };
+        let response = send(
+            &fixture.app,
+            Method::GET,
+            part["key"].as_str().unwrap(),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            expected_bytes
+        );
+    }
+    assert!(listed_paths.contains(&original_path));
+    assert!(listed_paths.contains(&original_path_copy));
+
+    let rating_key = episode["ratingKey"].as_str().unwrap();
+    let direct = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/library/metadata/{rating_key}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(direct.status(), StatusCode::OK);
+    let direct: serde_json::Value =
+        serde_json::from_slice(&to_bytes(direct.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        direct["MediaContainer"]["Metadata"][0]["Media"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let queue = send(
+        &fixture.app,
+        Method::POST,
+        &format!("/playQueues?type=video&uri=%2Flibrary%2Fmetadata%2F{rating_key}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(queue.status(), StatusCode::OK);
+    let queue: serde_json::Value =
+        serde_json::from_slice(&to_bytes(queue.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        queue["MediaContainer"]["Metadata"][0]["Media"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let decision = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/video/:/transcode/universal/decision?ratingKey={rating_key}&directPlay=1"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(decision.status(), StatusCode::OK);
+    let decision: serde_json::Value =
+        serde_json::from_slice(&to_bytes(decision.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        decision["MediaContainer"]["Metadata"][0]["Media"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
 async fn other_libraries_skip_tmdb_metadata_matching() {
     let fixture = fixture();
     fixture.config.lock().unwrap().libraries[0].kind = "other".to_owned();
