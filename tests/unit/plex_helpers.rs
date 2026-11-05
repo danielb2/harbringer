@@ -13,12 +13,12 @@ use super::{
     plex_rating_key_from_source, plex_request_token, plex_safe_numeric_id, plex_search_hubs,
     plex_search_rank, plex_search_result_entries, plex_search_type_matches, plex_stream_id,
     plex_stream_id_and_format, plex_track_label, plex_tv_episode_parents, plex_tv_season_groups,
-    plex_tv_season_json, plex_tv_show_groups, plex_tv_show_json, plex_video_json,
-    plex_video_resolution, render_database_info_panel, render_season_description_panel,
-    render_toml_details, render_tv_show_metadata_details, sidebar_nav_with_library_links,
-    sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms, technical_tracks,
-    tv_metadata_with_season_details, tv_show_title, vtt_to_srt, ConfigLibrary, HeaderMap,
-    HeaderValue, Media, PathBuf, PlexStreamSelection, TvEpisodeInfo, Uri,
+    plex_tv_season_json, plex_tv_show_groups, plex_tv_show_json, plex_user_avatar_source,
+    plex_video_json, plex_video_resolution, render_database_info_panel,
+    render_season_description_panel, render_toml_details, render_tv_show_metadata_details,
+    sidebar_nav_with_library_links, sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms,
+    technical_tracks, tv_metadata_with_season_details, tv_show_title, vtt_to_srt, ConfigLibrary,
+    HeaderMap, HeaderValue, Media, PathBuf, PlexStreamSelection, TvEpisodeInfo, Uri,
 };
 
 #[test]
@@ -74,6 +74,16 @@ fn plex_photo_sources_resolve_thumb_and_art_routes() {
         Some(("2-42".to_owned(), "banner.jpg"))
     );
     assert_eq!(plex_photo_source("/library/metadata/2-42/poster"), None);
+}
+
+#[test]
+fn plex_user_avatar_sources_accept_only_user_avatar_paths() {
+    assert_eq!(
+        plex_user_avatar_source("/users/96a9727d29e511ca/avatar"),
+        Some("96a9727d29e511ca".to_owned())
+    );
+    assert_eq!(plex_user_avatar_source("/users/../avatar"), None);
+    assert_eq!(plex_user_avatar_source("/users/id/avatar/extra"), None);
 }
 #[test]
 fn media_info_json_duration_and_tracks_map_to_plex_fields() {

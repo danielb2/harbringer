@@ -740,6 +740,9 @@ fn build_app(state: AppState) -> Router {
                     );
                 })
                 .on_response(|response: &Response, latency: Duration, _span: &Span| {
+                    if response.extensions().get::<SuppressHttpResponseLog>().is_some() {
+                        return;
+                    }
                     info!(
                         "event=http_response status={} latency_ms={}",
                         response.status(),
@@ -9755,13 +9758,19 @@ async fn log_not_found(State(state): State<AppState>, req: Request<Body>) -> Res
         let Some(source) = query.and_then(|query| query.get("url").cloned()) else {
             return StatusCode::BAD_REQUEST.into_response();
         };
+        if let Some(user_id) = plex_user_avatar_source(&source) {
+            return plex_user_avatar(&state, &user_id).await;
+        }
+
         let Some((id, filename)) = plex_photo_source(&source) else {
             let source_path = Uri::try_from(source.as_str())
                 .ok()
                 .map(|uri| uri.path().to_owned())
                 .unwrap_or_else(|| "<invalid-uri>".to_owned());
-            warn!(source_path, "unsupported Plex photo source");
-            return StatusCode::NOT_FOUND.into_response();
+            warn!(status = %StatusCode::NOT_FOUND, source_path, "unsupported Plex photo source");
+            let mut response = StatusCode::NOT_FOUND.into_response();
+            response.extensions_mut().insert(SuppressHttpResponseLog);
+            return response;
         };
         return plex_artwork(&state, &id, filename).await;
     }
@@ -9979,6 +9988,83 @@ fn plex_photo_source(source: &str) -> Option<(String, &'static str)> {
         _ => return None,
     };
     Some((id.to_owned(), filename))
+}
+
+fn plex_user_avatar_source(source: &str) -> Option<String> {
+    let uri = Uri::try_from(source).ok()?;
+    let segments = uri
+        .path()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let ["users", user_id, "avatar"] = segments.as_slice() else {
+        return None;
+    };
+    if user_id.is_empty()
+        || user_id.len() > 64
+        || !user_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return None;
+    }
+    Some((*user_id).to_owned())
+}
+
+#[derive(Clone)]
+struct SuppressHttpResponseLog;
+
+async fn plex_user_avatar(state: &AppState, user_id: &str) -> Response {
+    let token = state.db.lock().ok().and_then(|connection| {
+        connection
+            .query_row(
+                "SELECT plex_account_token FROM server_identity WHERE id = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+    });
+    let Some(token) = token else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let response = match reqwest::Client::new()
+        .get(format!("https://plex.tv/users/{user_id}/avatar"))
+        .header("Accept", "image/*")
+        .header("X-Plex-Product", "Plex Media Server")
+        .header(
+            "X-Plex-Client-Identifier",
+            state.machine_identifier.as_ref(),
+        )
+        .header("X-Plex-Token", token)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(%error, user_id, "Plex account avatar request failed");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    if !response.status().is_success() {
+        warn!(status = %response.status(), user_id, "Plex account avatar request failed");
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.starts_with("image/"))
+        .unwrap_or("image/jpeg")
+        .to_owned();
+    let Ok(bytes) = response.bytes().await else {
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .body(Body::from(bytes))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
 async fn plex_cors(request: Request<Body>, next: Next) -> Response {
