@@ -6,7 +6,7 @@ Project guidance for `mplex`: the target is a 100% drop-in replacement for Plex'
 
 - Read relevant code and current Plex request traces before changing behavior.
 - Keep the protocol surface Plex-only. Do not add Jellyfin routes or mix adapters.
-- Implement Plex behavior against the official PMS documentation, current request traces, and a reference PMS or compatible implementation where available. Validate client-visible behavior, including the full item menus, against Plex clients; do not infer parity from route tests alone.
+- Before implementing or changing any Plex API behavior, consult the official PMS API documentation at https://developer.plex.tv/pms and verify the operation, parameters, response formats, and status codes. Do not rely on request traces or assumptions in place of the documentation. If the documentation does not specify a detail or is unavailable, state that clearly and use current request traces and a reference PMS or compatible implementation where available; do not present an inference as documented behavior. Validate client-visible behavior, including the full item menus, against Plex clients; do not infer parity from route tests alone.
 - Playback is a core requirement: support direct play, direct stream/remux, and transcoding when a Plex client requires it.
 - Media inspection, remuxing, decoding, encoding, and transcoding must use portable in-process Rust libraries. Do not depend on installed commands such as `ffmpeg` or `ffprobe`.
 - Keep platform support in mind when selecting media libraries and features. Do not make one operating system's hardware decoder mandatory.

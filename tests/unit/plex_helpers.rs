@@ -99,6 +99,11 @@ fn plex_media_advertises_playable_part_audio_video_and_external_subtitle() {
         scan_enabled: true,
         scan_interval_value: 5,
         scan_interval_unit: "minutes".to_owned(),
+        plex_agent: None,
+        plex_scanner: None,
+        plex_language: None,
+        metadata_agent_provider_group_id: None,
+        plex_preferences: None,
     };
     let info = serde_json::json!({"media":{"track":[
         {"@type":"General", "Duration":"120.5", "BitRate":"1800000"},
@@ -219,6 +224,11 @@ fn plex_media_infers_average_bitrate_when_media_info_omits_it() {
         scan_enabled: true,
         scan_interval_value: 5,
         scan_interval_unit: "minutes".to_owned(),
+        plex_agent: None,
+        plex_scanner: None,
+        plex_language: None,
+        metadata_agent_provider_group_id: None,
+        plex_preferences: None,
     };
     let info = serde_json::json!({"media":{"track":[
         {"@type":"General", "Duration":"120.5"},
@@ -554,6 +564,11 @@ fn continue_watching_picks_the_first_unwatched_episode_for_a_show() {
         scan_enabled: true,
         scan_interval_value: 5,
         scan_interval_unit: "minutes".to_owned(),
+        plex_agent: None,
+        plex_scanner: None,
+        plex_language: None,
+        metadata_agent_provider_group_id: None,
+        plex_preferences: None,
     };
     let watched = std::collections::HashSet::from([first_path.to_owned()]);
     let hidden = std::collections::HashSet::new();
@@ -749,6 +764,11 @@ fn plex_tv_library_groups_episode_files_under_show_and_season_items() {
         scan_enabled: true,
         scan_interval_value: 5,
         scan_interval_unit: "minutes".to_owned(),
+        plex_agent: None,
+        plex_scanner: None,
+        plex_language: None,
+        metadata_agent_provider_group_id: None,
+        plex_preferences: None,
     };
     let metadata = std::collections::HashMap::from([(
         "3-1".to_owned(),
@@ -982,6 +1002,11 @@ fn plex_extras_for_known_media_return_an_empty_json_container() {
         scan_enabled: true,
         scan_interval_value: 5,
         scan_interval_unit: "minutes".to_owned(),
+        plex_agent: None,
+        plex_scanner: None,
+        plex_language: None,
+        metadata_agent_provider_group_id: None,
+        plex_preferences: None,
     };
     let response = plex_empty_extras_response(&library, 1, "library-uuid");
     assert_eq!(response["MediaContainer"]["size"], 0);

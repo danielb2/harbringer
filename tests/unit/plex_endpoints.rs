@@ -7,6 +7,7 @@ use axum::{
     http::{header, Method, Request, StatusCode},
     Router,
 };
+use base64::Engine as _;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -117,6 +118,11 @@ fn fixture() -> Fixture {
         scan_enabled: true,
         scan_interval_value: 5,
         scan_interval_unit: "minutes".to_owned(),
+        plex_agent: None,
+        plex_scanner: None,
+        plex_language: None,
+        metadata_agent_provider_group_id: None,
+        plex_preferences: None,
     };
     let config = Config {
         bind: "127.0.0.1:0".to_owned(),
@@ -214,6 +220,11 @@ fn tv_fixture() -> Fixture {
             scan_enabled: true,
             scan_interval_value: 5,
             scan_interval_unit: "minutes".to_owned(),
+            plex_agent: None,
+            plex_scanner: None,
+            plex_language: None,
+            metadata_agent_provider_group_id: None,
+            plex_preferences: None,
         }],
         metadata_storage: "sidecar".to_owned(),
         tmdb_bearer_token: None,
@@ -879,6 +890,11 @@ async fn manual_scan_updates_web_and_plex_inventory_without_changing_existing_id
             scan_enabled: true,
             scan_interval_value: 5,
             scan_interval_unit: "minutes".to_owned(),
+            plex_agent: None,
+            plex_scanner: None,
+            plex_language: None,
+            metadata_agent_provider_group_id: None,
+            plex_preferences: None,
         });
     {
         let config = fixture.config.lock().unwrap();
@@ -2344,6 +2360,11 @@ fn media_cards_use_the_selected_media_poster_and_path() {
         scan_enabled: true,
         scan_interval_value: 5,
         scan_interval_unit: "minutes".to_owned(),
+        plex_agent: None,
+        plex_scanner: None,
+        plex_language: None,
+        metadata_agent_provider_group_id: None,
+        plex_preferences: None,
     };
     let movie_card = super::media_card(
         &movie,
@@ -2408,6 +2429,11 @@ fn media_cards_use_the_selected_media_poster_and_path() {
         scan_enabled: true,
         scan_interval_value: 5,
         scan_interval_unit: "minutes".to_owned(),
+        plex_agent: None,
+        plex_scanner: None,
+        plex_language: None,
+        metadata_agent_provider_group_id: None,
+        plex_preferences: None,
     };
     let tv_metadata = serde_json::json!({"name":"Example Show"});
     let tv_card = super::media_card(
@@ -2505,6 +2531,217 @@ async fn deleting_a_library_uses_an_async_response() {
     assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
     assert!(fixture.config.lock().unwrap().libraries.is_empty());
     assert!(media_file.exists());
+}
+
+#[tokio::test]
+async fn plex_post_sections_creates_a_library_from_query_parameters() {
+    let fixture = fixture();
+    let media_root = fixture.root.join("morem");
+    std::fs::create_dir_all(&media_root).unwrap();
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query
+        .append_pair("name", "Other Videos")
+        .append_pair("type", "movie")
+        .append_pair("agent", "tv.plex.agents.none")
+        .append_pair("scanner", "Plex Video Files")
+        .append_pair("language", "en-US")
+        .append_pair("metadataAgentProviderGroupId", "4")
+        .append_pair("location", media_root.to_str().unwrap())
+        .append_pair("prefs[hidden]", "1")
+        .append_pair("prefs[collectionMode]", "0");
+    let uri = format!("/library/sections?{}", query.finish());
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(&uri)
+        .header(header::ACCEPT, "application/xml")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = fixture.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/xml");
+    let xml = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(xml.starts_with("<?xml version=\"1.0\""));
+    assert!(xml.contains("<MediaContainer size=\"1\">"));
+    assert!(xml.contains("title=\"Other Videos\""));
+    assert!(xml.contains("agent=\"tv.plex.agents.none\""));
+    assert!(xml.contains("scanner=\"Plex Video Files\""));
+    assert!(xml.contains("metadataAgentProviderGroupId=\"4\""));
+
+    let sections = send(
+        &fixture.app,
+        Method::GET,
+        "/library/sections",
+        Body::empty(),
+    )
+    .await;
+    let sections: serde_json::Value =
+        serde_json::from_slice(&to_bytes(sections.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let directory = sections["MediaContainer"]["Directory"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|directory| directory["title"] == "Other Videos")
+        .unwrap();
+    assert_eq!(directory["key"], "2");
+    assert_eq!(directory["type"], "movie");
+    assert_eq!(directory["agent"], "tv.plex.agents.none");
+    assert_eq!(directory["scanner"], "Plex Video Files");
+    assert_eq!(directory["language"], "en-US");
+    assert_eq!(directory["metadataAgentProviderGroupId"], 4);
+    assert_eq!(
+        directory["Location"][0]["path"],
+        tokio::fs::canonicalize(&media_root)
+            .await
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+
+    let duplicate = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&uri)
+                .header(header::ACCEPT, "application/xml")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), StatusCode::OK);
+    assert_eq!(
+        String::from_utf8(
+            to_bytes(duplicate.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec()
+        )
+        .unwrap(),
+        xml
+    );
+
+    let config: super::Config =
+        toml::from_str(&std::fs::read_to_string(fixture.state.config_path.as_ref()).unwrap())
+            .unwrap();
+    let created = &config.libraries[1];
+    assert_eq!(created.plex_agent.as_deref(), Some("tv.plex.agents.none"));
+    assert_eq!(created.plex_scanner.as_deref(), Some("Plex Video Files"));
+    assert_eq!(created.plex_language.as_deref(), Some("en-US"));
+    assert_eq!(created.metadata_agent_provider_group_id, Some(4));
+    let preferences = created.plex_preferences.as_ref().unwrap();
+    assert_eq!(preferences.get("hidden").map(String::as_str), Some("1"));
+    assert_eq!(
+        preferences.get("collectionMode").map(String::as_str),
+        Some("0")
+    );
+
+    let invalid = send(
+        &fixture.app,
+        Method::POST,
+        "/library/sections?name=Invalid&type=movie&agent=tv.plex.agents.none&scanner=Plex%20Video%20Files&location=%2Fdoes-not-exist",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(fixture.config.lock().unwrap().libraries.len(), 2);
+}
+
+#[tokio::test]
+async fn official_post_sections_all_accepts_numeric_media_types() {
+    let fixture = fixture();
+    let mut movie_query = form_urlencoded::Serializer::new(String::new());
+    movie_query
+        .append_pair("name", "Documented Movies")
+        .append_pair("type", "1")
+        .append_pair("agent", "tv.plex.agents.none")
+        .append_pair("language", "en-US")
+        .append_pair("locations", fixture.root.join("media").to_str().unwrap());
+    let movie_uri = format!("/library/sections/all?{}", movie_query.finish());
+    let movie_response = send(&fixture.app, Method::POST, &movie_uri, Body::empty()).await;
+    assert_eq!(movie_response.status(), StatusCode::OK);
+    let movie: serde_json::Value = serde_json::from_slice(
+        &to_bytes(movie_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(movie["MediaContainer"]["Directory"][0]["type"], "movie");
+    assert_eq!(
+        movie["MediaContainer"]["Directory"][0]["scanner"],
+        "Plex Video Files"
+    );
+
+    let mut tv_query = form_urlencoded::Serializer::new(String::new());
+    tv_query
+        .append_pair("name", "Documented Shows")
+        .append_pair("type", "2")
+        .append_pair("agent", "tv.plex.agents.series")
+        .append_pair("language", "en-US")
+        .append_pair("locations", fixture.root.join("media").to_str().unwrap());
+    let tv_uri = format!("/library/sections/all?{}", tv_query.finish());
+    let tv_response = send(&fixture.app, Method::POST, &tv_uri, Body::empty()).await;
+    assert_eq!(tv_response.status(), StatusCode::OK);
+    let tv: serde_json::Value =
+        serde_json::from_slice(&to_bytes(tv_response.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(tv["MediaContainer"]["Directory"][0]["type"], "show");
+    assert_eq!(
+        tv["MediaContainer"]["Directory"][0]["scanner"],
+        "Plex TV Series"
+    );
+}
+
+#[tokio::test]
+async fn plex_delete_section_removes_library_and_keeps_media_files() {
+    let fixture = fixture();
+    let create_uri = format!(
+        "/library/sections?name=Delete%20Me&type=movie&agent=tv.plex.agents.none&location={}",
+        fixture.root.join("media").display()
+    );
+    let created = send(&fixture.app, Method::POST, &create_uri, Body::empty()).await;
+    assert_eq!(created.status(), StatusCode::OK);
+
+    let response = send(
+        &fixture.app,
+        Method::DELETE,
+        "/library/sections/2",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(fixture.config.lock().unwrap().libraries.len(), 1);
+    assert_eq!(fixture.config.lock().unwrap().libraries[0].name, "Movies");
+    assert!(fixture.root.join("media/Demo.mkv").exists());
+    let connection = fixture.db.lock().unwrap();
+    let library_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM library_groups WHERE name = 'Delete Me'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(library_count, 0);
+    drop(connection);
+
+    for section in ["0", "99"] {
+        let response = send(
+            &fixture.app,
+            Method::DELETE,
+            &format!("/library/sections/{section}"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }
 
 #[tokio::test]
@@ -3219,6 +3456,7 @@ async fn every_registered_plex_route_has_success_and_failure_cases() {
         (Method::GET, "/status/sessions/history/all"),
         (Method::GET, "/servers"),
         (Method::GET, "/media/providers"),
+        (Method::GET, "/services/browse?includeFiles=0"),
         (Method::GET, "/security/resources"),
         (Method::GET, "/hubs"),
         (Method::GET, "/hubs/promoted"),
@@ -3231,12 +3469,21 @@ async fn every_registered_plex_route_has_success_and_failure_cases() {
         (Method::GET, "/hubs/sections/1"),
         (Method::GET, "/hubs/metadata/1-1/related"),
         (Method::GET, "/library/sections"),
+        (Method::GET, "/library/sections/prefs?type=1"),
+        (
+            Method::POST,
+            &format!(
+                "/library/sections?name=Route%20Library&type=movie&agent=tv.plex.agents.none&scanner=Plex%20Video%20Files&location={}",
+                fixture.root.join("media").display()
+            ),
+        ),
+
         (Method::GET, "/system/scanners/1?action=update"),
         (Method::GET, "/library/sections/1"),
         (Method::GET, "/library/sections/1/refresh"),
         (Method::GET, "/library/sections/1/collections"),
         (Method::GET, "/library/sections/1/prefs"),
-        (Method::PUT, "/library/sections/1/prefs"),
+        (Method::PUT, "/library/sections/1/prefs?hidden=1"),
         (Method::GET, "/library/sections/1/sorts"),
         (Method::GET, "/library/sections/1/filters"),
         (Method::GET, "/library/sections/1/firstCharacter"),
@@ -3300,7 +3547,9 @@ async fn every_registered_plex_route_has_success_and_failure_cases() {
 
     for (method, uri) in cases {
         let response = send(&fixture.app, method.clone(), uri, Body::empty()).await;
-        let expected_status = if method == Method::POST
+        let expected_status = if method == Method::POST && uri.starts_with("/library/sections?") {
+            StatusCode::OK
+        } else if method == Method::POST
             && (uri.starts_with("/playlists?") || uri.starts_with("/library/collections?"))
         {
             StatusCode::CREATED
@@ -3315,7 +3564,9 @@ async fn every_registered_plex_route_has_success_and_failure_cases() {
         if uri.starts_with("/video/:/") || uri.starts_with("/photo/:/") || uri.starts_with("/:/") {
             continue;
         }
-        let (failure_uri, failure_status) = if uri.starts_with("/media/") {
+        let (failure_uri, failure_status) = if uri == "/library/sections/1" {
+            ("/library/sections/999", StatusCode::NOT_FOUND)
+        } else if uri.starts_with("/media/") {
             ("/media/no-such-item", StatusCode::NOT_FOUND)
         } else {
             (uri, StatusCode::METHOD_NOT_ALLOWED)
@@ -3390,6 +3641,158 @@ async fn plex_section_prefs_returns_library_settings_for_movies_and_tv() {
                 && setting["group"] == ""
         }));
     }
+}
+
+#[tokio::test]
+async fn plex_global_section_prefs_validates_type_and_agent_prefs_route_is_available() {
+    let fixture = fixture();
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/library/sections/prefs?type=1&agent=tv.plex.agents.none",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["MediaContainer"]["size"], 18);
+
+    let missing_type = send(
+        &fixture.app,
+        Method::GET,
+        "/library/sections/prefs",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(missing_type.status(), StatusCode::BAD_REQUEST);
+
+    let agent_prefs = send(
+        &fixture.app,
+        Method::GET,
+        "/:/plugins/tv.plex.agents.none/prefs",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(agent_prefs.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(agent_prefs.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(body["MediaContainer"]["size"], 0);
+
+    let unknown_agent = send(
+        &fixture.app,
+        Method::GET,
+        "/:/plugins/unknown.agent/prefs",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(unknown_agent.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn plex_section_prefs_put_persists_preferences_and_rejects_empty_updates() {
+    let fixture = fixture();
+    let response = send(
+        &fixture.app,
+        Method::PUT,
+        "/library/sections/1/prefs?hidden=1&collectionMode=0",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    {
+        let config = fixture.config.lock().unwrap();
+        let preferences = config.libraries[0].plex_preferences.as_ref().unwrap();
+        assert_eq!(preferences.get("hidden").map(String::as_str), Some("1"));
+        assert_eq!(
+            preferences.get("collectionMode").map(String::as_str),
+            Some("0")
+        );
+    }
+
+    let missing_preferences = send(
+        &fixture.app,
+        Method::PUT,
+        "/library/sections/1/prefs",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(missing_preferences.status(), StatusCode::BAD_REQUEST);
+
+    let missing_section = send(
+        &fixture.app,
+        Method::PUT,
+        "/library/sections/99/prefs?hidden=1",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(missing_section.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn plex_services_browse_lists_directories_and_optional_files() {
+    let fixture = fixture();
+    let root_response = send(
+        &fixture.app,
+        Method::GET,
+        "/services/browse?includeFiles=0",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(root_response.status(), StatusCode::OK);
+
+    let parent = fixture.root.join("browse");
+    let child = parent.join("Child Folder");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(parent.join("sample.mkv"), b"sample").unwrap();
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(parent.to_string_lossy().as_bytes());
+
+    let directories = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/services/browse/{encoded}?includeFiles=0"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(directories.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(directories.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("<Path"));
+    assert!(body.contains(&child.to_string_lossy().to_string()));
+    assert!(!body.contains("<File"));
+
+    let files = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/services/browse/{encoded}?includeFiles=1"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(files.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(files.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("<File"));
+
+    let invalid_path = send(
+        &fixture.app,
+        Method::GET,
+        "/services/browse/not-base64",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(invalid_path.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -3538,6 +3941,91 @@ async fn plex_section_put_adds_locations_and_preserves_existing_folders() {
         tv_fixture.config.lock().unwrap().libraries[0].folders.len(),
         2
     );
+}
+
+#[tokio::test]
+async fn plex_section_put_updates_optional_section_fields_without_locations() {
+    let fixture = fixture();
+    let response = send(
+        &fixture.app,
+        Method::PUT,
+        "/library/sections/1?agent=tv.plex.agents.movie&name=Renamed&scanner=Plex%20Video%20Files&language=fr&metadataAgentProviderGroupId=77&prefs%5Bhidden%5D=2",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    {
+        let config = fixture.config.lock().unwrap();
+        let library = &config.libraries[0];
+        assert_eq!(library.name, "Renamed");
+        assert_eq!(library.plex_agent.as_deref(), Some("tv.plex.agents.movie"));
+        assert_eq!(library.plex_scanner.as_deref(), Some("Plex Video Files"));
+        assert_eq!(library.plex_language.as_deref(), Some("fr"));
+        assert_eq!(library.metadata_agent_provider_group_id, Some(77));
+        assert_eq!(
+            library.plex_preferences.as_ref().unwrap().get("hidden"),
+            Some(&"2".to_owned())
+        );
+        assert_eq!(library.folders.len(), 1);
+    }
+
+    let connection = fixture.db.lock().unwrap();
+    let renamed_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM library_groups WHERE name = 'Renamed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(renamed_count, 1);
+    drop(connection);
+
+    let preferences = send(
+        &fixture.app,
+        Method::GET,
+        "/library/sections/1/prefs",
+        Body::empty(),
+    )
+    .await;
+    let preferences: serde_json::Value =
+        serde_json::from_slice(&to_bytes(preferences.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let hidden = preferences["MediaContainer"]["Setting"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|setting| setting["id"] == "hidden")
+        .unwrap();
+    assert_eq!(hidden["value"], "2");
+
+    let xml_response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/library/sections/1?agent=tv.plex.agents.movie")
+                .header(header::ACCEPT, "application/xml")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(xml_response.status(), StatusCode::OK);
+    assert_eq!(
+        xml_response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/xml"
+    );
+    let xml = String::from_utf8(
+        to_bytes(xml_response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(xml.contains("<Directory"));
+    assert!(xml.contains("title=\"Renamed\""));
 }
 
 #[tokio::test]
@@ -4014,6 +4502,12 @@ async fn every_official_pms_openapi_operation_has_a_real_router_test() {
     assert_eq!(inventory.operation_count, 261);
 
     let fixture = fixture();
+    let delete_probe = format!(
+        "/library/sections?name=Delete%20Probe&type=movie&agent=tv.plex.agents.none&location={}",
+        fixture.root.join("media").display()
+    );
+    let response = send(&fixture.app, Method::POST, &delete_probe, Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
     // `expected_status` is the checked-in baseline, including expected
     // 404/405 results for documented operations not implemented yet.
     // When an operation is implemented, update its status alongside
@@ -4037,6 +4531,16 @@ async fn every_official_pms_openapi_operation_has_a_real_router_test() {
             "transcodeStart" => uri.push_str("?path=%2Flibrary%2Fmetadata%2F1-1"),
             "transcodeDecision" => uri.push_str("?ratingKey=1-1"),
             "imageTranscode" => uri.push_str("?url=%2Flibrary%2Fmetadata%2F1-1%2Fthumb"),
+            "libraryPostSection" => uri.push_str(&format!(
+                "?name=OpenAPI%20Section&type=1&agent=tv.plex.agents.none&language=en-US&locations={}",
+                fixture.root.join("media").display()
+            )),
+            "libraryDeleteSection" => uri = "/library/sections/2".to_owned(),
+            "libraryGetSectionsPrefs" => {
+                uri.push_str("?type=1&agent=tv.plex.agents.none")
+            },
+            "librarySectionPutPrefs" => uri.push_str("?hidden=0"),
+
             "librarySectionPutSection" => uri.push_str(&format!(
                 "?agent=tv.plex.agents.movie&locations={}",
                 fixture.root.join("media").display()

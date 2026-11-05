@@ -716,14 +716,14 @@
       "path": "/library/sections/all",
       "operation_id": "libraryGetSections",
       "summary": "Get library sections (main Media Provider Only)",
-      "expected_status": 400
+      "expected_status": 200
     },
     {
       "method": "POST",
       "path": "/library/sections/all",
       "operation_id": "libraryPostSection",
       "summary": "Add a library section",
-      "expected_status": 405
+      "expected_status": 200
     },
     {
       "method": "DELETE",
@@ -737,7 +737,7 @@
       "path": "/library/sections/prefs",
       "operation_id": "libraryGetSectionsPrefs",
       "summary": "Get section prefs",
-      "expected_status": 400
+      "expected_status": 200
     },
     {
       "method": "POST",
@@ -758,7 +758,7 @@
       "path": "/library/sections/{sectionId}",
       "operation_id": "libraryDeleteSection",
       "summary": "Delete a library section",
-      "expected_status": 405
+      "expected_status": 200
     },
     {
       "method": "PUT",
