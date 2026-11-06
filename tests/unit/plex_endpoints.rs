@@ -9,7 +9,7 @@ use axum::{
 };
 use base64::Engine as _;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -129,6 +129,7 @@ fn fixture() -> Fixture {
         libraries: vec![library],
         metadata_storage: "sidecar".to_owned(),
         tmdb_bearer_token: None,
+        plex_account_preferences: BTreeMap::new(),
     };
     sync_config_libraries(&db, &config).unwrap();
     let mut media = Media {
@@ -228,6 +229,7 @@ fn tv_fixture() -> Fixture {
         }],
         metadata_storage: "sidecar".to_owned(),
         tmdb_bearer_token: None,
+        plex_account_preferences: BTreeMap::new(),
     };
     sync_config_libraries(&db, &config).unwrap();
     let part_id = plex_part_id(&media[0]);
@@ -3666,6 +3668,73 @@ async fn myplex_claim_and_reachability_require_a_claimed_account() {
     )
     .await;
     assert_eq!(reachability.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn plex_account_preferences_can_be_updated_and_read_back() {
+    let fixture = fixture();
+    let update = send(
+        &fixture.app,
+        Method::PUT,
+        "/accounts/1?defaultAudioLanguage=ab&autoSelectAudio=1&defaultSubtitleLanguage=ab&subtitleMode=2",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::OK);
+    assert_eq!(
+        fixture
+            .config
+            .lock()
+            .unwrap()
+            .plex_account_preferences
+            .get("defaultAudioLanguage")
+            .map(String::as_str),
+        Some("ab")
+    );
+
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/accounts/1")
+                .header(header::ACCEPT, "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let account: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let account = &account["MediaContainer"]["Account"][0];
+    assert_eq!(account["defaultAudioLanguage"], "ab");
+    assert_eq!(account["defaultSubtitleLanguage"], "ab");
+    assert_eq!(account["subtitleMode"], 2);
+
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/accounts/1")
+                .header(header::ACCEPT, "text/plain, */*; q=0.01")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/xml; charset=utf-8"
+    );
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let account_xml = String::from_utf8(body.to_vec()).unwrap();
+    assert!(account_xml.contains("autoSelectAudio=\"1\""));
+    assert!(account_xml.contains("defaultAudioLanguage=\"ab\""));
 }
 
 #[tokio::test]

@@ -65,6 +65,8 @@ struct Config {
     metadata_storage: String,
     #[serde(default)]
     tmdb_bearer_token: Option<String>,
+    #[serde(default)]
+    plex_account_preferences: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -593,7 +595,10 @@ fn build_app(state: AppState) -> Router {
         .route("/myplex/refreshReachability", put(plex_refresh_reachability))
         .route("/accounts", get(plex_accounts))
         .route("/devices", get(plex_devices))
-        .route("/accounts/:id", get(plex_account))
+        .route(
+            "/accounts/:id",
+            get(plex_account).put(update_plex_account),
+        )
         .route("/activities", get(plex_activities))
         .route("/status/sessions", get(plex_sessions))
         .route("/status/sessions/history/all", get(plex_session_history))
@@ -1283,6 +1288,7 @@ fn load_config(path: &std::path::Path) -> Result<Config, Box<dyn std::error::Err
             libraries: Vec::new(),
             metadata_storage: default_metadata_storage(),
             tmdb_bearer_token: None,
+            plex_account_preferences: BTreeMap::new(),
         });
     }
     let contents = std::fs::read_to_string(path)?;
@@ -10937,15 +10943,70 @@ async fn plex_refresh_reachability(State(state): State<AppState>) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-async fn plex_accounts(State(state): State<AppState>) -> Response {
-    plex_account_value(plex_cloud_profile(&state).await)
+async fn plex_accounts(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    plex_account_value(
+        plex_cloud_profile(&state).await,
+        plex_account_preferences(&state),
+        &headers,
+    )
 }
 
-async fn plex_account(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+async fn plex_account(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     if id != "1" {
         return StatusCode::NOT_FOUND.into_response();
     }
-    plex_account_value(plex_cloud_profile(&state).await)
+    plex_account_value(
+        plex_cloud_profile(&state).await,
+        plex_account_preferences(&state),
+        &headers,
+    )
+}
+
+async fn update_plex_account(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    if id != "1" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let updates = form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes())
+        .filter(|(key, _)| {
+            matches!(
+                key.as_ref(),
+                "defaultAudioLanguage"
+                    | "autoSelectAudio"
+                    | "defaultSubtitleLanguage"
+                    | "subtitleMode"
+            )
+        })
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    if updates.is_empty()
+        || updates.iter().any(|(key, value)| match key.as_str() {
+            "autoSelectAudio" => !matches!(value.as_str(), "0" | "1" | "true" | "false"),
+            "subtitleMode" => {
+                value.parse::<u8>().is_err() || value.parse::<u8>().is_ok_and(|mode| mode > 4)
+            }
+            _ => value.trim().is_empty(),
+        })
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Ok(mut config) = state.config.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    for (key, value) in updates {
+        config.plex_account_preferences.insert(key, value);
+    }
+    if save_config(&state.config_path, &config).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    StatusCode::OK.into_response()
 }
 
 async fn plex_cloud_profile(state: &AppState) -> Option<(String, Option<String>)> {
@@ -10995,15 +11056,38 @@ async fn plex_cloud_profile(state: &AppState) -> Option<(String, Option<String>)
         .map(|name| (name, thumb))
 }
 
-fn plex_account_value(profile: Option<(String, Option<String>)>) -> Response {
+fn plex_account_preferences(state: &AppState) -> BTreeMap<String, String> {
+    state
+        .config
+        .lock()
+        .map(|config| config.plex_account_preferences.clone())
+        .unwrap_or_default()
+}
+
+fn plex_account_value(
+    profile: Option<(String, Option<String>)>,
+    preferences: BTreeMap<String, String>,
+    headers: &HeaderMap,
+) -> Response {
     let mut account = serde_json::json!({
         "id": 1,
         "key": "/accounts/1",
         "name": "harbringer",
-            "defaultAudioLanguage": PLEX_DEFAULT_AUDIO_LANGUAGE,
-        "autoSelectAudio": true,
-        "defaultSubtitleLanguage": "en",
-        "subtitleMode": 2
+        "defaultAudioLanguage": preferences
+            .get("defaultAudioLanguage")
+            .map(String::as_str)
+            .unwrap_or(PLEX_DEFAULT_AUDIO_LANGUAGE),
+        "autoSelectAudio": preferences
+            .get("autoSelectAudio")
+            .is_none_or(|value| matches!(value.as_str(), "1" | "true")),
+        "defaultSubtitleLanguage": preferences
+            .get("defaultSubtitleLanguage")
+            .map(String::as_str)
+            .unwrap_or("en"),
+        "subtitleMode": preferences
+            .get("subtitleMode")
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or(2)
     });
     if let Some((name, thumb)) = profile {
         account["name"] = serde_json::json!(name);
@@ -11011,13 +11095,47 @@ fn plex_account_value(profile: Option<(String, Option<String>)>) -> Response {
             account["thumb"] = serde_json::json!(thumb);
         }
     }
-    plex_json(serde_json::json!({
+    let container = serde_json::json!({
         "MediaContainer": {
             "size": 1,
             "identifier": "com.plexapp.system.accounts",
-            "Account": [account]
+            "Account": [account.clone()]
         }
-    }))
+    });
+    if !headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("application/json"))
+    {
+        let fields = account
+            .as_object()
+            .into_iter()
+            .flat_map(|account| account.iter())
+            .map(|(key, value)| {
+                let value = if key == "autoSelectAudio" {
+                    if value.as_bool().unwrap_or(false) {
+                        "1".to_owned()
+                    } else {
+                        "0".to_owned()
+                    }
+                } else {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string())
+                };
+                format!(" {key}=\"{}\"", xml_escape(&value))
+            })
+            .collect::<String>();
+        return plex_protocol_response(
+            (
+                [(header::CONTENT_TYPE, "text/xml; charset=utf-8")],
+                format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><MediaContainer size=\"1\" identifier=\"com.plexapp.system.accounts\"><Account{fields}/></MediaContainer>"),
+            )
+                .into_response(),
+        );
+    }
+    plex_json(container)
 }
 
 async fn plex_activities() -> Response {
