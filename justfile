@@ -17,18 +17,29 @@ test:
 
 # build docker image
 image:
-    docker build -t harbringer:latest .
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! docker buildx version >/dev/null 2>&1; then
+        printf 'Docker Buildx is required. Install it with: brew install docker-buildx\n' >&2
+        exit 1
+    fi
+    build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    docker buildx build --load --build-arg "IMAGE_BUILD_DATE=$build_date" -t harbringer:latest .
 
 # build and publish docker image
 publish:
     #!/usr/bin/env bash
     set -euo pipefail
+    if ! docker buildx version >/dev/null 2>&1; then
+        printf 'Docker Buildx is required. Install it with: brew install docker-buildx\n' >&2
+        exit 1
+    fi
     owner="$(gh repo view --json owner --jq .owner.login)"
     username="$(gh api user --jq .login)"
     image="ghcr.io/${owner}/harbringer:latest"
     gh auth token | docker login ghcr.io --username "$username" --password-stdin
-    docker build -t "$image" .
-    docker push "$image"
+    build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    docker buildx build --push --build-arg "IMAGE_BUILD_DATE=$build_date" -t "$image" .
 
 # restart local server
 restart:

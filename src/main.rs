@@ -315,6 +315,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_timer(LocalSecondTimer)
         .with_writer(LogBufferMakeWriter)
         .init();
+    if let Ok(build_date) = std::env::var("IMAGE_BUILD_DATE") {
+        if build_date != "unknown" {
+            info!(image_build_date = %build_date, "image build date");
+        }
+    }
     let args = Args::parse();
     if run_server(args).await? == RunOutcome::Reload {
         restart_process()?;
@@ -421,7 +426,7 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
         config: Arc::new(Mutex::new(config.clone())),
         config_path: Arc::new(config_path),
         db: Arc::new(Mutex::new(db)),
-        server_name: Arc::new(RwLock::new(server_name)),
+        server_name: Arc::new(RwLock::new(server_name.clone())),
         machine_identifier: Arc::from(machine_identifier),
         root: Arc::new(root),
         media: Arc::new(RwLock::new(Arc::new(media))),
@@ -437,6 +442,7 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
     let inventory_scan_task = tokio::spawn(library_scan_scheduler(scan_state));
     let server_tls = state.plex_tls.clone();
     let publication_state = state.clone();
+    let startup_server_name = server_name.clone();
     let publication_task = tokio::spawn(async move {
         let server_token = publication_state.db.lock().ok().and_then(|connection| {
             connection
@@ -455,6 +461,7 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
                 .ensure_certificate(
                     &client,
                     &publication_state.machine_identifier,
+                    &startup_server_name,
                     &server_token,
                 )
                 .await
@@ -2135,6 +2142,7 @@ async fn web_media_for_relative(
 
 async fn start_plex_auth(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let client = reqwest::Client::new();
+    let configured_server_name = server_name(&state);
     let auth_client_identifier = plex_auth_client_identifier(&state);
     let Ok((signing_key, kid)) = plex_device_key(&state) else {
         return settings_error("Could not initialize Plex device authentication");
@@ -2146,7 +2154,7 @@ async fn start_plex_auth(State(state): State<AppState>, headers: HeaderMap) -> R
             "strong": true
         }))
         .header("Accept", "application/json")
-        .header("X-Plex-Product", "harbringer")
+        .header("X-Plex-Product", &configured_server_name)
         .header("X-Plex-Client-Identifier", &auth_client_identifier)
         .send()
         .await
@@ -2182,15 +2190,35 @@ async fn start_plex_auth(State(state): State<AppState>, headers: HeaderMap) -> R
         "https://app.plex.tv/auth#?clientID={}&code={}&context%5Bdevice%5D%5Bproduct%5D={}&context%5Bdevice%5D%5Bversion%5D=0.1.0&context%5Bdevice%5D%5Bplatform%5D=macOS&context%5Bdevice%5D%5BdeviceName%5D={}&forwardUrl={}",
         url_encode(&auth_client_identifier),
         url_encode(&pin.code),
-        url_encode("harbringer"),
-        url_encode("harbringer"),
+        url_encode(&configured_server_name),
+        url_encode(&configured_server_name),
         url_encode(&callback)
     );
     Redirect::to(&link).into_response()
 }
 
 async fn plex_auth_callback(State(state): State<AppState>) -> Response {
-    let _ = plex_auth_status(State(state)).await;
+    for _ in 0..60 {
+        let _ = plex_auth_status(State(state.clone())).await;
+        let pending = state
+            .db
+            .lock()
+            .ok()
+            .and_then(|connection| {
+                connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM plex_auth WHERE id != 0)",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .ok()
+            })
+            .unwrap_or(false);
+        if !pending {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
     Redirect::to("/settings").into_response()
 }
 
@@ -2408,7 +2436,12 @@ async fn claim_and_publish_plex_server(
 
     let tls_error = state
         .plex_tls
-        .ensure_certificate(&client, &state.machine_identifier, &server_token)
+        .ensure_certificate(
+            &client,
+            &state.machine_identifier,
+            &server_name(state),
+            &server_token,
+        )
         .await
         .err();
     if let Some(error) = &tls_error {

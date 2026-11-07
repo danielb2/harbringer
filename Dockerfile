@@ -9,6 +9,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+ARG IMAGE_BUILD_DATE=unknown
+ENV IMAGE_BUILD_DATE=${IMAGE_BUILD_DATE}
 COPY --from=builder /build/target/release/harbringer /usr/local/bin/harbringer
 RUN mkdir -p /config
 VOLUME ["/config", "/media"]

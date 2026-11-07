@@ -85,6 +85,7 @@ impl PlexTls {
         &self,
         client: &reqwest::Client,
         machine_identifier: &str,
+        server_name: &str,
         server_token: &str,
     ) -> Result<(), String> {
         let _guard = self.ensure_lock.lock().await;
@@ -107,7 +108,8 @@ impl PlexTls {
             ));
         }
 
-        let result = request_certificate(client, machine_identifier, server_token).await;
+        let result =
+            request_certificate(client, machine_identifier, server_name, server_token).await;
         match result {
             Ok((hash, cert_pem, key_pem)) => {
                 write_private_file(&self.directory.join("plexdirect.crt"), &cert_pem)?;
@@ -212,6 +214,7 @@ where
 async fn request_certificate(
     client: &reqwest::Client,
     machine_identifier: &str,
+    server_name: &str,
     server_token: &str,
 ) -> Result<(String, Vec<u8>, Vec<u8>), String> {
     let identity_headers = |request: reqwest::RequestBuilder| {
@@ -220,7 +223,7 @@ async fn request_certificate(
             .header("X-Plex-Version", "1.43.4.10903-e5521bd8c")
             .header("X-Plex-Platform", "MacOSX")
             .header("X-Plex-Platform-Version", std::env::consts::ARCH)
-            .header("X-Plex-Device-Name", "harbringer")
+            .header("X-Plex-Device-Name", server_name)
             .header("X-Plex-Device", "MacOSX")
             .header("X-Plex-Provides", "server")
             .header("X-Plex-Client-Identifier", machine_identifier)
