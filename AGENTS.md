@@ -1,12 +1,14 @@
-# mplex
+# harbringer
 
-Project guidance for `mplex`: the target is a 100% drop-in replacement for Plex's official Media Server. This includes documented PMS APIs and matching behavior in official Plex clients, including every client-visible capability and item menu. This is past the MVP stage; treat full compatibility as the goal, not a single-route or single-action milestone.
+Project guidance for `harbringer`: the target is a 100% drop-in replacement for Plex's official Media Server. This includes documented PMS APIs and matching behavior in official Plex clients, including every client-visible capability and item menu. This is past the MVP stage; treat full compatibility as the goal, not a single-route or single-action milestone.
 
 ## Essential rules
+- Stay within the user's requested scope. Make only changes needed to fulfill the request; do not add adjacent features, cleanup, or speculative improvements. If a broader change seems necessary, explain why and ask before proceeding.
 
 - Read relevant code and current Plex request traces before changing behavior.
 - Keep the protocol surface Plex-only. Do not add Jellyfin routes or mix adapters.
 - Before implementing or changing any Plex API behavior, consult the official PMS API documentation at https://developer.plex.tv/pms and verify the operation, parameters, response formats, and status codes. Do not rely on request traces or assumptions in place of the documentation. If the documentation does not specify a detail or is unavailable, state that clearly and use current request traces and a reference PMS or compatible implementation where available; do not present an inference as documented behavior. Validate client-visible behavior, including the full item menus, against Plex clients; do not infer parity from route tests alone.
+- For Plex webhooks, also consult the official support article at https://support.plex.tv/articles/115002267687-webhooks/ and inspect current Plex client traces before implementation. Webhook destination management is account-level; verify the account API behavior against traces and a compatible implementation when the PMS API reference does not document it. Do not replace existing Plex webhook destinations with an unrelated local URL list.
 - Playback is a core requirement: support direct play, direct stream/remux, and transcoding when a Plex client requires it.
 - Media inspection, remuxing, decoding, encoding, and transcoding must use portable in-process Rust libraries. Do not depend on installed commands such as `ffmpeg` or `ffprobe`.
 - Keep platform support in mind when selecting media libraries and features. Do not make one operating system's hardware decoder mandatory.
