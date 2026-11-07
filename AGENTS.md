@@ -3,7 +3,7 @@
 Project guidance for `harbringer`: the target is a 100% drop-in replacement for Plex's official Media Server. This includes documented PMS APIs and matching behavior in official Plex clients, including every client-visible capability and item menu. This is past the MVP stage; treat full compatibility as the goal, not a single-route or single-action milestone.
 
 ## Essential rules
-- Stay within the user's requested scope. Make only changes needed to fulfill the request; do not add adjacent features, cleanup, or speculative improvements. If a broader change seems necessary, explain why and ask before proceeding.
+- Never expand scope beyond what the user requested. Make only changes needed to fulfill the request; do not add adjacent features, cleanup, or speculative improvements. If broader work seems necessary, explain why and ask before proceeding.
 
 - Read relevant code and current Plex request traces before changing behavior.
 - Keep the protocol surface Plex-only. Do not add Jellyfin routes or mix adapters.
