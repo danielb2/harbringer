@@ -9,7 +9,7 @@ use axum::{
 };
 use base64::Engine as _;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -162,6 +162,10 @@ fn fixture() -> Fixture {
         plex_stream_selections: Arc::new(Mutex::new(HashMap::new())),
         plex_play_queues: Arc::new(Mutex::new(HashMap::new())),
         next_plex_play_queue_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        plex_playback_states: Arc::new(Mutex::new(HashMap::new())),
+        plex_scrobbled_sessions: Arc::new(Mutex::new(HashSet::new())),
+        plex_webhook_delivery_lock: Arc::new(tokio::sync::Mutex::new(())),
+
         plex_tls: PlexTls::load(root.join("config/certs")).unwrap(),
     };
     Fixture {
@@ -251,6 +255,10 @@ fn tv_fixture() -> Fixture {
         plex_stream_selections: Arc::new(Mutex::new(HashMap::new())),
         plex_play_queues: Arc::new(Mutex::new(HashMap::new())),
         next_plex_play_queue_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        plex_playback_states: Arc::new(Mutex::new(HashMap::new())),
+        plex_scrobbled_sessions: Arc::new(Mutex::new(HashSet::new())),
+        plex_webhook_delivery_lock: Arc::new(tokio::sync::Mutex::new(())),
+
         plex_tls: PlexTls::load(root.join("config/certs")).unwrap(),
     };
     Fixture {
@@ -1415,11 +1423,47 @@ async fn web_and_plex_clients_share_playback_progress() {
     let timeline = send(
         &fixture.app,
         Method::GET,
-        "/:/timeline?ratingKey=1-1&time=4000&duration=10000",
+        "/:/timeline?ratingKey=1-1&time=4000&duration=10000&state=playing",
         Body::empty(),
     )
     .await;
     assert_eq!(timeline.status(), StatusCode::OK);
+    assert_eq!(
+        fixture
+            .state
+            .plex_playback_states
+            .lock()
+            .unwrap()
+            .get("unknown:1-1")
+            .map(String::as_str),
+        Some("playing")
+    );
+    let scrobble_timeline = send(
+        &fixture.app,
+        Method::GET,
+        "/:/timeline?ratingKey=1-1&time=9000&duration=10000&state=playing",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(scrobble_timeline.status(), StatusCode::OK);
+    assert!(fixture
+        .state
+        .plex_scrobbled_sessions
+        .lock()
+        .unwrap()
+        .contains("unknown:1-1"));
+    let duplicate_scrobble_timeline = send(
+        &fixture.app,
+        Method::GET,
+        "/:/timeline?ratingKey=1-1&time=9500&duration=10000&state=playing",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(duplicate_scrobble_timeline.status(), StatusCode::OK);
+    assert_eq!(
+        fixture.state.plex_scrobbled_sessions.lock().unwrap().len(),
+        1
+    );
 
     let timeline_body = to_bytes(timeline.into_body(), usize::MAX).await.unwrap();
     let timeline_json: serde_json::Value = serde_json::from_slice(&timeline_body).unwrap();
@@ -1433,7 +1477,7 @@ async fn web_and_plex_clients_share_playback_progress() {
     .await;
     let progress: serde_json::Value =
         serde_json::from_slice(&to_bytes(progress.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(progress["positionMs"], 4000);
+    assert_eq!(progress["positionMs"], 9500);
 }
 
 #[tokio::test]
@@ -1927,6 +1971,20 @@ async fn plex_episode_metadata_includes_guid_ancestry_and_watch_state() {
         season["MediaContainer"]["Metadata"][0]["guid"],
         episode["parentGuid"]
     );
+    let webhook_metadata =
+        super::plex_webhook_metadata(&fixture.state, rating_key, 2500, Some(10000))
+            .await
+            .unwrap()
+            .1;
+    assert_eq!(webhook_metadata["type"], "episode");
+    assert_eq!(webhook_metadata["librarySectionType"], "show");
+    assert_eq!(webhook_metadata["parentGuid"], episode["parentGuid"]);
+    assert_eq!(
+        webhook_metadata["grandparentGuid"],
+        episode["grandparentGuid"]
+    );
+    assert_eq!(webhook_metadata["viewOffset"], 2500);
+    assert!(webhook_metadata.get("Media").is_none());
 
     let watched = send(
         &fixture.app,

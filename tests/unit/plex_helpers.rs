@@ -10,15 +10,18 @@ use super::{
     plex_media_id, plex_paged_children, plex_part_id, plex_photo_source, plex_play_queue_response,
     plex_play_queue_source_uri, plex_presence_url, plex_publish_urls, plex_query_media_id,
     plex_queue_item_without_playback_decision, plex_ranked_tv_shows, plex_rating_key,
-    plex_rating_key_from_source, plex_request_token, plex_safe_numeric_id, plex_search_hubs,
-    plex_search_rank, plex_search_result_entries, plex_search_type_matches, plex_stream_id,
+    plex_rating_key_from_source, plex_request_token, plex_safe_numeric_id,
+    plex_scrobble_threshold_reached, plex_search_hubs, plex_search_rank,
+    plex_search_result_entries, plex_search_type_matches, plex_stream_id,
     plex_stream_id_and_format, plex_track_label, plex_tv_episode_parents, plex_tv_season_groups,
     plex_tv_season_json, plex_tv_show_groups, plex_tv_show_json, plex_user_avatar_source,
-    plex_video_json, plex_video_resolution, render_database_info_panel,
-    render_season_description_panel, render_toml_details, render_tv_show_metadata_details,
-    sidebar_nav_with_library_links, sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms,
-    technical_tracks, tv_metadata_with_season_details, tv_show_title, vtt_to_srt, ConfigLibrary,
-    HeaderMap, HeaderValue, Media, PathBuf, PlexStreamSelection, TvEpisodeInfo, Uri,
+    plex_video_json, plex_video_resolution, plex_webhook_account_from_access_tokens,
+    plex_webhook_destinations_for_account, plex_webhook_destinations_from_response,
+    plex_webhook_event_for_transition, render_database_info_panel, render_season_description_panel,
+    render_toml_details, render_tv_show_metadata_details, sidebar_nav_with_library_links,
+    sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms, technical_tracks,
+    tv_metadata_with_season_details, tv_show_title, vtt_to_srt, ConfigLibrary, HeaderMap,
+    HeaderValue, Media, PathBuf, PlexStreamSelection, TvEpisodeInfo, Uri,
 };
 
 #[test]
@@ -1012,6 +1015,98 @@ fn plex_provider_advertises_timeline_scrobble_actions() {
         actions["Action"][0]["key"],
         "/actions/removeFromContinueWatching"
     );
+}
+
+#[test]
+fn plex_webhook_events_follow_playback_state_transitions() {
+    assert_eq!(
+        plex_webhook_event_for_transition(None, "playing"),
+        Some("media.play")
+    );
+    assert_eq!(
+        plex_webhook_event_for_transition(Some("playing"), "playing"),
+        None
+    );
+    assert_eq!(
+        plex_webhook_event_for_transition(Some("playing"), "paused"),
+        Some("media.pause")
+    );
+    assert_eq!(
+        plex_webhook_event_for_transition(Some("paused"), "playing"),
+        Some("media.resume")
+    );
+    assert_eq!(
+        plex_webhook_event_for_transition(Some("paused"), "stopped"),
+        Some("media.stop")
+    );
+    assert_eq!(plex_webhook_event_for_transition(None, "stopped"), None);
+}
+
+#[test]
+fn plex_webhook_destinations_parse_server_xml_and_filter_by_account() {
+    let xml = r#"<users>
+<user id="1" owner="1"><webhooks><webhook url="https://example.test/owner?x=a&amp;y=b"/><webhook url="https://example.test/owner?x=a&amp;y=b"/><webhook url="ftp://example.test/nope"/></webhooks></user>
+<user id="2" owner="0"><webhooks><webhook url="https://example.test/shared"/></webhooks></user>
+</users>"#;
+    let configuration = plex_webhook_destinations_from_response(xml);
+    assert_eq!(configuration.owner_id.as_deref(), Some("1"));
+    let destinations = configuration.destinations;
+    assert_eq!(destinations.len(), 2);
+    assert!(destinations[0].owner);
+    assert_eq!(destinations[0].user_id, "1");
+    assert_eq!(
+        destinations[0].url.as_str(),
+        "https://example.test/owner?x=a&y=b"
+    );
+    assert!(!destinations[1].owner);
+    assert_eq!(destinations[1].user_id, "2");
+
+    let shared = plex_webhook_destinations_for_account(destinations.clone(), Some("2"));
+    assert_eq!(shared.len(), 2);
+    let owner = plex_webhook_destinations_for_account(destinations.clone(), Some("1"));
+    assert_eq!(owner.len(), 1);
+    let unknown = plex_webhook_destinations_for_account(destinations, None);
+    assert_eq!(unknown.len(), 1);
+
+    let no_hooks = plex_webhook_destinations_from_response(
+        r#"<users><user id="9" owner="1"><webhooks></webhooks></user></users>"#,
+    );
+    assert_eq!(no_hooks.owner_id.as_deref(), Some("9"));
+    assert!(no_hooks.destinations.is_empty());
+}
+
+#[test]
+fn plex_webhook_account_uses_server_access_token_identity() {
+    let tokens = r#"<tokens>
+<token type="device" token="owner-device" owned="1"/>
+<token type="server" token="shared-token" owned="0"><invited id="2" title="Shared" username="shared-user" thumb="https://example.test/avatar"/></token>
+</tokens>"#;
+    let shared = plex_webhook_account_from_access_tokens(
+        tokens,
+        Some("shared-token"),
+        "server-token",
+        Some("1"),
+    );
+    assert_eq!(shared["id"], 2);
+    assert_eq!(shared["title"], "Shared");
+    assert_eq!(shared["username"], "shared-user");
+
+    let owner = plex_webhook_account_from_access_tokens(
+        tokens,
+        Some("owner-device"),
+        "server-token",
+        Some("1"),
+    );
+    assert_eq!(owner["id"], 1);
+}
+
+#[test]
+fn plex_timeline_scrobbles_at_ninety_percent() {
+    assert!(!plex_scrobble_threshold_reached(0, 1000));
+    assert!(!plex_scrobble_threshold_reached(899, 1000));
+    assert!(plex_scrobble_threshold_reached(900, 1000));
+    assert!(plex_scrobble_threshold_reached(1001, 1000));
+    assert!(!plex_scrobble_threshold_reached(900, 0));
 }
 
 #[test]

@@ -166,6 +166,10 @@ struct AppState {
     plex_stream_selections: Arc<Mutex<HashMap<u64, PlexStreamSelection>>>,
     plex_play_queues: Arc<Mutex<HashMap<u64, serde_json::Value>>>,
     next_plex_play_queue_id: Arc<AtomicU64>,
+    plex_playback_states: Arc<Mutex<HashMap<String, String>>>,
+    plex_scrobbled_sessions: Arc<Mutex<HashSet<String>>>,
+    plex_webhook_delivery_lock: Arc<tokio::sync::Mutex<()>>,
+
     plex_tls: PlexTls,
 }
 
@@ -436,6 +440,10 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
         plex_stream_selections: Arc::new(Mutex::new(HashMap::new())),
         plex_play_queues: Arc::new(Mutex::new(HashMap::new())),
         next_plex_play_queue_id: Arc::new(AtomicU64::new(1)),
+        plex_playback_states: Arc::new(Mutex::new(HashMap::new())),
+        plex_scrobbled_sessions: Arc::new(Mutex::new(HashSet::new())),
+        plex_webhook_delivery_lock: Arc::new(tokio::sync::Mutex::new(())),
+
         plex_tls,
     };
     let scan_state = state.clone();
@@ -9872,7 +9880,9 @@ async fn log_not_found(State(state): State<AppState>, req: Request<Body>) -> Res
         let Some(query) = query else {
             return StatusCode::BAD_REQUEST.into_response();
         };
-        return plex_timeline(&state, query);
+        let headers = req.headers().clone();
+        let request_token = plex_request_token(&headers, req.uri()).map(str::to_owned);
+        return plex_timeline(&state, query, headers, request_token);
     }
     if req.uri().path() == "/:/prefs" {
         return plex_prefs(&state);
@@ -9886,7 +9896,9 @@ async fn log_not_found(State(state): State<AppState>, req: Request<Body>) -> Res
         let Some(query) = query else {
             return StatusCode::BAD_REQUEST.into_response();
         };
-        return plex_scrobble(&state, query, watched);
+        let headers = req.headers().clone();
+        let request_token = plex_request_token(&headers, req.uri()).map(str::to_owned);
+        return plex_scrobble(&state, query, watched, headers, request_token);
     }
     warn!(method = %req.method(), path = %req.uri().path(), "unsupported route");
     StatusCode::NOT_FOUND.into_response()
@@ -9899,6 +9911,8 @@ struct PlexTimelineQuery {
     key: Option<String>,
     time: Option<i64>,
     duration: Option<i64>,
+    #[serde(rename = "state")]
+    playback_state: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -9963,7 +9977,639 @@ fn plex_progress_path(state: &AppState, media_id: &str) -> Option<String> {
     )
 }
 
-fn plex_timeline(state: &AppState, query: PlexTimelineQuery) -> Response {
+fn plex_playback_session_key(media_id: &str, headers: &HeaderMap) -> String {
+    let session = [
+        "X-Plex-Session-Identifier",
+        "X-Plex-Client-Identifier",
+        "X-Plex-Product",
+    ]
+    .iter()
+    .find_map(|name| headers.get(*name).and_then(|value| value.to_str().ok()))
+    .unwrap_or("unknown");
+    format!("{session}:{media_id}")
+}
+
+fn plex_playback_webhook_event(
+    state: &AppState,
+    media_id: &str,
+    playback_state: &str,
+    headers: &HeaderMap,
+) -> Option<&'static str> {
+    let playback_state = playback_state.trim().to_ascii_lowercase();
+    if !matches!(playback_state.as_str(), "playing" | "paused" | "stopped") {
+        return None;
+    }
+    let key = plex_playback_session_key(media_id, headers);
+    let mut states = state.plex_playback_states.lock().ok()?;
+    let previous = states.insert(key.clone(), playback_state.clone());
+    if previous.as_deref() == Some("stopped") && playback_state == "playing" {
+        if let Ok(mut scrobbled) = state.plex_scrobbled_sessions.lock() {
+            scrobbled.remove(&key);
+        }
+    }
+    plex_webhook_event_for_transition(previous.as_deref(), &playback_state)
+}
+
+fn plex_scrobble_threshold_reached(position: i64, duration: i64) -> bool {
+    position > 0 && duration > 0 && i128::from(position) * 100 >= i128::from(duration) * 90
+}
+
+fn plex_scrobble_webhook_once(state: &AppState, media_id: &str, headers: &HeaderMap) -> bool {
+    state
+        .plex_scrobbled_sessions
+        .lock()
+        .is_ok_and(|mut sessions| sessions.insert(plex_playback_session_key(media_id, headers)))
+}
+
+fn plex_webhook_event_for_transition(
+    previous: Option<&str>,
+    current: &str,
+) -> Option<&'static str> {
+    match current {
+        "playing" if previous == Some("paused") => Some("media.resume"),
+        "playing" if previous == Some("playing") => None,
+        "playing" => Some("media.play"),
+        "paused" if previous == Some("playing") => Some("media.pause"),
+        "stopped" if matches!(previous, Some("playing" | "paused")) => Some("media.stop"),
+        _ => None,
+    }
+}
+
+fn plex_webhook_player(headers: &HeaderMap) -> serde_json::Value {
+    let mut player = serde_json::json!({});
+    for (field, header_name) in [
+        ("title", "X-Plex-Device-Name"),
+        ("uuid", "X-Plex-Client-Identifier"),
+        ("platform", "X-Plex-Platform"),
+        ("platformVersion", "X-Plex-Platform-Version"),
+        ("device", "X-Plex-Device"),
+    ] {
+        if let Some(value) = headers
+            .get(header_name)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+        {
+            player[field] = serde_json::json!(value);
+        }
+    }
+    if player.get("title").is_none() {
+        if let Some(product) = headers
+            .get("X-Plex-Product")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+        {
+            player["title"] = serde_json::json!(product);
+        }
+    }
+    if player.get("uuid").is_none() {
+        if let Some(session) = headers
+            .get("X-Plex-Session-Identifier")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+        {
+            player["uuid"] = serde_json::json!(session);
+        }
+    }
+    player
+}
+
+fn plex_webhook_server_token(state: &AppState) -> Option<String> {
+    state.db.lock().ok().and_then(|connection| {
+        connection
+            .query_row(
+                "SELECT plex_account_token FROM server_identity WHERE id = 1 AND claimed = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+            .filter(|token| !token.is_empty())
+    })
+}
+
+#[derive(Clone)]
+struct PlexWebhookDestination {
+    user_id: String,
+    owner: bool,
+    url: reqwest::Url,
+}
+
+struct PlexWebhookConfiguration {
+    owner_id: Option<String>,
+    destinations: Vec<PlexWebhookDestination>,
+}
+
+fn plex_webhook_destinations_from_response(body: &str) -> PlexWebhookConfiguration {
+    let lower = body.to_ascii_lowercase();
+    let mut destinations = Vec::new();
+    let mut owner_id = None;
+
+    let mut seen = HashSet::new();
+    let mut user_offset = 0;
+    while let Some(relative_start) = lower[user_offset..].find("<user") {
+        let user_start = user_offset + relative_start;
+        let user_name_end = user_start + "<user".len();
+        if !lower
+            .as_bytes()
+            .get(user_name_end)
+            .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
+        {
+            user_offset = user_name_end;
+            continue;
+        }
+        let Some(user_tag_end_relative) = body[user_name_end..].find('>') else {
+            break;
+        };
+        let user_tag_end = user_name_end + user_tag_end_relative + 1;
+        let user_tag = &body[user_start..user_tag_end];
+        let Some(user_id) = xml_attribute(user_tag, "id") else {
+            user_offset = user_tag_end;
+            continue;
+        };
+        let owner = xml_attribute(user_tag, "owner").is_some_and(|value| value == "1");
+        if owner && owner_id.is_none() {
+            owner_id = Some(user_id.clone());
+        }
+
+        let Some(user_block_end_relative) = lower[user_tag_end..].find("</user>") else {
+            break;
+        };
+        let user_block_end = user_tag_end + user_block_end_relative;
+        let user_block = &body[user_tag_end..user_block_end];
+        let user_block_lower = &lower[user_tag_end..user_block_end];
+        if let Some(webhooks_start) = user_block_lower.find("<webhooks") {
+            if let Some(webhooks_tag_end_relative) = user_block[webhooks_start..].find('>') {
+                let webhooks_body_start = webhooks_start + webhooks_tag_end_relative + 1;
+                if let Some(webhooks_end_relative) =
+                    user_block_lower[webhooks_body_start..].find("</webhooks>")
+                {
+                    let webhooks_body_end = webhooks_body_start + webhooks_end_relative;
+                    let webhooks_body = &user_block[webhooks_body_start..webhooks_body_end];
+                    let webhooks_lower = &user_block_lower[webhooks_body_start..webhooks_body_end];
+                    let mut webhook_offset = 0;
+                    while let Some(relative_webhook) =
+                        webhooks_lower[webhook_offset..].find("<webhook")
+                    {
+                        let webhook_start = webhook_offset + relative_webhook;
+                        let webhook_name_end = webhook_start + "<webhook".len();
+                        if !webhooks_lower
+                            .as_bytes()
+                            .get(webhook_name_end)
+                            .is_some_and(|byte| {
+                                byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>')
+                            })
+                        {
+                            webhook_offset = webhook_name_end;
+                            continue;
+                        }
+                        let Some(webhook_tag_end_relative) =
+                            webhooks_body[webhook_name_end..].find('>')
+                        else {
+                            break;
+                        };
+                        let webhook_tag_end = webhook_name_end + webhook_tag_end_relative + 1;
+                        let tag = &webhooks_body[webhook_start..webhook_tag_end];
+                        if let Some(raw_url) = xml_attribute(tag, "url") {
+                            let raw_url = plex_xml_unescape(&raw_url);
+                            if let Ok(url) = reqwest::Url::parse(&raw_url) {
+                                if matches!(url.scheme(), "http" | "https")
+                                    && url.host_str().is_some()
+                                    && url.username().is_empty()
+                                    && url.password().is_none()
+                                    && seen.insert((user_id.clone(), url.as_str().to_owned()))
+                                {
+                                    destinations.push(PlexWebhookDestination {
+                                        user_id: user_id.clone(),
+                                        owner,
+                                        url,
+                                    });
+                                }
+                            }
+                        }
+                        webhook_offset = webhook_tag_end;
+                    }
+                }
+            }
+        }
+        user_offset = user_block_end + "</user>".len();
+    }
+    PlexWebhookConfiguration {
+        owner_id,
+        destinations,
+    }
+}
+
+fn plex_xml_unescape(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+fn plex_webhook_destinations_for_account(
+    destinations: Vec<PlexWebhookDestination>,
+    account_id: Option<&str>,
+) -> Vec<reqwest::Url> {
+    let mut seen = HashSet::new();
+    destinations
+        .into_iter()
+        .filter(|destination| destination.owner || Some(destination.user_id.as_str()) == account_id)
+        .filter_map(|destination| {
+            seen.insert(destination.url.as_str().to_owned())
+                .then_some(destination.url)
+        })
+        .collect()
+}
+
+async fn plex_webhook_destinations(
+    client: &reqwest::Client,
+    state: &AppState,
+    server_token: &str,
+) -> Result<PlexWebhookConfiguration, ()> {
+    let response = client
+        .get("https://plex.tv/api/v2/server/webhooks")
+        .query(&[("X-Plex-Token", server_token)])
+        .header(header::ACCEPT, "application/xml")
+        .header("X-Plex-Product", "Plex Media Server")
+        .header(
+            "X-Plex-Client-Identifier",
+            state.machine_identifier.as_ref(),
+        )
+        .send()
+        .await
+        .map_err(|_| ())?
+        .error_for_status()
+        .map_err(|_| ())?;
+    let body = response.text().await.map_err(|_| ())?;
+    Ok(plex_webhook_destinations_from_response(&body))
+}
+
+async fn plex_webhook_account(
+    client: &reqwest::Client,
+    state: &AppState,
+    user_token: &str,
+) -> serde_json::Value {
+    let Ok(response) = client
+        .get("https://clients.plex.tv/api/v2/user")
+        .header(header::ACCEPT, "application/json")
+        .header("X-Plex-Product", "Plex Media Server")
+        .header(
+            "X-Plex-Client-Identifier",
+            state.machine_identifier.as_ref(),
+        )
+        .header("X-Plex-Token", user_token)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+    else {
+        return serde_json::json!({});
+    };
+    let Ok(account) = response.json::<serde_json::Value>().await else {
+        return serde_json::json!({});
+    };
+    let mut profile = serde_json::json!({});
+    for field in ["id", "title", "username", "thumb"] {
+        if let Some(value) = account.get(field) {
+            profile[field] = value.clone();
+        }
+    }
+    if profile.get("title").is_none() {
+        if let Some(username) = account.get("username").and_then(serde_json::Value::as_str) {
+            profile["title"] = serde_json::json!(username);
+        }
+    }
+    profile
+}
+
+async fn plex_webhook_access_tokens(
+    client: &reqwest::Client,
+    state: &AppState,
+    server_token: &str,
+) -> Option<String> {
+    client
+        .get("https://plex.tv/api/v2/server/access_tokens")
+        .query(&[("X-Plex-Token", server_token)])
+        .header(header::ACCEPT, "application/xml")
+        .header("X-Plex-Product", "Plex Media Server")
+        .header(
+            "X-Plex-Client-Identifier",
+            state.machine_identifier.as_ref(),
+        )
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .text()
+        .await
+        .ok()
+}
+
+fn plex_webhook_account_from_access_tokens(
+    body: &str,
+    request_token: Option<&str>,
+    server_token: &str,
+    owner_id: Option<&str>,
+) -> serde_json::Value {
+    let owner_account = || {
+        let mut account = serde_json::json!({});
+        if let Some(id) = owner_id {
+            account["id"] = id
+                .parse::<u64>()
+                .map(serde_json::Value::from)
+                .unwrap_or_else(|_| serde_json::json!(id));
+        }
+        account
+    };
+    let Some(request_token) = request_token.filter(|token| *token != server_token) else {
+        return owner_account();
+    };
+    let lower = body.to_ascii_lowercase();
+    let mut offset = 0;
+    while let Some(relative_start) = lower[offset..].find("<token") {
+        let start = offset + relative_start;
+        let name_end = start + "<token".len();
+        if !lower
+            .as_bytes()
+            .get(name_end)
+            .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
+        {
+            offset = name_end;
+            continue;
+        }
+        let Some(tag_end_relative) = body[name_end..].find('>') else {
+            break;
+        };
+        let tag_end = name_end + tag_end_relative + 1;
+        let tag = &body[start..tag_end];
+        if xml_attribute(tag, "token").as_deref() != Some(request_token) {
+            offset = tag_end;
+            continue;
+        }
+        let token_type = xml_attribute(tag, "type").unwrap_or_default();
+        if token_type.eq_ignore_ascii_case("server") {
+            let Some(block_end_relative) = lower[tag_end..].find("</token>") else {
+                return owner_account();
+            };
+            let block_end = tag_end + block_end_relative;
+            let block = &body[tag_end..block_end];
+            let block_lower = &lower[tag_end..block_end];
+            if let Some(invited_start) = block_lower.find("<invited") {
+                if let Some(invited_tag_end_relative) = block[invited_start..].find('>') {
+                    let invited_tag_end = invited_start + invited_tag_end_relative + 1;
+                    let invited = &block[invited_start..invited_tag_end];
+                    if let Some(id) = xml_attribute(invited, "id") {
+                        let mut account = serde_json::json!({
+                            "id": id.parse::<u64>().map(serde_json::Value::from)
+                                .unwrap_or_else(|_| serde_json::json!(id))
+                        });
+                        for field in ["title", "username", "thumb"] {
+                            if let Some(value) = xml_attribute(invited, field) {
+                                account[field] = serde_json::json!(plex_xml_unescape(&value));
+                            }
+                        }
+                        return account;
+                    }
+                }
+            }
+            return owner_account();
+        }
+        return owner_account();
+    }
+    owner_account()
+}
+
+async fn plex_webhook_metadata(
+    state: &AppState,
+    media_id: &str,
+    position: i64,
+    duration: Option<i64>,
+) -> Option<(Media, serde_json::Value)> {
+    let media = find_media(state, media_id)?;
+    let (section, library) = media_library(state, &media)?;
+    let section_metadata = plex_section_metadata(state, section);
+    let mut metadata = plex_video_json(&media, section, &library, section_metadata.get(&media.id));
+    if library.kind == "tv" {
+        let media_items = state
+            .media
+            .read()
+            .ok()
+            .map(|media_items| media_items.clone());
+        if let Some(media_items) = media_items {
+            if let Some(episode_metadata) = plex_tv_episode_json_for_media(
+                state,
+                media_items.as_slice(),
+                &media,
+                section,
+                &library,
+                &section_metadata,
+            )
+            .await
+            {
+                metadata = episode_metadata;
+            }
+        }
+    }
+    metadata["librarySectionType"] = serde_json::json!(if library.kind == "tv" {
+        "show"
+    } else {
+        "movie"
+    });
+    metadata["librarySectionTitle"] = serde_json::json!(library.name);
+    metadata["viewOffset"] = serde_json::json!(position);
+    if let Some(duration) = duration {
+        metadata["duration"] = serde_json::json!(duration);
+    }
+    if let Some(fields) = metadata.as_object_mut() {
+        fields.remove("Media");
+    }
+    Some((media, metadata))
+}
+
+fn spawn_plex_webhook_delivery(
+    state: &AppState,
+    event: &'static str,
+    media_id: String,
+    position: i64,
+    duration: Option<i64>,
+    headers: HeaderMap,
+    request_token: Option<String>,
+) {
+    let state = state.clone();
+    let player = plex_webhook_player(&headers);
+    let delivery_lock = state.plex_webhook_delivery_lock.clone();
+
+    tokio::spawn(async move {
+        let _guard = delivery_lock.lock().await;
+        deliver_plex_webhook(
+            &state,
+            event,
+            &media_id,
+            position,
+            duration,
+            player,
+            request_token,
+        )
+        .await;
+    });
+}
+
+async fn deliver_plex_webhook(
+    state: &AppState,
+    event: &'static str,
+    media_id: &str,
+    position: i64,
+    duration: Option<i64>,
+    player: serde_json::Value,
+    request_token: Option<String>,
+) {
+    let Some(server_token) = plex_webhook_server_token(state) else {
+        warn!(
+            event,
+            reason = "server_not_claimed",
+            "Plex webhook delivery skipped"
+        );
+        return;
+    };
+    let Some((media, metadata)) = plex_webhook_metadata(state, media_id, position, duration).await
+    else {
+        warn!(
+            event,
+            reason = "media_not_found",
+            "Plex webhook delivery skipped"
+        );
+        return;
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+    else {
+        warn!(
+            event,
+            reason = "http_client_unavailable",
+            "Plex webhook delivery skipped"
+        );
+        return;
+    };
+    let (profile, access_tokens, configuration) = tokio::join!(
+        plex_webhook_account(&client, state, &server_token),
+        plex_webhook_access_tokens(&client, state, &server_token),
+        plex_webhook_destinations(&client, state, &server_token)
+    );
+    let Ok(configuration) = configuration else {
+        warn!(
+            event,
+            reason = "destination_lookup_failed",
+            "Plex webhook delivery skipped"
+        );
+        return;
+    };
+    let owner_id = configuration.owner_id;
+    let mut account = access_tokens
+        .as_deref()
+        .map(|body| {
+            plex_webhook_account_from_access_tokens(
+                body,
+                request_token.as_deref(),
+                &server_token,
+                owner_id.as_deref(),
+            )
+        })
+        .unwrap_or_else(|| serde_json::json!({}));
+    for field in ["id", "title", "username", "thumb"] {
+        if account.get(field).is_none() {
+            if let Some(value) = profile.get(field) {
+                account[field] = value.clone();
+            }
+        }
+    }
+    if account.get("id").is_none() {
+        if let Some(id) = &owner_id {
+            account["id"] = id
+                .parse::<u64>()
+                .map(serde_json::Value::from)
+                .unwrap_or_else(|_| serde_json::json!(id));
+        }
+    }
+    let account_id = account.get("id").and_then(|id| {
+        id.as_str()
+            .map(str::to_owned)
+            .or_else(|| id.as_u64().map(|id| id.to_string()))
+    });
+    let is_owner = owner_id.as_deref() == account_id.as_deref();
+    let destinations =
+        plex_webhook_destinations_for_account(configuration.destinations, account_id.as_deref());
+    if destinations.is_empty() {
+        info!(
+            event,
+            "no Plex webhook destinations are configured for this account"
+        );
+        return;
+    }
+    let payload = serde_json::json!({
+        "event": event,
+        "user": true,
+        "owner": is_owner,
+        "Account": account,
+        "Server": {
+            "title": server_name(state),
+            "uuid": state.machine_identifier.as_ref()
+        },
+        "Player": player,
+        "Metadata": metadata
+    });
+    let thumbnail = if event == "media.play" {
+        plex_frame_cover(state, &media).await
+    } else {
+        None
+    };
+    for (index, destination) in destinations.iter().enumerate() {
+        let Ok(payload_part) =
+            reqwest::multipart::Part::text(payload.to_string()).mime_str("application/json")
+        else {
+            continue;
+        };
+        let mut form = reqwest::multipart::Form::new().part("payload", payload_part);
+        if let Some(thumbnail) = &thumbnail {
+            if let Ok(part) = reqwest::multipart::Part::bytes(thumbnail.clone())
+                .file_name("thumb.jpg")
+                .mime_str("image/jpeg")
+            {
+                form = form.part("thumb", part);
+            }
+        }
+        match client
+            .post(destination.clone())
+            .multipart(form)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                info!(event, destination_index = index, "Plex webhook delivered");
+            }
+            Ok(response) => {
+                warn!(event, destination_index = index, status = %response.status(), "Plex webhook destination rejected event");
+            }
+            Err(error) => {
+                warn!(
+                    event,
+                    destination_index = index,
+                    timed_out = error.is_timeout(),
+                    "Plex webhook destination request failed"
+                );
+            }
+        }
+    }
+}
+
+fn plex_timeline(
+    state: &AppState,
+    query: PlexTimelineQuery,
+    headers: HeaderMap,
+    request_token: Option<String>,
+) -> Response {
     let Some(media_id) = plex_query_media_id(query.rating_key.as_deref(), query.key.as_deref())
     else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -9986,10 +10632,44 @@ fn plex_timeline(state: &AppState, query: PlexTimelineQuery) -> Response {
     ).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    drop(connection);
+    if let Some(playback_state) = query.playback_state.as_deref() {
+        if let Some(event) = plex_playback_webhook_event(state, &media_id, playback_state, &headers)
+        {
+            spawn_plex_webhook_delivery(
+                state,
+                event,
+                media_id.clone(),
+                position,
+                duration,
+                headers.clone(),
+                request_token.clone(),
+            );
+        }
+    }
+    if duration.is_some_and(|duration| plex_scrobble_threshold_reached(position, duration))
+        && plex_scrobble_webhook_once(state, &media_id, &headers)
+    {
+        spawn_plex_webhook_delivery(
+            state,
+            "media.scrobble",
+            media_id,
+            position,
+            duration,
+            headers,
+            request_token,
+        );
+    }
     plex_json(serde_json::json!({"MediaContainer": {"size": 0}}))
 }
 
-fn plex_scrobble(state: &AppState, query: PlexScrobbleQuery, watched: bool) -> Response {
+fn plex_scrobble(
+    state: &AppState,
+    query: PlexScrobbleQuery,
+    watched: bool,
+    headers: HeaderMap,
+    request_token: Option<String>,
+) -> Response {
     let Some(media_id) = plex_query_media_id(query.rating_key.as_deref(), query.key.as_deref())
     else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -10004,6 +10684,13 @@ fn plex_scrobble(state: &AppState, query: PlexScrobbleQuery, watched: bool) -> R
     let Ok(connection) = state.db.lock() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
+    let (position, duration, was_watched) = connection
+        .query_row(
+            "SELECT position_ms, duration_ms, watched FROM watch_progress WHERE user_id = ?1 AND media_key = ?2",
+            (USER_ID, &path),
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, bool>(2)?)),
+        )
+        .unwrap_or((0, None, false));
     let result = if watched {
         connection.execute(
             "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at) VALUES (?1, ?2, 0, NULL, 1, 0, ?3) ON CONFLICT(user_id, media_key) DO UPDATE SET position_ms = 0, watched = 1, hidden_from_continue = 0, updated_at = excluded.updated_at",
@@ -10016,10 +10703,25 @@ fn plex_scrobble(state: &AppState, query: PlexScrobbleQuery, watched: bool) -> R
         )
     };
     if result.is_err() {
-        StatusCode::INTERNAL_SERVER_ERROR.into_response()
-    } else {
-        StatusCode::OK.into_response()
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    drop(connection);
+    if watched {
+        if !was_watched && plex_scrobble_webhook_once(state, &media_id, &headers) {
+            spawn_plex_webhook_delivery(
+                state,
+                "media.scrobble",
+                media_id,
+                position,
+                duration,
+                headers,
+                request_token,
+            );
+        }
+    } else if let Ok(mut sessions) = state.plex_scrobbled_sessions.lock() {
+        sessions.remove(&plex_playback_session_key(&media_id, &headers));
+    }
+    StatusCode::OK.into_response()
 }
 
 async fn plex_remove_from_continue_watching(
