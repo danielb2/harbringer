@@ -18,7 +18,7 @@ Project guidance for `harbringer`: the target is a 100% drop-in replacement for 
 - Treat `tests/unit/plex_regressions.rs` as an append-only protected suite. Never edit, reformat, rename, or remove an existing test or expectation there unless the user explicitly authorizes it. Add new cases only; ask before changing an existing case.
 - Do not commit secrets, generated artifacts, or changes unless explicitly asked.
 - When asked to commit, use the commit subject as a concise summary; include a detailed body when useful to explain the change, rationale, and validation. The subject is not a substitute for the body.
-- Before work begins on a task refer to https://developer.plex.tv/pms and check offcial API for a solution rather than guessing or checking logs
+- Before work begins on a task refer to https://developer.plex.tv/pms and check offcial API for a solution rather than guessing or checking logs. also consolt implementations from https://github.com/debridmediamanager/rex, https://github.com/braedonsaunders/ether/, and https://github.com/edde746/plezy
 
 ## Commands
 
