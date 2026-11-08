@@ -205,7 +205,7 @@
       "path": "/hubs/items",
       "operation_id": "hubsGetItems",
       "summary": "Get a hub's items",
-      "expected_status": 404
+      "expected_status": 400
     },
     {
       "method": "GET",

@@ -626,11 +626,18 @@ fn build_app(state: AppState) -> Router {
         .route("/hubs/promoted", get(plex_global_hubs))
         .route("/hubs/continueWatching", get(plex_continue_watching_hub))
         .route("/hubs/search", get(plex_hub_search))
+        .route("/hubs/items", get(plex_hub_items))
+
         .route(
             "/actions/removeFromContinueWatching",
             put(plex_remove_from_continue_watching),
         )
         .route("/hubs/sections/:section", get(plex_section_hubs))
+        .route(
+            "/hubs/sections/:section/continueWatching/items",
+            get(plex_section_continue_watching_items),
+        )
+
         .route("/hubs/metadata/:id/related", get(plex_related_hubs))
         .route(
             "/hubs/sections/:section/:hub",
@@ -12277,7 +12284,7 @@ async fn plex_continue_watching_hub(
     }
     let hub_key = only_section.map_or_else(
         || "/hubs/continueWatching".to_owned(),
-        |section| format!("/hubs/sections/{section}/continueWatching"),
+        |section| format!("/hubs/sections/{section}/continueWatching/items"),
     );
     let hub = serde_json::json!({
         "key": hub_key,
@@ -12287,6 +12294,8 @@ async fn plex_continue_watching_hub(
         "hubIdentifier": "home.continue",
         "context": "hub.home.continue",
         "size": metadata.len(),
+        "totalSize": total_size,
+
         "more": total_size > count,
         "style": "shelf",
         "promoted": true,
@@ -12375,6 +12384,152 @@ async fn plex_section_hub(
     plex_hubs_response(&state, Some(section), query.get("count"), Some(&hub)).await
 }
 
+async fn plex_hub_items(
+    State(state): State<AppState>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let Some(identifier) = query.get("identifier") else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let mut parts = identifier.split('.');
+    let (Some(kind), Some(category), Some(section), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Ok(section) = section.parse::<usize>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if !matches!(category, "recommended" | "recentlyadded") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let libraries = match state.config.lock() {
+        Ok(config) => config.libraries.clone(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let Some(library) = section
+        .checked_sub(1)
+        .and_then(|index| libraries.get(index))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if plex_kind(&library.kind) != kind {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let hub_response =
+        plex_hubs_response(&state, Some(section), query.get("count"), Some(category)).await;
+    if !hub_response.status().is_success() {
+        return hub_response;
+    }
+    let body = match axum::body::to_bytes(hub_response.into_body(), usize::MAX).await {
+        Ok(body) => body,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let container = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(body) => body["MediaContainer"].clone(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let Some(hub) = container["Hub"].as_array().and_then(|hubs| hubs.first()) else {
+        return plex_json(serde_json::json!({
+            "MediaContainer": {
+                "size": 0,
+                "totalSize": 0,
+                "offset": 0,
+                "allowSync": false,
+                "identifier": "com.plexapp.plugins.library",
+                "librarySectionID": section,
+                "librarySectionTitle": library.name,
+                "Metadata": []
+            }
+        }));
+    };
+    let metadata = hub["Metadata"].as_array().cloned().unwrap_or_default();
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": metadata.len(),
+            "totalSize": hub["size"],
+            "offset": 0,
+            "allowSync": false,
+            "identifier": "com.plexapp.plugins.library",
+            "librarySectionID": section,
+            "librarySectionTitle": library.name,
+            "title1": library.name,
+            "title2": hub["title"],
+            "Metadata": metadata
+        }
+    }))
+}
+
+async fn plex_section_continue_watching_items(
+    State(state): State<AppState>,
+    Path(section): Path<usize>,
+    Query(mut query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let libraries = match state.config.lock() {
+        Ok(config) => config.libraries.clone(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let Some(library) = section
+        .checked_sub(1)
+        .and_then(|index| libraries.get(index))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let offset = query
+        .get("X-Plex-Container-Start")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_default();
+    let requested_count = query
+        .get("X-Plex-Container-Size")
+        .or_else(|| query.get("count"))
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(10)
+        .clamp(1, 50);
+    query.insert("section".to_owned(), section.to_string());
+    query.insert(
+        "count".to_owned(),
+        offset
+            .saturating_add(requested_count)
+            .clamp(1, 50)
+            .to_string(),
+    );
+    let response = plex_continue_watching_hub(State(state), Query(query)).await;
+    if !response.status().is_success() {
+        return response;
+    }
+    let body = match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+        Ok(body) => body,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let hub = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(body) => body["MediaContainer"]["Hub"][0].clone(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let metadata = hub["Metadata"]
+        .as_array()
+        .map(|metadata| {
+            metadata
+                .iter()
+                .skip(offset)
+                .take(requested_count)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": metadata.len(),
+            "totalSize": hub["totalSize"],
+            "offset": offset,
+            "allowSync": true,
+            "identifier": "com.plexapp.plugins.library",
+            "librarySectionID": section,
+            "librarySectionTitle": library.name,
+            "Metadata": metadata
+        }
+    }))
+}
+
 async fn plex_hubs_response(
     state: &AppState,
     only_section: Option<usize>,
@@ -12394,9 +12549,6 @@ async fn plex_hubs_response(
         return StatusCode::NOT_FOUND.into_response();
     }
     let media_index = media_snapshot(state);
-    if only_hub == Some("recommended") && only_section.is_some() {
-        return StatusCode::NOT_FOUND.into_response();
-    }
 
     let mut hubs = Vec::new();
     for (index, library) in libraries.iter().enumerate() {
@@ -12492,8 +12644,33 @@ async fn plex_hubs_response(
             Ok(body) => body["MediaContainer"]["Hub"][0].clone(),
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
+        info!(
+            section,
+            item_count = continue_hub["Metadata"].as_array().map_or(0, Vec::len),
+            "Plex section Continue Watching hub generated"
+        );
+
         hubs.insert(0, continue_hub);
     }
+    if only_hub == Some("recommended") {
+        let hub_details = hubs
+            .iter()
+            .map(|hub| {
+                (
+                    hub["title"].as_str().unwrap_or_default(),
+                    hub["size"].as_u64().unwrap_or_default(),
+                    hub["Metadata"].as_array().map_or(0, Vec::len),
+                )
+            })
+            .collect::<Vec<_>>();
+        tracing::info!(
+            section = ?only_section,
+            hub_count = hubs.len(),
+            hub_details = ?hub_details,
+            "Plex recommended hubs generated"
+        );
+    }
+
     let mut container = serde_json::json!({"size": hubs.len(), "Hub": hubs});
     container["allowSync"] = serde_json::json!(false);
     container["identifier"] = serde_json::json!("com.plexapp.plugins.library");
@@ -12509,7 +12686,9 @@ async fn plex_hubs_response(
 
 fn plex_hub_categories(_has_rated_items: bool, requested: Option<&str>) -> Vec<&'static str> {
     match requested {
-        Some("recentlyAdded") | None => vec!["recentlyAdded"],
+        Some("recommended") => vec!["recommended"],
+        Some("recentlyAdded") => vec!["recentlyAdded"],
+        None => vec!["recommended", "recentlyAdded"],
         Some(_) => Vec::new(),
     }
 }
@@ -12564,7 +12743,7 @@ async fn plex_recommendation_hub(
             .collect::<Vec<_>>();
         return serde_json::json!({
             "hubKey": format!("/library/sections/{section}/all?sort={sort_key}"),
-            "key": format!("/hubs/sections/{section}/{category}"),
+            "key": format!("/hubs/items?identifier={identifier}"),
             "title": title,
             "type": kind,
             "hubIdentifier": identifier,
@@ -12584,7 +12763,7 @@ async fn plex_recommendation_hub(
     }
     serde_json::json!({
         "hubKey": format!("/library/sections/{section}/all?sort={sort_key}"),
-        "key": format!("/hubs/sections/{section}/{category}"),
+        "key": format!("/hubs/items?identifier={identifier}"),
         "title": title,
         "type": kind,
         "hubIdentifier": identifier,
@@ -16190,6 +16369,32 @@ fn plex_queue_item_without_playback_decision(item: &mut serde_json::Value) {
     }
 }
 
+fn plex_tv_show_playback_media(state: &AppState, rating_key: &str) -> Option<Media> {
+    let libraries = state.config.lock().ok()?.libraries.clone();
+    let media_index = media_snapshot(state);
+    for (index, library) in libraries.iter().enumerate() {
+        if library.kind != "tv" {
+            continue;
+        }
+        let section = index + 1;
+        let shows = plex_tv_show_groups(
+            section,
+            &library.folders,
+            media_index
+                .iter()
+                .filter(|media| media_in_library(media, library)),
+        );
+        let Some(show) = shows.into_iter().find(|show| show.rating_key == rating_key) else {
+            continue;
+        };
+        return plex_tv_season_groups(&show, &library.folders)
+            .into_values()
+            .flatten()
+            .find_map(|episode| episode.files.into_iter().next().cloned());
+    }
+    None
+}
+
 async fn plex_create_play_queue(
     State(state): State<AppState>,
     Query(query): Query<BTreeMap<String, String>>,
@@ -16217,7 +16422,9 @@ async fn plex_create_play_queue(
         );
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let Some(media) = find_media(&state, &rating_key) else {
+    let Some(media) = find_media(&state, &rating_key)
+        .or_else(|| plex_tv_show_playback_media(&state, &rating_key))
+    else {
         warn!(
             rating_key,
             reason = "item_not_found",

@@ -1548,23 +1548,29 @@ async fn plex_continue_watching_hub_tracks_progress_and_remove_action() {
         "Continue Watching"
     );
     let section_shelves = section_hubs["MediaContainer"]["Hub"].as_array().unwrap();
-    assert!(section_shelves.iter().any(|hub| {
-        hub["key"]
-            .as_str()
-            .is_some_and(|key| key.ends_with("/recentlyAdded"))
-    }));
-    assert!(!section_shelves
+    assert!(section_shelves
         .iter()
-        .any(|hub| hub["title"] == "Recommended"));
+        .any(|hub| { hub["key"] == "/hubs/items?identifier=movie.recentlyadded.1" }));
+    assert!(section_shelves
+        .iter()
+        .any(|hub| hub["title"] == "Recommended in Movies"));
 
     let recommended = send(
         &fixture.app,
         Method::GET,
-        "/hubs/sections/1/recommended",
+        "/hubs/items?identifier=movie.recommended.1",
         Body::empty(),
     )
     .await;
-    assert_eq!(recommended.status(), StatusCode::NOT_FOUND);
+    assert_eq!(recommended.status(), StatusCode::OK);
+    let recommended: serde_json::Value =
+        serde_json::from_slice(&to_bytes(recommended.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert!(recommended["MediaContainer"]["size"].as_u64().unwrap() > 0);
+    assert_eq!(
+        recommended["MediaContainer"]["Metadata"][0]["type"],
+        "movie"
+    );
 
     let providers = send(&fixture.app, Method::GET, "/media/providers", Body::empty()).await;
     let providers: serde_json::Value =
@@ -1589,8 +1595,33 @@ async fn plex_continue_watching_hub_tracks_progress_and_remove_action() {
         .iter()
         .find(|hub| hub["title"] == "Continue Watching")
         .unwrap();
-    assert_eq!(continue_hub["key"], "/hubs/sections/1/continueWatching");
+    assert_eq!(
+        continue_hub["key"],
+        "/hubs/sections/1/continueWatching/items"
+    );
     assert_eq!(continue_hub["Metadata"][0]["ratingKey"], "1048577");
+
+    let section_continue_items = send(
+        &fixture.app,
+        Method::GET,
+        "/hubs/sections/1/continueWatching/items?X-Plex-Container-Start=0&X-Plex-Container-Size=7",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(section_continue_items.status(), StatusCode::OK);
+    let section_continue_items: serde_json::Value = serde_json::from_slice(
+        &to_bytes(section_continue_items.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(section_continue_items["MediaContainer"]["size"], 1);
+    assert_eq!(section_continue_items["MediaContainer"]["totalSize"], 1);
+    assert_eq!(section_continue_items["MediaContainer"]["offset"], 0);
+    assert_eq!(
+        section_continue_items["MediaContainer"]["Metadata"][0]["ratingKey"],
+        "1048577"
+    );
 
     let section_continue = send(
         &fixture.app,
@@ -1801,6 +1832,85 @@ async fn marking_a_tv_episode_watched_shows_the_next_episode_in_continue_watchin
 }
 
 #[tokio::test]
+async fn plex_timeline_progress_populates_tv_continue_watching() {
+    let fixture = tv_fixture();
+    let recommended = send(
+        &fixture.app,
+        Method::GET,
+        "/hubs/items?identifier=show.recommended.1",
+        Body::empty(),
+    )
+    .await;
+    let recommended: serde_json::Value =
+        serde_json::from_slice(&to_bytes(recommended.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let show_rating_key = recommended["MediaContainer"]["Metadata"][0]["ratingKey"]
+        .as_str()
+        .unwrap();
+    let play_queue = send(
+        &fixture.app,
+        Method::POST,
+        &format!(
+            "/playQueues?type=video&uri=%2Flibrary%2Fmetadata%2F{show_rating_key}&key=%2Flibrary%2Fmetadata%2F{show_rating_key}"
+        ),
+        Body::empty(),
+    )
+    .await;
+    let play_queue: serde_json::Value =
+        serde_json::from_slice(&to_bytes(play_queue.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let episode_rating_key = play_queue["MediaContainer"]["Metadata"][0]["ratingKey"]
+        .as_str()
+        .unwrap();
+
+    let timeline = send(
+        &fixture.app,
+        Method::GET,
+        &format!(
+            "/:/timeline?ratingKey={episode_rating_key}&time=4000&duration=10000&state=playing"
+        ),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(timeline.status(), StatusCode::OK);
+
+    let continue_items = send(
+        &fixture.app,
+        Method::GET,
+        "/hubs/sections/1/continueWatching/items?X-Plex-Container-Size=7",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(continue_items.status(), StatusCode::OK);
+    let continue_items: serde_json::Value = serde_json::from_slice(
+        &to_bytes(continue_items.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(continue_items["MediaContainer"]["size"], 1);
+    assert_eq!(
+        continue_items["MediaContainer"]["Metadata"][0]["ratingKey"],
+        episode_rating_key
+    );
+
+    let section_hubs = send(&fixture.app, Method::GET, "/hubs/sections/1", Body::empty()).await;
+    let section_hubs: serde_json::Value = serde_json::from_slice(
+        &to_bytes(section_hubs.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let continue_hub = section_hubs["MediaContainer"]["Hub"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hub| hub["title"] == "Continue Watching")
+        .unwrap();
+    assert_eq!(continue_hub["Metadata"][0]["ratingKey"], episode_rating_key);
+}
+
+#[tokio::test]
 async fn continue_watching_shows_only_the_first_unwatched_episode_per_show() {
     let fixture = tv_fixture();
     for (path, position_ms) in [
@@ -1882,21 +1992,51 @@ async fn continue_watching_shows_only_the_first_unwatched_episode_per_show() {
     .unwrap();
     let hubs = section_hubs["MediaContainer"]["Hub"].as_array().unwrap();
     assert_eq!(hubs[0]["title"], "Continue Watching");
-    assert!(hubs.iter().any(|hub| {
-        hub["key"]
-            .as_str()
-            .is_some_and(|key| key.ends_with("/recentlyAdded"))
-    }));
-    assert!(!hubs.iter().any(|hub| hub["title"] == "Recommended"));
+    assert!(hubs
+        .iter()
+        .any(|hub| { hub["key"] == "/hubs/items?identifier=show.recentlyadded.1" }));
+    assert!(hubs
+        .iter()
+        .any(|hub| hub["title"] == "Recommended in Shows"));
 
     let recommended = send(
         &fixture.app,
         Method::GET,
-        "/hubs/sections/1/recommended",
+        "/hubs/items?identifier=show.recommended.1",
         Body::empty(),
     )
     .await;
-    assert_eq!(recommended.status(), StatusCode::NOT_FOUND);
+    assert_eq!(recommended.status(), StatusCode::OK);
+    let recommended: serde_json::Value =
+        serde_json::from_slice(&to_bytes(recommended.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert!(recommended["MediaContainer"]["size"].as_u64().unwrap() > 0);
+    assert_eq!(recommended["MediaContainer"]["Metadata"][0]["type"], "show");
+
+    let show_rating_key = recommended["MediaContainer"]["Metadata"][0]["ratingKey"]
+        .as_str()
+        .unwrap();
+    let play_queue = send(
+        &fixture.app,
+        Method::POST,
+        &format!(
+            "/playQueues?type=video&uri=%2Flibrary%2Fmetadata%2F{show_rating_key}&key=%2Flibrary%2Fmetadata%2F{show_rating_key}"
+        ),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(play_queue.status(), StatusCode::OK);
+    let play_queue: serde_json::Value =
+        serde_json::from_slice(&to_bytes(play_queue.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(
+        play_queue["MediaContainer"]["Metadata"][0]["type"],
+        "episode"
+    );
+    assert_ne!(
+        play_queue["MediaContainer"]["Metadata"][0]["ratingKey"],
+        show_rating_key
+    );
 
     let providers = send(&fixture.app, Method::GET, "/media/providers", Body::empty()).await;
     let providers: serde_json::Value =
@@ -3830,6 +3970,16 @@ async fn every_registered_plex_route_has_success_and_failure_cases() {
             "/actions/removeFromContinueWatching?ratingKey=1-1",
         ),
         (Method::GET, "/hubs/sections/1"),
+        (
+            Method::GET,
+            "/hubs/sections/1/continueWatching/items?X-Plex-Container-Size=7",
+        ),
+
+        (
+            Method::GET,
+            "/hubs/items?identifier=movie.recommended.1",
+        ),
+
         (Method::GET, "/hubs/metadata/1-1/related"),
         (Method::GET, "/library/sections"),
         (Method::GET, "/library/sections/prefs?type=1"),
@@ -5005,6 +5155,12 @@ async fn plex_route_errors_are_explicit_for_unknown_resources_and_bad_requests()
         ),
         (Method::GET, "/library/search", StatusCode::BAD_REQUEST),
         (Method::GET, "/hubs/search", StatusCode::BAD_REQUEST),
+        (Method::GET, "/hubs/items", StatusCode::BAD_REQUEST),
+        (
+            Method::GET,
+            "/hubs/items?identifier=movie.recommended.99",
+            StatusCode::NOT_FOUND,
+        ),
         (
             Method::GET,
             "/library/metadata/missing/related",

@@ -57,14 +57,23 @@ fn plex_external_stream_urls_accept_client_appended_extensions() {
     assert_eq!(plex_stream_id_and_format("123.srt.exe"), None);
 }
 #[test]
-fn plex_section_hubs_use_recently_added_instead_of_recommended() {
+fn plex_hub_categories_include_recommendations_by_default() {
     assert_eq!(
         plex_hub_categories(false, Some("recentlyAdded")),
         vec!["recentlyAdded"]
     );
-    assert_eq!(plex_hub_categories(false, None), vec!["recentlyAdded"]);
-    assert_eq!(plex_hub_categories(true, None), vec!["recentlyAdded"]);
-    assert!(plex_hub_categories(true, Some("recommended")).is_empty());
+    assert_eq!(
+        plex_hub_categories(false, None),
+        vec!["recommended", "recentlyAdded"]
+    );
+    assert_eq!(
+        plex_hub_categories(true, None),
+        vec!["recommended", "recentlyAdded"]
+    );
+    assert_eq!(
+        plex_hub_categories(true, Some("recommended")),
+        vec!["recommended"]
+    );
 }
 #[test]
 fn plex_photo_sources_resolve_thumb_and_art_routes() {
