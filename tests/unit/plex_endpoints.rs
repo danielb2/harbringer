@@ -18,6 +18,9 @@ use std::{
 };
 use tower::ServiceExt;
 
+#[path = "plex_regressions.rs"]
+mod regression_suite;
+
 #[derive(serde::Deserialize)]
 struct PlexApiInventory {
     spec_version: String,
@@ -1829,85 +1832,6 @@ async fn marking_a_tv_episode_watched_shows_the_next_episode_in_continue_watchin
         .unwrap();
     assert!(continue_cards.contains("Example.Show.S01E02.Next.mkv"));
     assert!(!continue_cards.contains("Example.Show.S01E01.Pilot.mkv"));
-}
-
-#[tokio::test]
-async fn plex_timeline_progress_populates_tv_continue_watching() {
-    let fixture = tv_fixture();
-    let recommended = send(
-        &fixture.app,
-        Method::GET,
-        "/hubs/items?identifier=show.recommended.1",
-        Body::empty(),
-    )
-    .await;
-    let recommended: serde_json::Value =
-        serde_json::from_slice(&to_bytes(recommended.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
-    let show_rating_key = recommended["MediaContainer"]["Metadata"][0]["ratingKey"]
-        .as_str()
-        .unwrap();
-    let play_queue = send(
-        &fixture.app,
-        Method::POST,
-        &format!(
-            "/playQueues?type=video&uri=%2Flibrary%2Fmetadata%2F{show_rating_key}&key=%2Flibrary%2Fmetadata%2F{show_rating_key}"
-        ),
-        Body::empty(),
-    )
-    .await;
-    let play_queue: serde_json::Value =
-        serde_json::from_slice(&to_bytes(play_queue.into_body(), usize::MAX).await.unwrap())
-            .unwrap();
-    let episode_rating_key = play_queue["MediaContainer"]["Metadata"][0]["ratingKey"]
-        .as_str()
-        .unwrap();
-
-    let timeline = send(
-        &fixture.app,
-        Method::GET,
-        &format!(
-            "/:/timeline?ratingKey={episode_rating_key}&time=4000&duration=10000&state=playing"
-        ),
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(timeline.status(), StatusCode::OK);
-
-    let continue_items = send(
-        &fixture.app,
-        Method::GET,
-        "/hubs/sections/1/continueWatching/items?X-Plex-Container-Size=7",
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(continue_items.status(), StatusCode::OK);
-    let continue_items: serde_json::Value = serde_json::from_slice(
-        &to_bytes(continue_items.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(continue_items["MediaContainer"]["size"], 1);
-    assert_eq!(
-        continue_items["MediaContainer"]["Metadata"][0]["ratingKey"],
-        episode_rating_key
-    );
-
-    let section_hubs = send(&fixture.app, Method::GET, "/hubs/sections/1", Body::empty()).await;
-    let section_hubs: serde_json::Value = serde_json::from_slice(
-        &to_bytes(section_hubs.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    let continue_hub = section_hubs["MediaContainer"]["Hub"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|hub| hub["title"] == "Continue Watching")
-        .unwrap();
-    assert_eq!(continue_hub["Metadata"][0]["ratingKey"], episode_rating_key);
 }
 
 #[tokio::test]

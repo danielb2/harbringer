@@ -15,6 +15,7 @@ Project guidance for `harbringer`: the target is a 100% drop-in replacement for 
 - Preserve original-file serving and seeking when a client can play the source directly. Transcoding must be selected from client capabilities and media metadata, not used as a blanket path.
 - Keep shared file handling and media logic reusable. Avoid duplicated protocol responses, route behavior, or UI implementations.
 - Add or update tests for behavior changes, including success and failure paths. Keep the Plex endpoint inventory and route tests in sync with the official API documentation.
+- Treat `tests/unit/plex_regressions.rs` as an append-only protected suite. Never edit, reformat, rename, or remove an existing test or expectation there unless the user explicitly authorizes it. Add new cases only; ask before changing an existing case.
 - Do not commit secrets, generated artifacts, or changes unless explicitly asked.
 - When asked to commit, use the commit subject as a concise summary; include a detailed body when useful to explain the change, rationale, and validation. The subject is not a substitute for the body.
 
