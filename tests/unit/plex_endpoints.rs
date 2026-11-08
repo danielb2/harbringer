@@ -390,9 +390,16 @@ async fn settings_indicates_saved_tmdb_token_without_disclosing_it() {
 
 #[tokio::test]
 async fn settings_logs_tab_displays_recent_events() {
+    let mut log_updates = super::log_broadcast().subscribe();
     let fixture = fixture();
     super::push_log_line("event=http_request method=GET path=/settings".to_owned());
     super::push_log_line("event=tmdb \x1b[31msearch\x1b[0m finished".to_owned());
+    let mut streamed_lines = Vec::new();
+    while let Ok((_, line)) = log_updates.try_recv() {
+        streamed_lines.push(line);
+    }
+    assert!(streamed_lines.contains(&"event=http_request method=GET path=/settings".to_owned()));
+    assert!(streamed_lines.contains(&"event=tmdb search finished".to_owned()));
     let response = send(
         &fixture.app,
         Method::GET,
@@ -403,10 +410,21 @@ async fn settings_logs_tab_displays_recent_events() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.contains("<h2 id=\"logs-heading\">Logs</h2>"));
+    assert!(body.contains("id=\"settings-logs-search\" type=\"search\""));
+    assert!(body.contains("id=\"settings-logs-reverse\" type=\"checkbox\""));
+    assert!(body.contains("id=\"settings-logs-output\""));
+    assert!(body.contains("Reverse filter (show non-matching)"));
+    assert!(body.contains("id=\"settings-logs-live\""));
+    assert!(body.contains("id=\"settings-logs-follow\""));
+    assert!(body.contains("/settings/logs/socket"));
+    assert!(!body.contains(">Refresh</a>"));
     assert!(body.contains("<div class=\"settings-stack\" style=\"display:none\">"));
     assert!(body.contains("event=http_request method=GET path=/settings"));
     assert!(body.contains("event=tmdb search finished"));
     assert!(!body.contains('\u{1b}'));
+    let (_, log_snapshot) = super::recent_log_snapshot();
+    assert!(log_snapshot.contains(&"event=http_request method=GET path=/settings".to_owned()));
+    assert!(log_snapshot.contains(&"event=tmdb search finished".to_owned()));
     assert!(body.contains("class=\"active\" href=\"/settings?tab=logs\""));
 }
 

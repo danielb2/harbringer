@@ -23,6 +23,7 @@ Project guidance for `harbringer`: the target is a 100% drop-in replacement for 
 
 - Build: `cargo build`
 - Test: `cargo test`
+- Before every code handoff, run the full `cargo test` suite. If it cannot run or fails, report that clearly and do not claim verification is complete.
 - Run: `cargo run`
 - Restart the running server with `SIGHUP`; do not use `SIGTERM`.
 

@@ -210,6 +210,12 @@ impl tracing_subscriber::fmt::time::FormatTime for LocalSecondTimer {
 const MAX_LOG_LINES: usize = 1000;
 const MAX_LOG_LINE_BYTES: usize = 4096;
 static LOG_BUFFER: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static LOG_BROADCAST: OnceLock<tokio::sync::broadcast::Sender<(u64, String)>> = OnceLock::new();
+
+fn log_broadcast() -> &'static tokio::sync::broadcast::Sender<(u64, String)> {
+    LOG_BROADCAST.get_or_init(|| tokio::sync::broadcast::channel(1024).0)
+}
 
 #[derive(Clone)]
 struct LogBufferMakeWriter;
@@ -300,7 +306,9 @@ fn push_log_line(line: String) {
     if logs.len() == MAX_LOG_LINES {
         logs.pop_front();
     }
-    logs.push_back(line);
+    logs.push_back(line.clone());
+    let sequence = LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+    let _ = log_broadcast().send((sequence, line));
 }
 
 fn recent_log_lines() -> Vec<String> {
@@ -309,6 +317,77 @@ fn recent_log_lines() -> Vec<String> {
         .lock()
         .map(|logs| logs.iter().cloned().collect())
         .unwrap_or_default()
+}
+
+
+fn recent_log_snapshot() -> (u64, Vec<String>) {
+    let logs = LOG_BUFFER
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    (
+        LOG_SEQUENCE.load(Ordering::Relaxed),
+        logs.iter().cloned().collect(),
+    )
+}
+
+async fn settings_logs_socket(upgrade: WebSocketUpgrade) -> Response {
+    let mut response = upgrade
+        .on_upgrade(|mut socket| async move {
+            let mut updates = log_broadcast().subscribe();
+            let (mut last_sequence, lines) = recent_log_snapshot();
+            let snapshot = serde_json::json!({
+                "type": "snapshot",
+                "sequence": last_sequence,
+                "lines": lines,
+            });
+            if socket.send(Message::Text(snapshot.to_string().into())).await.is_err() {
+                return;
+            }
+            loop {
+                tokio::select! {
+                    message = socket.recv() => match message {
+                        Some(Ok(Message::Ping(payload))) => {
+                            if socket.send(Message::Pong(payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                        Some(Ok(Message::Text(_) | Message::Binary(_) | Message::Pong(_))) => {}
+                    },
+                    update = updates.recv() => match update {
+                        Ok((sequence, line)) if sequence > last_sequence => {
+                            let event = serde_json::json!({
+                                "type": "entry",
+                                "sequence": sequence,
+                                "line": line,
+                            });
+                            if socket.send(Message::Text(event.to_string().into())).await.is_err() {
+                                break;
+                            }
+                            last_sequence = sequence;
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let (sequence, lines) = recent_log_snapshot();
+                            let snapshot = serde_json::json!({
+                                "type": "snapshot",
+                                "sequence": sequence,
+                                "lines": lines,
+                            });
+                            if socket.send(Message::Text(snapshot.to_string().into())).await.is_err() {
+                                break;
+                            }
+                            last_sequence = sequence;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        })
+        .into_response();
+    response.extensions_mut().insert(SuppressHttpResponseLog);
+    response
 }
 
 #[tokio::main]
@@ -584,6 +663,7 @@ fn build_app(state: AppState) -> Router {
         .route("/web/tv-match/search", get(tv_match_search))
         .route("/web/tv-match/select", post(tv_match_select))
         .route("/settings", get(settings_page))
+        .route("/settings/logs/socket", get(settings_logs_socket))
         .route("/settings/libraries", post(create_library))
         .route("/settings/libraries/:id/rename", post(rename_library))
         .route("/settings/libraries/:id/save", post(save_library_settings))
@@ -732,6 +812,9 @@ fn build_app(state: AppState) -> Router {
         .layer(
             TraceLayer::new_for_http()
                 .on_request(|request: &Request<Body>, _span: &Span| {
+                    if request.uri().path() == "/settings/logs/socket" {
+                        return;
+                    }
                     let remote_ip = request
                         .extensions()
                         .get::<SocketAddr>()
@@ -3170,16 +3253,17 @@ async fn settings_page(
     };
     let log_lines = recent_log_lines();
     let logs_content = if logs_active {
-        let output = if log_lines.is_empty() {
-            "<p class=\"note\">No log entries yet.</p>".to_owned()
+        let output = format!(
+            "<pre class=\"settings-logs\" id=\"settings-logs-output\">{}</pre>",
+            html(&log_lines.join("\n"))
+        );
+        let empty_notice = if log_lines.is_empty() {
+            "<p id=\"settings-logs-empty\" class=\"note\">No log entries yet.</p>"
         } else {
-            format!(
-                "<pre class=\"settings-logs\">{}</pre>",
-                html(&log_lines.join("\n"))
-            )
+            "<p id=\"settings-logs-empty\" class=\"note\" hidden>No log entries yet.</p>"
         };
         format!(
-            "<section class=\"settings-card\" aria-labelledby=\"logs-heading\"><div class=\"section-heading\"><div><h2 id=\"logs-heading\">Logs</h2><p class=\"section-description\">Recent server and request events. The server keeps up to 1000 entries in memory.</p></div><a class=\"button-link button-secondary\" href=\"/settings?tab=logs\">Refresh</a></div>{output}</section>"
+            "<section class=\"settings-card\" aria-labelledby=\"logs-heading\"><div class=\"section-heading\"><div><h2 id=\"logs-heading\">Logs</h2><p class=\"section-description\">Recent server and request events. The server keeps up to 1000 entries in memory.</p></div><span id=\"settings-logs-live\" role=\"status\">Live</span></div><div class=\"log-filters\"><label for=\"settings-logs-search\">Search log entries <input id=\"settings-logs-search\" type=\"search\" placeholder=\"Search log entries…\" autocomplete=\"off\"></label><label><input id=\"settings-logs-reverse\" type=\"checkbox\"> Reverse filter (show non-matching)</label><span id=\"settings-logs-count\" role=\"status\" aria-live=\"polite\"></span><button class=\"button-secondary log-follow\" id=\"settings-logs-follow\" type=\"button\" aria-label=\"Scroll to latest log entries\" title=\"Scroll to latest log entries\" hidden>↓ Latest</button></div>{empty_notice}{output}</section>"
         )
     } else {
         String::new()
@@ -3380,6 +3464,8 @@ button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: 
 .library-scan-settings {{ display: flex; grid-column: 1 / -1; flex-wrap: wrap; align-items: center; gap: .4rem; padding-top: .9rem; border-top: 1px solid #26354a; }} .library-scan-settings > strong {{ margin-right: .25rem; }} .library-scan-settings label {{ display: flex; align-items: center; gap: .4rem; color: #c9d4e4; font-size: .84rem; }} .library-scan-settings input[type="number"] {{ width: 5.5rem; }} .library-scan-settings select {{ width: auto; }}
 
 .library-add-folder[open] > summary::before {{ content: "+"; }}
+#settings-logs-live {{ color: #8fd6a7; font-size: .82rem; }} .log-follow[hidden] {{ display: none; }}
+.log-filters {{ display: flex; flex-wrap: wrap; align-items: end; gap: 1rem; margin-bottom: 1rem; }} .log-filters > label:first-child {{ display: grid; flex: 1 1 16rem; gap: .45rem; color: #c9d4e4; font-size: .84rem; font-weight: 650; }} .log-filters > label:first-child input {{ margin-top: 0; }} .log-filters > label:nth-child(2) {{ display: flex; align-items: center; gap: .45rem; min-height: 2.75rem; color: #c9d4e4; font-size: .84rem; }} #settings-logs-count {{ margin-left: auto; color: #98a6bb; font-size: .82rem; }}
 .settings-tabs {{ display: flex; gap: .35rem; margin: 0 0 1.15rem; padding-bottom: .7rem; border-bottom: 1px solid #29364b; }} .settings-tabs a {{ padding: .55rem .8rem; border-radius: .5rem; color: #aeb9cc; text-decoration: none; }} .settings-tabs a.active, .settings-tabs a:hover {{ color: #fff; background: #1d4ed8; }} .settings-logs {{ max-height: 70vh; margin: 0; padding: 1rem; overflow: auto; border: 1px solid #29364b; border-radius: .65rem; color: #d4deec; background: #0a111e; font: .8rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }}
 </style></head><body><div class="app-shell">{}
 <main><header class="page-heading"><p class="eyebrow">harbringer</p><h1>Settings</h1><p class="page-subtitle">Manage Plex access, metadata storage, and the libraries available on this server.</p></header>{}{}
@@ -3395,6 +3481,69 @@ if (localStorage.getItem('mplex-sidebar-collapsed') === 'true') shell.classList.
 toggle?.addEventListener('click', () => {{ const collapsed = shell.classList.toggle('sidebar-collapsed'); localStorage.setItem('mplex-sidebar-collapsed', collapsed ? 'true' : 'false'); }});
 const pathList = document.querySelector('#new-library-paths'); const updatePathButtons = () => {{ const rows = [...pathList.querySelectorAll('.path-row')]; rows.forEach((row, index) => {{ const button = row.querySelector('.remove-path'); button.disabled = rows.length === 1; button.setAttribute('aria-label', `Remove folder path ${{index + 1}}`); button.title = `Remove folder path ${{index + 1}}`; }}); }};
 document.querySelector('#add-path')?.addEventListener('click', () => {{ const index = pathList.querySelectorAll('.path-row').length; const row = document.createElement('div'); row.className = 'path-row'; row.innerHTML = `<label class="sr-only" for="new-path-${{index}}">Folder path</label><input id="new-path-${{index}}" name="path[]" type="text" placeholder="/path/to/folder" required><a class="button-link button-secondary" href="/settings/browse">Browse</a><button type="button" class="button-quiet remove-path">−</button>`; row.querySelector('.remove-path').addEventListener('click', () => {{ row.remove(); updatePathButtons(); }}); pathList.appendChild(row); updatePathButtons(); }});
+const logOutput = document.querySelector('#settings-logs-output');
+const logSearch = document.querySelector('#settings-logs-search');
+const logReverse = document.querySelector('#settings-logs-reverse');
+const logCount = document.querySelector('#settings-logs-count');
+const logEmpty = document.querySelector('#settings-logs-empty');
+const logFollowButton = document.querySelector('#settings-logs-follow');
+const logLiveStatus = document.querySelector('#settings-logs-live');
+if (logOutput && logSearch && logReverse && logCount && logEmpty && logFollowButton && logLiveStatus) {{
+  let logLines = logOutput.textContent ? logOutput.textContent.split("\n") : [];
+  let followLogs = true;
+  let lastSequence = 0;
+  const isAtBottom = () => logOutput.scrollHeight - logOutput.scrollTop - logOutput.clientHeight <= 4;
+  const scrollToLatest = () => {{ logOutput.scrollTop = logOutput.scrollHeight; }};
+  const updateFollowButton = () => {{ logFollowButton.hidden = isAtBottom(); }};
+  const filterLogs = () => {{
+    const query = logSearch.value.trim().toLocaleLowerCase();
+    const reverse = logReverse.checked && query !== "";
+    const visibleLines = query === "" ? logLines : logLines.filter(line => line.toLocaleLowerCase().includes(query) !== reverse);
+    logOutput.textContent = visibleLines.join("\n");
+    logEmpty.hidden = logLines.length !== 0;
+    logCount.textContent = `${{visibleLines.length}} of ${{logLines.length}} lines`;
+    if (followLogs) scrollToLatest();
+    updateFollowButton();
+  }};
+  logOutput.addEventListener('scroll', () => {{
+    followLogs = isAtBottom();
+    updateFollowButton();
+  }});
+  logFollowButton.addEventListener('click', () => {{
+    followLogs = true;
+    scrollToLatest();
+    updateFollowButton();
+  }});
+  logSearch.addEventListener('input', filterLogs);
+  logReverse.addEventListener('change', filterLogs);
+  const connectLogs = () => {{
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const socket = new WebSocket(`${{protocol}}//${{location.host}}/settings/logs/socket`);
+    socket.addEventListener('open', () => {{ logLiveStatus.textContent = 'Live'; }});
+    socket.addEventListener('message', event => {{
+      let update;
+      try {{ update = JSON.parse(event.data); }} catch {{ return; }}
+      if (update.type === 'snapshot' && Array.isArray(update.lines)) {{
+        logLines = update.lines;
+        lastSequence = update.sequence;
+      }} else if (update.type === 'entry' && update.sequence > lastSequence) {{
+        logLines.push(update.line);
+        if (logLines.length > 1000) logLines.shift();
+        lastSequence = update.sequence;
+      }} else {{
+        return;
+      }}
+      filterLogs();
+    }});
+    socket.addEventListener('close', () => {{
+      logLiveStatus.textContent = 'Reconnecting…';
+      window.setTimeout(connectLogs, 1500);
+    }});
+    socket.addEventListener('error', () => socket.close());
+  }};
+  filterLogs();
+  connectLogs();
+}}
 </script></body></html>"#,
         sidebar_nav_for_settings(&state),
         error,
