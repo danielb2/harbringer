@@ -34,3 +34,40 @@ tower-http = { version = "0.5", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 vuio-media-info = "0.1.4"
+bytes = "1"
+broadcast-common = "11.0.0"
+matroska-demuxer = "0.8.1"
+transmux = { version = "=0.30.0", default-features = false, features = ["std"] }
+tempfile = "3"
+oxideav-ac3 = "=0.0.12"
+oxideav-aac = "=0.1.7"
+oxideav-core = "0.1"
+rusty_aac = { version = "=2.0.1", default-features = false }
+rust_h265 = "=0.4.1"
+rusty_h264-common = "=0.16.1"
+rusty_h264-encoder = "=0.16.1"
+
+[profile.dev]
+opt-level = 3
+
+
+[profile.dev.package.oxideav-aac]
+opt-level = 3
+
+[profile.dev.package.oxideav-ac3]
+opt-level = 3
+
+[profile.dev.package.rusty_aac]
+opt-level = 3
+
+[profile.dev.package.matroska-demuxer]
+opt-level = 3
+
+[profile.dev.package.transmux]
+opt-level = 3
+
+[profile.dev.package.rust_h265]
+opt-level = 3
+
+[profile.dev.package.rusty_h264-encoder]
+opt-level = 3

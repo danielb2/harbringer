@@ -1,6 +1,6 @@
 use super::{
     build_app, migrate_library_model, open_database, plex_external_subtitle_id, plex_part_id,
-    sync_config_libraries, AppState, Config, ConfigLibrary, Media, PlexTls,
+    plex_remux_audio_mode, sync_config_libraries, AppState, Config, ConfigLibrary, Media, PlexTls,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -166,6 +166,7 @@ fn fixture() -> Fixture {
         plex_play_queues: Arc::new(Mutex::new(HashMap::new())),
         next_plex_play_queue_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         plex_playback_states: Arc::new(Mutex::new(HashMap::new())),
+        plex_remux_sessions: Arc::new(Mutex::new(HashMap::new())),
         plex_scrobbled_sessions: Arc::new(Mutex::new(HashSet::new())),
         plex_webhook_delivery_lock: Arc::new(tokio::sync::Mutex::new(())),
 
@@ -259,6 +260,7 @@ fn tv_fixture() -> Fixture {
         plex_play_queues: Arc::new(Mutex::new(HashMap::new())),
         next_plex_play_queue_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         plex_playback_states: Arc::new(Mutex::new(HashMap::new())),
+        plex_remux_sessions: Arc::new(Mutex::new(HashMap::new())),
         plex_scrobbled_sessions: Arc::new(Mutex::new(HashSet::new())),
         plex_webhook_delivery_lock: Arc::new(tokio::sync::Mutex::new(())),
 
@@ -3250,6 +3252,135 @@ async fn plex_web_dash_start_reports_transcoding_unavailable() {
     assert!(String::from_utf8(body.to_vec())
         .unwrap()
         .contains("DASH transcoding is not supported."));
+}
+
+#[test]
+fn plex_web_dash_start_defaults_missing_audio_flag_to_aac_conversion() {
+    let query = std::collections::BTreeMap::from([
+        ("directPlay".to_owned(), "0".to_owned()),
+        ("directStream".to_owned(), "1".to_owned()),
+    ]);
+    assert_eq!(plex_remux_audio_mode("dash", &query), Some(true));
+    assert_eq!(plex_remux_audio_mode("hls", &query), None);
+}
+
+#[tokio::test]
+async fn plex_hls_start_does_not_claim_success_for_invalid_media() {
+    let fixture = fixture();
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/video/:/transcode/universal/start.m3u8?protocol=hls&directPlay=0&directStream=1&directStreamAudio=1&path=%2Flibrary%2Fmetadata%2F1048577",
+        Body::empty(),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/plain; charset=utf-8"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert!(String::from_utf8(body.to_vec())
+        .unwrap()
+        .contains("HLS playback is not supported."));
+    assert!(fixture.state.plex_remux_sessions.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn plex_android_audio_conversion_decision_selects_aac() {
+    let fixture = fixture();
+    fixture.state.media_info.lock().unwrap().insert(
+        "1-1".to_owned(),
+        serde_json::json!({
+            "media": {
+                "track": [
+                    {
+                        "@type": "Video",
+                        "ID": "1",
+                        "Format": "HEVC",
+                        "Default": "Yes"
+                    },
+                    {
+                        "@type": "Audio",
+                        "ID": "2",
+                        "Format": "E-AC-3",
+                        "Channels": "6",
+                        "SamplingRate": "48000",
+                        "Default": "Yes"
+                    }
+                ]
+            }
+        }),
+    );
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/video/:/transcode/universal/decision?ratingKey=1-1&protocol=hls&directPlay=0&directStream=1&directStreamAudio=0",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let decision: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(decision["MediaContainer"]["generalDecisionCode"], 1001);
+    assert_eq!(decision["MediaContainer"]["transcodeDecisionCode"], 1001);
+    let part = &decision["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0];
+    assert_eq!(part["decision"], "transcode");
+    assert_eq!(part["Stream"][0]["codec"], "hevc");
+    assert_eq!(part["Stream"][0]["decision"], "copy");
+    assert_eq!(part["Stream"][1]["codec"], "aac");
+    assert_eq!(part["Stream"][1]["decision"], "transcode");
+}
+
+
+#[tokio::test]
+async fn plex_web_dash_video_conversion_decision_selects_h264_and_aac() {
+    let fixture = fixture();
+    fixture.state.media_info.lock().unwrap().insert(
+        "1-1".to_owned(),
+        serde_json::json!({
+            "media": {
+                "track": [
+                    {
+                        "@type": "Video",
+                        "ID": "1",
+                        "Format": "HEVC",
+                        "Default": "Yes"
+                    },
+                    {
+                        "@type": "Audio",
+                        "ID": "2",
+                        "Format": "E-AC-3",
+                        "Channels": "6",
+                        "SamplingRate": "48000",
+                        "Default": "Yes"
+                    }
+                ]
+            }
+        }),
+    );
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/video/:/transcode/universal/decision?ratingKey=1-1&protocol=dash&directPlay=0&directStream=0&directStreamAudio=0",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let decision: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(decision["MediaContainer"]["generalDecisionCode"], 1001);
+    assert_eq!(decision["MediaContainer"]["transcodeDecisionCode"], 1001);
+    assert_eq!(decision["MediaContainer"]["directPlayDecisionCode"], 3000);
+    let part = &decision["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0];
+    assert_eq!(part["decision"], "transcode");
+    assert_eq!(part["Stream"][0]["codec"], "h264");
+    assert_eq!(part["Stream"][0]["decision"], "transcode");
+    assert_eq!(part["Stream"][1]["codec"], "aac");
+    assert_eq!(part["Stream"][1]["decision"], "transcode");
 }
 
 #[tokio::test]

@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod plex_remux;
 mod plex_tls;
 
 use axum::{
@@ -33,7 +34,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock, RwLock,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     fs::File,
@@ -167,11 +168,25 @@ struct AppState {
     plex_play_queues: Arc<Mutex<HashMap<u64, serde_json::Value>>>,
     next_plex_play_queue_id: Arc<AtomicU64>,
     plex_playback_states: Arc<Mutex<HashMap<String, String>>>,
+    plex_remux_sessions: Arc<Mutex<HashMap<String, PlexRemuxSession>>>,
     plex_scrobbled_sessions: Arc<Mutex<HashSet<String>>>,
     plex_webhook_delivery_lock: Arc<tokio::sync::Mutex<()>>,
 
     plex_tls: PlexTls,
 }
+
+struct PlexRemuxSession {
+    playback: Arc<plex_remux::RemuxedPlayback>,
+    source_path: PathBuf,
+    protocol: String,
+    transcode_audio: bool,
+    transcode_video: bool,
+    offset_seconds: f64,
+    expires_at: Instant,
+}
+
+const PLEX_REMUX_SESSION_TTL: Duration = Duration::from_secs(4 * 60 * 60);
+static PLEX_REMUX_BUILD_LIMITER: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 #[derive(Clone)]
 struct Media {
@@ -318,7 +333,6 @@ fn recent_log_lines() -> Vec<String> {
         .map(|logs| logs.iter().cloned().collect())
         .unwrap_or_default()
 }
-
 
 fn recent_log_snapshot() -> (u64, Vec<String>) {
     let logs = LOG_BUFFER
@@ -520,6 +534,7 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
         plex_play_queues: Arc::new(Mutex::new(HashMap::new())),
         next_plex_play_queue_id: Arc::new(AtomicU64::new(1)),
         plex_playback_states: Arc::new(Mutex::new(HashMap::new())),
+        plex_remux_sessions: Arc::new(Mutex::new(HashMap::new())),
         plex_scrobbled_sessions: Arc::new(Mutex::new(HashSet::new())),
         plex_webhook_delivery_lock: Arc::new(tokio::sync::Mutex::new(())),
 
@@ -527,6 +542,13 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
     };
     let scan_state = state.clone();
     let inventory_scan_task = tokio::spawn(library_scan_scheduler(scan_state));
+    let remux_cleanup_state = state.clone();
+    let remux_cleanup_task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            prune_plex_remux_sessions(&remux_cleanup_state);
+        }
+    });
     let server_tls = state.plex_tls.clone();
     let publication_state = state.clone();
     let startup_server_name = server_name.clone();
@@ -628,6 +650,7 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
     gdm_task.abort();
     publication_task.abort();
     inventory_scan_task.abort();
+    remux_cleanup_task.abort();
     Ok(outcome)
 }
 
@@ -9915,6 +9938,20 @@ fn xml_escape(value: &str) -> String {
 }
 
 async fn log_not_found(State(state): State<AppState>, req: Request<Body>) -> Response {
+    if let Some(resource) = req
+        .uri()
+        .path()
+        .strip_prefix("/video/:/transcode/universal/session/")
+    {
+        return plex_remux_resource(
+            &state,
+            resource,
+            req.method().clone(),
+            req.headers().clone(),
+        )
+        .await;
+    }
+
     if req.uri().path() == "/video/:/transcode/universal/decision" {
         let query = req
             .uri()
@@ -9960,27 +9997,8 @@ async fn log_not_found(State(state): State<AppState>, req: Request<Body>) -> Res
             client_platform = ?query.get("X-Plex-Platform"),
             "Plex universal stream start requested"
         );
-        if extension.eq_ignore_ascii_case("mpd") {
-            warn!(
-                extension,
-                reason = "transcoding_unavailable",
-                "Plex DASH playback rejected"
-            );
-            return (
-                StatusCode::NOT_IMPLEMENTED,
-                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                "DASH transcoding is not supported.",
-            )
-                .into_response();
-        }
-        if extension.eq_ignore_ascii_case("m3u8") {
-            warn!(extension, "HLS playback is not supported");
-            return (
-                StatusCode::NOT_IMPLEMENTED,
-                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                "HLS playback is not supported.",
-            )
-                .into_response();
+        if extension.eq_ignore_ascii_case("mpd") || extension.eq_ignore_ascii_case("m3u8") {
+            return plex_remux_start(&state, extension, &query).await;
         }
         let Some(media) = plex_playback_media_from_query(&state, &query) else {
             warn!(
@@ -10114,6 +10132,254 @@ fn plex_playback_media_from_query(
             .or_else(|| query.get("mediaId"))
             .and_then(|media_id| find_media(state, media_id))
     })
+}
+
+async fn plex_remux_start(
+    state: &AppState,
+    extension: &str,
+    query: &BTreeMap<String, String>,
+) -> Response {
+    let (protocol, content_type) = if extension.eq_ignore_ascii_case("m3u8") {
+        ("hls", "application/vnd.apple.mpegurl")
+    } else if extension.eq_ignore_ascii_case("mpd") {
+        ("dash", "application/dash+xml")
+    } else {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    };
+    let direct_stream = query.get("directStream").map(String::as_str);
+    if query
+        .get("protocol")
+        .is_some_and(|requested| !requested.eq_ignore_ascii_case(protocol))
+        || !matches!(direct_stream, Some("0" | "1"))
+    {
+        warn!(
+            protocol,
+            reason = "unsupported_conversion",
+            "Plex remux request rejected"
+        );
+        return plex_remux_unavailable(protocol);
+    }
+    let transcode_video = direct_stream == Some("0");
+    let offset_seconds = match query.get("offset") {
+        Some(offset) => match offset.parse::<f64>() {
+            Ok(offset) if offset.is_finite() && offset >= 0.0 => offset,
+            _ => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None => 0.0,
+    };
+    let offset_seconds = if protocol == "dash" {
+        offset_seconds
+    } else {
+        0.0
+    };
+    let Some(transcode_audio) = plex_remux_audio_mode(protocol, query) else {
+        warn!(
+            protocol,
+            reason = "unsupported_conversion",
+            "Plex remux request rejected"
+        );
+        return plex_remux_unavailable(protocol);
+    };
+    let Some(media) = plex_playback_media_from_query(state, query) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let path = media.path;
+    prune_plex_remux_sessions(state);
+    let existing_session = {
+        let Ok(mut sessions) = state.plex_remux_sessions.lock() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        sessions.iter_mut().find_map(|(session_id, session)| {
+            if session.source_path == path
+                && session.protocol == protocol
+                && session.transcode_audio == transcode_audio
+                && session.transcode_video == transcode_video
+                && session.offset_seconds == offset_seconds
+                && !session.playback.has_failed()
+            {
+                session.expires_at = Instant::now() + PLEX_REMUX_SESSION_TTL;
+                Some((session_id.clone(), Arc::clone(&session.playback)))
+            } else {
+                None
+            }
+        })
+    };
+    if let Some((session_id, playback)) = existing_session {
+        let manifest = if protocol == "hls" {
+            playback.hls_manifest(&session_id)
+        } else {
+            playback.dash_manifest(&session_id)
+        };
+        return plex_protocol_response(
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, content_type)],
+                manifest,
+            )
+                .into_response(),
+        );
+    }
+    let preparation_path = path.clone();
+    let playback = match tokio::task::spawn_blocking(move || {
+        plex_remux::RemuxedPlayback::prepare(
+            &preparation_path,
+            transcode_audio,
+            transcode_video,
+            protocol == "dash",
+            offset_seconds,
+        )
+    })
+    .await
+    {
+        Ok(Ok(playback)) => Arc::new(playback),
+        Ok(Err(reason)) => {
+            warn!(%reason, protocol, "Plex playback cannot be prepared");
+            return plex_remux_unavailable(protocol);
+        }
+        Err(error) => {
+            warn!(%error, protocol, "Plex playback preparation task failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let session_id = plex_async_identifier();
+    let manifest = if protocol == "hls" {
+        playback.hls_manifest(&session_id)
+    } else {
+        playback.dash_manifest(&session_id)
+    };
+    prune_plex_remux_sessions(state);
+    let Ok(mut sessions) = state.plex_remux_sessions.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    sessions.insert(
+        session_id,
+        PlexRemuxSession {
+            playback: Arc::clone(&playback),
+            source_path: path.clone(),
+            protocol: protocol.to_owned(),
+            transcode_audio,
+            transcode_video,
+            offset_seconds,
+            expires_at: Instant::now() + PLEX_REMUX_SESSION_TTL,
+        },
+    );
+    drop(sessions);
+
+    let worker_playback = Arc::clone(&playback);
+    let limiter = Arc::clone(
+        PLEX_REMUX_BUILD_LIMITER.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1))),
+    );
+    let worker = tokio::spawn(async move {
+        let Ok(permit) = limiter.acquire_owned().await else {
+            return;
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            worker_playback.build(&path)
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(reason)) => warn!(%reason, protocol, "Plex background remux failed"),
+            Err(error) => warn!(%error, protocol, "Plex background remux task failed"),
+        }
+    });
+    drop(worker);
+    plex_protocol_response(
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, content_type)],
+            manifest,
+        )
+            .into_response(),
+    )
+}
+
+fn plex_remux_audio_mode(protocol: &str, query: &BTreeMap<String, String>) -> Option<bool> {
+    match query.get("directStreamAudio").map(String::as_str) {
+        Some("0") => Some(true),
+        Some("1") => Some(false),
+        None if protocol == "hls"
+            && query.get("directPlay").map(String::as_str) == Some("0")
+            && query.get("directStream").map(String::as_str) == Some("0") =>
+        {
+            Some(false)
+        }
+        None if protocol == "dash"
+            && query.get("directPlay").map(String::as_str) == Some("0")
+            && matches!(query.get("directStream").map(String::as_str), Some("0" | "1")) =>
+        {
+            Some(true)
+        }
+        _ => None,
+    }
+}
+
+fn plex_remux_unavailable(protocol: &str) -> Response {
+    let message = if protocol == "dash" {
+        "DASH transcoding is not supported."
+    } else {
+        "HLS playback is not supported."
+    };
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        message,
+    )
+        .into_response()
+}
+
+async fn plex_remux_resource(
+    state: &AppState,
+    resource: &str,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    let Some((session_id, name)) = resource.split_once('/') else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let playback = {
+        let Ok(mut sessions) = state.plex_remux_sessions.lock() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        let now = Instant::now();
+        sessions.retain(|_, session| session.expires_at > now);
+        let Some(session) = sessions.get_mut(session_id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        session.expires_at = now + PLEX_REMUX_SESSION_TTL;
+        Arc::clone(&session.playback)
+    };
+    if playback.resource(name).is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let path = match playback.wait_resource(name).await {
+        Ok(path) => path,
+        Err(reason) => {
+            warn!(%reason, session_id, resource = name, "Plex playback resource not ready");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let Ok(metadata) = tokio::fs::metadata(&path).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let media = Media {
+        id: session_id.to_owned(),
+        title: "Plex playback segment".to_owned(),
+        path,
+        size: metadata.len(),
+        container: "mp4".to_owned(),
+        mime: "video/mp4".to_owned(),
+        metadata_revision: 0,
+    };
+    plex_protocol_response(stream_file(&media, method, headers, false).await)
+}
+
+fn prune_plex_remux_sessions(state: &AppState) {
+    if let Ok(mut sessions) = state.plex_remux_sessions.lock() {
+        let now = Instant::now();
+        sessions.retain(|_, session| session.expires_at > now);
+    }
 }
 
 fn plex_progress_path(state: &AppState, media_id: &str) -> Option<String> {
@@ -16718,6 +16984,42 @@ async fn plex_playback_decision(
     }
 
     let protocol = query.get("protocol").map(String::as_str).unwrap_or("http");
+    let direct_stream = query.get("directStream").map(String::as_str);
+    let audio_copy_disabled = query.get("directStreamAudio").map(String::as_str) == Some("0");
+    let transcode_audio = audio_copy_disabled
+        || (protocol == "dash" && query.get("directStreamAudio").is_none());
+    if direct_stream == Some("0")
+        && matches!(protocol, "hls" | "dash")
+        && plex_can_transcode_video(&video)
+        && (!transcode_audio || plex_can_transcode_audio(&video))
+    {
+        plex_mark_video_transcode_decision(&mut video, protocol, transcode_audio);
+        info!(media_id, section, protocol, "Plex video conversion decision returned");
+        return plex_json(plex_audio_transcode_decision_response(
+            video,
+            section,
+            &library,
+            &library_uuid,
+        ));
+    }
+    if direct_stream == Some("1")
+        && audio_copy_disabled
+        && matches!(protocol, "hls" | "dash")
+        && plex_can_transcode_audio(&video)
+    {
+        plex_mark_audio_transcode_decision(&mut video, protocol);
+        info!(
+            media_id,
+            section, protocol, "Plex audio conversion decision returned"
+        );
+        return plex_json(plex_audio_transcode_decision_response(
+            video,
+            section,
+            &library,
+            &library_uuid,
+        ));
+    }
+
     warn!(
         media_id,
         section,
@@ -16745,6 +17047,175 @@ fn plex_direct_play_decision_response(
     container["transcodeDecisionText"] = serde_json::json!("Direct play OK.");
     container["Metadata"] = serde_json::json!([video]);
     serde_json::json!({"MediaContainer": container})
+}
+
+fn plex_can_transcode_audio(video: &serde_json::Value) -> bool {
+    let Some(streams) = video
+        .pointer("/Media/0/Part/0/Stream")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    let has_hevc_video = streams.iter().any(|stream| {
+        stream.get("streamType").and_then(serde_json::Value::as_i64) == Some(1)
+            && stream.get("codec").and_then(serde_json::Value::as_str) == Some("hevc")
+    });
+    let has_selected_eac3_audio = streams.iter().any(|stream| {
+        stream.get("streamType").and_then(serde_json::Value::as_i64) == Some(2)
+            && stream.get("codec").and_then(serde_json::Value::as_str) == Some("eac3")
+            && stream.get("selected").and_then(serde_json::Value::as_bool) == Some(true)
+    });
+    let has_selected_subtitle = streams.iter().any(|stream| {
+        stream.get("streamType").and_then(serde_json::Value::as_i64) == Some(3)
+            && stream.get("selected").and_then(serde_json::Value::as_bool) == Some(true)
+    });
+    has_hevc_video && has_selected_eac3_audio && !has_selected_subtitle
+}
+
+
+fn plex_can_transcode_video(video: &serde_json::Value) -> bool {
+    let Some(streams) = video
+        .pointer("/Media/0/Part/0/Stream")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    let has_hevc_video = streams.iter().any(|stream| {
+        stream.get("streamType").and_then(serde_json::Value::as_i64) == Some(1)
+            && stream.get("codec").and_then(serde_json::Value::as_str) == Some("hevc")
+    });
+    let unsupported_selected_audio = streams.iter().any(|stream| {
+        stream.get("streamType").and_then(serde_json::Value::as_i64) == Some(2)
+            && stream.get("selected").and_then(serde_json::Value::as_bool) == Some(true)
+            && stream.get("codec").and_then(serde_json::Value::as_str) != Some("eac3")
+    });
+    let has_selected_subtitle = streams.iter().any(|stream| {
+        stream.get("streamType").and_then(serde_json::Value::as_i64) == Some(3)
+            && stream.get("selected").and_then(serde_json::Value::as_bool) == Some(true)
+    });
+    has_hevc_video && !unsupported_selected_audio && !has_selected_subtitle
+}
+
+fn plex_mark_audio_transcode_decision(video: &mut serde_json::Value, protocol: &str) {
+    let Some(media) = video
+        .get_mut("Media")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|media| media.first_mut())
+    else {
+        return;
+    };
+    media["decision"] = serde_json::json!("transcode");
+    media["selected"] = serde_json::json!(true);
+    media["protocol"] = serde_json::json!(protocol);
+    media["container"] = serde_json::json!("mp4");
+    media["audioCodec"] = serde_json::json!("aac");
+    media["audioChannels"] = serde_json::json!(2);
+    let Some(part) = media
+        .get_mut("Part")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|parts| parts.first_mut())
+    else {
+        return;
+    };
+    part["decision"] = serde_json::json!("transcode");
+    part["protocol"] = serde_json::json!(protocol);
+    part["container"] = serde_json::json!("mp4");
+    if let Some(streams) = part
+        .get_mut("Stream")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for stream in streams {
+            match stream.get("streamType").and_then(serde_json::Value::as_i64) {
+                Some(1) => stream["decision"] = serde_json::json!("copy"),
+                Some(2)
+                    if stream.get("selected").and_then(serde_json::Value::as_bool)
+                        == Some(true) =>
+                {
+                    stream["decision"] = serde_json::json!("transcode");
+                    stream["codec"] = serde_json::json!("aac");
+                    stream["channels"] = serde_json::json!(2);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+
+fn plex_mark_video_transcode_decision(
+    video: &mut serde_json::Value,
+    protocol: &str,
+    transcode_audio: bool,
+) {
+    let Some(media) = video
+        .get_mut("Media")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|media| media.first_mut())
+    else {
+        return;
+    };
+    media["decision"] = serde_json::json!("transcode");
+    media["selected"] = serde_json::json!(true);
+    media["protocol"] = serde_json::json!(protocol);
+    media["container"] = serde_json::json!("mp4");
+    media["videoCodec"] = serde_json::json!("h264");
+    if transcode_audio {
+        media["audioCodec"] = serde_json::json!("aac");
+        media["audioChannels"] = serde_json::json!(2);
+    }
+    let Some(part) = media
+        .get_mut("Part")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|parts| parts.first_mut())
+    else {
+        return;
+    };
+    part["decision"] = serde_json::json!("transcode");
+    part["protocol"] = serde_json::json!(protocol);
+    part["container"] = serde_json::json!("mp4");
+    if let Some(streams) = part
+        .get_mut("Stream")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for stream in streams {
+            match stream.get("streamType").and_then(serde_json::Value::as_i64) {
+                Some(1) => {
+                    stream["decision"] = serde_json::json!("transcode");
+                    stream["codec"] = serde_json::json!("h264");
+                }
+                Some(2)
+                    if stream.get("selected").and_then(serde_json::Value::as_bool)
+                        == Some(true) && transcode_audio =>
+                {
+                    stream["decision"] = serde_json::json!("transcode");
+                    stream["codec"] = serde_json::json!("aac");
+                    stream["channels"] = serde_json::json!(2);
+                }
+                Some(2) if stream.get("selected").and_then(serde_json::Value::as_bool)
+                    == Some(true) => stream["decision"] = serde_json::json!("copy"),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn plex_audio_transcode_decision_response(
+    video: serde_json::Value,
+    section: usize,
+    library: &ConfigLibrary,
+    library_uuid: &str,
+) -> serde_json::Value {
+    let mut response = plex_direct_play_decision_response(video, section, library, library_uuid);
+    let container = &mut response["MediaContainer"];
+    container["directPlayDecisionCode"] = serde_json::json!(3000);
+    container["directPlayDecisionText"] = serde_json::json!("Direct play not available.");
+    container["generalDecisionCode"] = serde_json::json!(1001);
+    container["generalDecisionText"] =
+        serde_json::json!("Direct play not available; Conversion OK.");
+    container["transcodeDecisionCode"] = serde_json::json!(1001);
+    container["transcodeDecisionText"] =
+        serde_json::json!("Direct play not available; Conversion OK.");
+    response
 }
 
 fn plex_mark_direct_play_decision(container: &mut serde_json::Value) {
