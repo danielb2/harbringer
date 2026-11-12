@@ -132,6 +132,8 @@ fn fixture() -> Fixture {
         libraries: vec![library],
         metadata_storage: "sidecar".to_owned(),
         tmdb_bearer_token: None,
+        subtitle_language_primary: "en".to_owned(),
+        subtitle_language_secondary: "vi".to_owned(),
         plex_account_preferences: BTreeMap::new(),
     };
     sync_config_libraries(&db, &config).unwrap();
@@ -153,6 +155,7 @@ fn fixture() -> Fixture {
     let (plex_notifications, _) = tokio::sync::broadcast::channel(64);
     let state = AppState {
         config: shared_config.clone(),
+        translated_subtitles_dir: Arc::new(config_dir.join("translated_subtitles")),
         config_path: Arc::new(config_path),
         db: shared_db.clone(),
         server_name: Arc::new(super::RwLock::new("harbringer".to_owned())),
@@ -237,6 +240,8 @@ fn tv_fixture() -> Fixture {
         }],
         metadata_storage: "sidecar".to_owned(),
         tmdb_bearer_token: None,
+        subtitle_language_primary: "en".to_owned(),
+        subtitle_language_secondary: "vi".to_owned(),
         plex_account_preferences: BTreeMap::new(),
     };
     sync_config_libraries(&db, &config).unwrap();
@@ -247,6 +252,7 @@ fn tv_fixture() -> Fixture {
     let (plex_notifications, _) = tokio::sync::broadcast::channel(64);
     let state = AppState {
         config: shared_config.clone(),
+        translated_subtitles_dir: Arc::new(config_dir.join("translated_subtitles")),
         config_path: Arc::new(config_path),
         db: shared_db.clone(),
         server_name: Arc::new(super::RwLock::new("harbringer".to_owned())),
@@ -2232,9 +2238,11 @@ async fn web_and_plex_clients_share_subtitle_selection() {
     )
     .unwrap();
     assert!(web_player.contains(&format!(
-        "data-stream-id=\"{}\" selected",
+        "data-stream-id=\"{}\" data-bilingual=\"false\" selected",
         fixture.subtitle_id
     )));
+    assert!(web_player.contains("Translate while playing"));
+    assert!(web_player.contains("Prepare subtitle"));
 
     let plex_selection = send(
         &fixture.app,
@@ -2261,6 +2269,210 @@ async fn web_and_plex_clients_share_subtitle_selection() {
     )
     .unwrap();
     assert_eq!(web_selection["streamId"], fixture.subtitle_id);
+}
+
+#[tokio::test]
+async fn built_in_player_lists_embedded_text_subtitle_tracks() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    fixture.state.media_info.lock().unwrap().insert(media.id.clone(), serde_json::json!({
+        "media":{"track":[
+            {"@type":"Video","StreamOrder":"0","Format":"AVC"},
+            {"@type":"Audio","StreamOrder":"1","Format":"AAC","Language":"eng"},
+            {"@type":"Text","StreamOrder":"2","Format":"UTF-8","Language":"eng","Title":"English"}
+        ]}
+    }));
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&play=Demo.mkv",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("Embedded: English"));
+    assert!(page.contains("stream=3"));
+}
+
+#[tokio::test]
+async fn translation_settings_do_not_require_credentials() {
+    let fixture = fixture();
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/settings/translation",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("No API key is required"));
+    assert!(!page.contains("google_translate_api_key"));
+}
+
+#[tokio::test]
+async fn bilingual_sidecar_is_recognized_and_reused_without_translation() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let sidecar_path = fixture.root.join("media/Demo.en-vi.srt");
+    std::fs::write(
+        &sidecar_path,
+        "1\n00:00:01,000 --> 00:00:02,000\nHello\nXin chào\n",
+    )
+    .unwrap();
+
+    let translated = super::translate_subtitle_cached(
+        &fixture.state,
+        &media,
+        "ignored source contents",
+        "en",
+        "srt",
+        "en",
+        "vi",
+    )
+    .await
+    .unwrap();
+    assert!(translated.contains("Hello\nXin chào"));
+
+    let metadata = send(
+        &fixture.app,
+        Method::GET,
+        "/library/metadata/1-1",
+        Body::empty(),
+    )
+    .await;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let streams = metadata["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["Stream"]
+        .as_array()
+        .unwrap();
+    assert!(streams.iter().any(|stream| {
+        stream["title"] == "English + Vietnamese (Bilingual SRT External)"
+            && stream["external"] == true
+    }));
+    let generated_id = super::plex_translated_subtitle_id(&media, "en", "vi");
+    assert!(!streams.iter().any(|stream| stream["id"] == generated_id));
+
+    let player = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&play=Demo.mkv",
+        Body::empty(),
+    )
+    .await;
+    let page = String::from_utf8(
+        to_bytes(player.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("data-bilingual=\"true\""));
+    assert!(page.contains("Bilingual SRT External"));
+}
+
+#[tokio::test]
+async fn completed_bilingual_track_is_written_as_a_named_srt_sidecar() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let sidecar = super::bilingual_subtitle_path(&media, "en", "vi");
+    super::save_bilingual_sidecar(
+        &sidecar,
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n",
+    )
+    .await
+    .unwrap();
+    assert_eq!(sidecar.file_name().unwrap(), "Demo.en-vi.srt");
+    let contents = std::fs::read_to_string(sidecar).unwrap();
+    assert!(contents.starts_with("1\n00:00:01,000 --> 00:00:02,000"));
+    assert!(contents.contains("Hello\nXin chào"));
+}
+
+#[tokio::test]
+async fn embedded_text_subtitle_can_be_selected_as_translation_source() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    fixture.state.media_info.lock().unwrap().insert(
+        media.id.clone(),
+        serde_json::json!({
+            "media":{"track":[{"@type":"Text","StreamOrder":"2","Format":"UTF-8","Language":"eng"}]}
+        }),
+    );
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/web/translated-subtitle")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path":"Demo.mkv", "library":0, "stream_id":3,
+                        "first_language":"en", "second_language":"vi"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let message = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(message.contains("Embedded subtitles could not be read"));
+}
+
+#[tokio::test]
+async fn plex_metadata_and_selection_expose_configured_bilingual_track() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let translated_id = super::plex_translated_subtitle_id(&media, "en", "vi");
+    let metadata = send(
+        &fixture.app,
+        Method::GET,
+        "/library/metadata/1-1",
+        Body::empty(),
+    )
+    .await;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(
+        metadata["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["Stream"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|stream| stream["id"] == translated_id && stream["external"] == true)
+    );
+    let selection = send(
+        &fixture.app,
+        Method::PUT,
+        &format!(
+            "/library/parts/{}?subtitleStreamID={translated_id}",
+            fixture.part_id
+        ),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(selection.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -3326,7 +3538,10 @@ async fn plex_android_audio_conversion_decision_selects_aac() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(decision["MediaContainer"]["generalDecisionCode"], 1001);
     assert_eq!(decision["MediaContainer"]["transcodeDecisionCode"], 1001);
-    assert_eq!(decision["MediaContainer"]["Metadata"][0]["Media"][0]["container"], "mp4");
+    assert_eq!(
+        decision["MediaContainer"]["Metadata"][0]["Media"][0]["container"],
+        "mp4"
+    );
     let part = &decision["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0];
     assert_eq!(part["decision"], "transcode");
     assert_eq!(part["Stream"][0]["codec"], "hevc");
@@ -3342,16 +3557,15 @@ async fn plex_android_audio_conversion_decision_selects_aac() {
     .await;
     assert_eq!(mkv_response.status(), StatusCode::OK);
     let mkv_decision: serde_json::Value = serde_json::from_slice(
-        &to_bytes(mkv_response.into_body(), usize::MAX).await.unwrap(),
+        &to_bytes(mkv_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
     )
     .unwrap();
     let mkv_media = &mkv_decision["MediaContainer"]["Metadata"][0]["Media"][0];
     assert_eq!(mkv_media["container"], "mkv");
     assert_eq!(mkv_media["Part"][0]["container"], "mkv");
 }
-
-
-
 
 #[tokio::test]
 async fn plex_web_dash_video_conversion_decision_selects_h264_and_aac() {
@@ -4762,7 +4976,19 @@ async fn plex_desktop_bootstrap_endpoints_return_compatible_containers() {
     assert_eq!(history["MediaContainer"]["offset"], 0);
     assert_eq!(history["MediaContainer"]["Metadata"], serde_json::json!([]));
 
-    let accounts = send(&fixture.app, Method::GET, "/accounts", Body::empty()).await;
+    let accounts = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/accounts")
+                .header(header::ACCEPT, "application/json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(accounts.status(), StatusCode::OK);
     let accounts: serde_json::Value =
         serde_json::from_slice(&to_bytes(accounts.into_body(), usize::MAX).await.unwrap()).unwrap();

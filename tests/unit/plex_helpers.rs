@@ -1,16 +1,16 @@
 use super::{
-    apply_plex_technical_metadata, ass_to_vtt, clean_relative_path, contains_hidden_component,
-    external_subtitle_content, external_subtitle_language_token, extract_xml_token, html,
-    next_tv_episode_paths, ordered_continue_paths, parse_range, parse_sidecar_metadata,
-    parse_tv_episode_marker, parse_tv_season_directory, plex_children_json, plex_codec,
-    plex_connectivity_url, plex_device_announce_query, plex_device_announce_url,
-    plex_direct_play_decision_response, plex_empty_extras_response, plex_external_subtitle_id,
-    plex_genre_tokens, plex_hub_categories, plex_language, plex_library_children_container,
-    plex_library_media_container, plex_library_provider_features, plex_mark_direct_play,
-    plex_media_id, plex_paged_children, plex_part_id, plex_photo_source, plex_play_queue_response,
-    plex_play_queue_source_uri, plex_presence_url, plex_publish_urls, plex_query_media_id,
-    plex_queue_item_without_playback_decision, plex_ranked_tv_shows, plex_rating_key,
-    plex_rating_key_from_source, plex_request_token, plex_safe_numeric_id,
+    apply_plex_technical_metadata, ass_to_vtt, contains_hidden_component,
+    external_subtitle_content, external_subtitle_label, external_subtitle_language_token,
+    external_subtitle_pair, extract_xml_token, html, next_tv_episode_paths, ordered_continue_paths,
+    parse_range, parse_sidecar_metadata, parse_tv_episode_marker, parse_tv_season_directory,
+    plex_children_json, plex_codec, plex_connectivity_url, plex_device_announce_query,
+    plex_device_announce_url, plex_direct_play_decision_response, plex_empty_extras_response,
+    plex_external_subtitle_id, plex_genre_tokens, plex_hub_categories, plex_language,
+    plex_library_children_container, plex_library_media_container, plex_library_provider_features,
+    plex_mark_direct_play, plex_media_id, plex_paged_children, plex_part_id, plex_photo_source,
+    plex_play_queue_response, plex_play_queue_source_uri, plex_presence_url, plex_publish_urls,
+    plex_query_media_id, plex_queue_item_without_playback_decision, plex_ranked_tv_shows,
+    plex_rating_key, plex_rating_key_from_source, plex_request_token, plex_safe_numeric_id,
     plex_scrobble_threshold_reached, plex_search_hubs, plex_search_rank,
     plex_search_result_entries, plex_search_type_matches, plex_stream_id,
     plex_stream_id_and_format, plex_track_label, plex_tv_episode_parents, plex_tv_season_groups,
@@ -35,6 +35,20 @@ fn plex_request_token_reads_header_or_query_parameter() {
     let mut headers = HeaderMap::new();
     headers.insert("X-Plex-Token", HeaderValue::from_static("header-token"));
     assert_eq!(plex_request_token(&headers, &uri), Some("header-token"));
+}
+
+#[test]
+fn bilingual_sidecar_filename_identifies_both_languages() {
+    let video = PathBuf::from("/media/Movie.mkv");
+    let subtitle = PathBuf::from("/media/Movie.en-vi.srt");
+    assert_eq!(
+        external_subtitle_pair(&video, &subtitle),
+        Some(("en".to_owned(), "vi".to_owned()))
+    );
+    assert_eq!(
+        external_subtitle_label(&video, &subtitle),
+        "English + Vietnamese (Bilingual SRT External)"
+    );
 }
 #[test]
 fn plex_playback_ids_resolve_rating_keys_and_metadata_paths() {
@@ -148,7 +162,16 @@ fn plex_media_advertises_playable_part_audio_video_and_external_subtitle() {
     ]}});
     let subtitle = PathBuf::from("/media/Film.rum.srt");
     let mut item = plex_video_json(&media, 1, &library, None);
-    apply_plex_technical_metadata(&mut item, &media, &info, &[subtitle], None);
+    apply_plex_technical_metadata(
+        &mut item,
+        &media,
+        &info,
+        &[subtitle],
+        None,
+        "en",
+        "vi",
+        false,
+    );
 
     assert_eq!(item["duration"], 120_500);
     assert!(item.get("id").is_none());
@@ -212,6 +235,9 @@ fn plex_media_advertises_playable_part_audio_video_and_external_subtitle() {
             audio_stream_id: Some(2),
             subtitle_stream_id: Some(subtitle_id),
         }),
+        "en",
+        "vi",
+        false,
     );
     let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
     assert_eq!(streams[1]["selected"], true);
@@ -237,6 +263,105 @@ fn plex_media_advertises_playable_part_audio_video_and_external_subtitle() {
         decision_container["Metadata"][0]["Media"][0]["Part"][0]["decision"],
         "directplay"
     );
+}
+
+#[test]
+fn plex_metadata_can_advertise_one_generated_bilingual_track() {
+    let media = Media {
+        id: "translation-test".to_owned(),
+        title: "Film".to_owned(),
+        path: PathBuf::from("/media/Film.mkv"),
+        size: 1,
+        container: "mkv".to_owned(),
+        mime: "video/x-matroska".to_owned(),
+        metadata_revision: 0,
+    };
+    let library = ConfigLibrary {
+        name: "Movies".to_owned(),
+        kind: "movie".to_owned(),
+        folders: vec![PathBuf::from("/media")],
+        show_recently_added: true,
+        show_continue_watching: true,
+        scan_enabled: true,
+        scan_interval_value: 5,
+        scan_interval_unit: "minutes".to_owned(),
+        plex_agent: None,
+        plex_scanner: None,
+        plex_language: None,
+        metadata_agent_provider_group_id: None,
+        plex_preferences: None,
+    };
+    let subtitle = PathBuf::from("/media/Film.en.srt");
+    let info = serde_json::json!({"media":{"track":[]}});
+    let mut item = plex_video_json(&media, 1, &library, None);
+    apply_plex_technical_metadata(
+        &mut item,
+        &media,
+        &info,
+        &[subtitle],
+        None,
+        "en",
+        "vi",
+        true,
+    );
+    let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
+    let generated = streams
+        .iter()
+        .find(|stream| {
+            stream["title"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Bilingual")
+        })
+        .unwrap();
+    assert_eq!(generated["languageTag"], "en");
+    assert!(generated["key"].as_str().unwrap().ends_with(".vtt"));
+    assert_eq!(generated["external"], true);
+}
+
+#[test]
+fn plex_metadata_advertises_translation_for_embedded_text_subtitles() {
+    let media = Media {
+        id: "embedded-translation-test".to_owned(),
+        title: "Film".to_owned(),
+        path: PathBuf::from("/media/Film.mkv"),
+        size: 1,
+        container: "mkv".to_owned(),
+        mime: "video/x-matroska".to_owned(),
+        metadata_revision: 0,
+    };
+    let library = ConfigLibrary {
+        name: "Movies".to_owned(),
+        kind: "movie".to_owned(),
+        folders: vec![PathBuf::from("/media")],
+        show_recently_added: true,
+        show_continue_watching: true,
+        scan_enabled: true,
+        scan_interval_value: 5,
+        scan_interval_unit: "minutes".to_owned(),
+        plex_agent: None,
+        plex_scanner: None,
+        plex_language: None,
+        metadata_agent_provider_group_id: None,
+        plex_preferences: None,
+    };
+    let info = serde_json::json!({"media":{"track":[
+        {"@type":"Text","StreamOrder":"2","Format":"UTF-8","Language":"eng","Title":"English"}
+    ]}});
+    let mut item = plex_video_json(&media, 1, &library, None);
+    apply_plex_technical_metadata(&mut item, &media, &info, &[], None, "en", "vi", true);
+    let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
+    let generated = streams
+        .iter()
+        .find(|stream| {
+            stream["title"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Bilingual")
+        })
+        .unwrap();
+    assert_eq!(generated["languageTag"], "en");
+    assert!(generated["key"].as_str().unwrap().ends_with(".vtt"));
 }
 
 #[test]
@@ -272,7 +397,7 @@ fn plex_media_infers_average_bitrate_when_media_info_omits_it() {
     ]}});
     let mut item = plex_video_json(&media, 1, &library, None);
 
-    apply_plex_technical_metadata(&mut item, &media, &info, &[], None);
+    apply_plex_technical_metadata(&mut item, &media, &info, &[], None, "en", "vi", false);
 
     assert_eq!(item["Media"][0]["bitrate"], 598);
     assert_eq!(item["Media"][0]["Part"][0]["bitrate"], 598);

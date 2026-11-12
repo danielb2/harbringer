@@ -88,6 +88,12 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 
 ## Gap log
 
+### 2026-11-12
+
+- Added bilingual subtitles to the built-in player and Plex stream metadata for external and supported embedded text subtitles. Translation progress checkpoints each completed language per cue, resumes after rate limits, and writes completed pairs beside the video as `<video>.<first>-<second>.srt`; matching sidecars are recognized and served without translation requests.
+- Embedded extraction is limited to text tracks in Matroska files; image-based tracks are not translatable. Generated sidecars require write access to the media directory. `Plex.log`/`output.log` showed Plex Desktop selecting the bilingual stream but Google Translate returning HTTP 429 before this change; live client playback after the fix remains to be verified.
+- Checks: `cargo test` passed all 170 tests, `cargo build` passed, and `git diff --check` passed.
+
 ### 2026-11-05
 
 - Added Docker Compose and `docker run` examples to the README with persistent configuration and a read-only media mount by default; noted that users can remove `:ro` for disposable test media. Validation: `just --list` passed; the examples were not run.
