@@ -214,7 +214,12 @@ fn plex_media_advertises_playable_part_audio_video_and_external_subtitle() {
     assert_eq!(streams[2]["language"], "Romanian");
     assert_eq!(streams[2]["languageCode"], "ron");
     assert_eq!(streams[2]["languageTag"], "ro");
-    assert_eq!(streams[3]["displayTitle"], "Romanian (SRT External)");
+    assert_eq!(streams[2]["displayTitle"], "Romanian");
+    assert_eq!(streams[2]["extendedDisplayTitle"], "UTF-8");
+    assert_eq!(streams[2]["title"], "UTF-8");
+    assert_eq!(streams[3]["displayTitle"], "Romanian");
+    assert_eq!(streams[3]["extendedDisplayTitle"], "SRT External");
+    assert_eq!(streams[3]["title"], "SRT External");
     assert_eq!(streams[3]["language"], "Romanian");
     assert_eq!(streams[3]["languageCode"], "ron");
     assert_eq!(streams[3]["languageTag"], "ro");
@@ -315,6 +320,9 @@ fn plex_metadata_can_advertise_one_generated_bilingual_track() {
         })
         .unwrap();
     assert_eq!(generated["languageTag"], "en");
+    assert_eq!(generated["displayTitle"], "English + Vietnamese");
+    assert_eq!(generated["extendedDisplayTitle"], "Bilingual VTT External");
+    assert_eq!(generated["title"], "Bilingual VTT External");
     assert!(generated["key"].as_str().unwrap().ends_with(".vtt"));
     assert_eq!(generated["external"], true);
 }

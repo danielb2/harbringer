@@ -2360,7 +2360,9 @@ async fn bilingual_sidecar_is_recognized_and_reused_without_translation() {
         .as_array()
         .unwrap();
     assert!(streams.iter().any(|stream| {
-        stream["title"] == "English + Vietnamese (Bilingual SRT External)"
+        stream["displayTitle"] == "English + Vietnamese"
+            && stream["extendedDisplayTitle"] == "Bilingual SRT External"
+            && stream["title"] == "Bilingual SRT External"
             && stream["external"] == true
     }));
     let generated_id = super::plex_translated_subtitle_id(&media, "en", "vi");

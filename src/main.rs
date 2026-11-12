@@ -6017,6 +6017,22 @@ fn apply_plex_technical_metadata(
         let display_title = fallback_audio_language
             .map(|language| plex_track_label_with_fallback(track, stream_type, Some(language)))
             .unwrap_or_else(|| plex_track_label(track, stream_type));
+        let (stream_display_title, stream_extended_display_title) = if stream_type == 3 {
+            let detail = display_title
+                .split_once(" (")
+                .and_then(|(_, detail)| detail.strip_suffix(')'))
+                .unwrap_or(codec_value);
+            (
+                if language_name == "Unknown" {
+                    display_title.as_str()
+                } else {
+                    language_name
+                },
+                detail,
+            )
+        } else {
+            (display_title.as_str(), display_title.as_str())
+        };
         let mut plex_stream = serde_json::json!({
             "id": track_id + 1,
             "streamType": stream_type,
@@ -6026,11 +6042,17 @@ fn apply_plex_technical_metadata(
             "language": if language_code == "und" { "None" } else { language_name },
             "languageCode": plex_language_code_3(language_code),
             "languageTag": language_code,
-            "displayTitle": display_title,
-            "extendedDisplayTitle": display_title,
+            "displayTitle": stream_display_title,
+            "extendedDisplayTitle": stream_extended_display_title,
             "title": technical_text(track, "Title")
                 .map(str::to_owned)
-                .unwrap_or_else(|| display_title.clone()),
+                .unwrap_or_else(|| {
+                    if stream_type == 3 {
+                        stream_extended_display_title.to_owned()
+                    } else {
+                        display_title.clone()
+                    }
+                }),
             "default": technical_text(track, "Default") == Some("Yes"),
             "selected": match stream_type {
                 1 => selected_video == Some(track_id),
@@ -6104,7 +6126,8 @@ fn apply_plex_technical_metadata(
     }
     for subtitle_path in external_subtitles {
         let id = plex_external_subtitle_id(media, &subtitle_path);
-        let label = external_subtitle_label(&media.path, &subtitle_path);
+        let (display_title, extended_display_title) =
+            external_subtitle_titles(&media.path, &subtitle_path);
         plex_streams.push(serde_json::json!({
             "id": id,
             "streamType": 3,
@@ -6114,9 +6137,9 @@ fn apply_plex_technical_metadata(
             "language": external_subtitle_language(&media.path, &subtitle_path).1,
             "languageCode": plex_language_code_3(external_subtitle_language(&media.path, &subtitle_path).0),
             "languageTag": external_subtitle_language(&media.path, &subtitle_path).0,
-            "displayTitle": label,
-            "extendedDisplayTitle": label,
-            "title": label,
+            "displayTitle": display_title,
+            "extendedDisplayTitle": extended_display_title,
+            "title": extended_display_title,
             "external": true,
             "key": format!(
                 "/library/streams/{id}.{}",
@@ -6132,7 +6155,7 @@ fn apply_plex_technical_metadata(
     if translation_available && language_primary != language_secondary {
         let id = plex_translated_subtitle_id(media, language_primary, language_secondary);
         let label = format!(
-            "{} + {} (Bilingual)",
+            "{} + {}",
             plex_language(language_primary).1,
             plex_language(language_secondary).1
         );
@@ -6140,7 +6163,7 @@ fn apply_plex_technical_metadata(
             "id": id, "streamType": 3, "type": 3, "index": -1, "codec": "vtt",
             "language": plex_language(language_primary).1,
             "languageCode": plex_language_code_3(language_primary), "languageTag": language_primary,
-            "displayTitle": label, "extendedDisplayTitle": label, "title": label,
+            "displayTitle": label, "extendedDisplayTitle": "Bilingual VTT External", "title": "Bilingual VTT External",
             "external": true, "key": format!("/library/streams/{id}.vtt"), "default": false,
             "selected": selection.and_then(|selection| selection.subtitle_stream_id).is_some_and(|selected| selected == id),
             "forced": false
@@ -8897,6 +8920,14 @@ fn srt_time(milliseconds: u64) -> String {
 }
 
 fn external_subtitle_label(video: &std::path::Path, subtitle: &std::path::Path) -> String {
+    let (language, detail) = external_subtitle_titles(video, subtitle);
+    format!("{language} ({detail})")
+}
+
+fn external_subtitle_titles(
+    video: &std::path::Path,
+    subtitle: &std::path::Path,
+) -> (String, String) {
     let stem = video
         .file_stem()
         .and_then(|value| value.to_str())
@@ -8911,17 +8942,16 @@ fn external_subtitle_label(video: &std::path::Path, subtitle: &std::path::Path) 
         .unwrap_or_default()
         .to_ascii_uppercase();
     if let Some((first, second)) = external_subtitle_pair(video, subtitle) {
-        return format!(
-            "{} + {} (Bilingual {format} External)",
-            plex_language(&first).1,
-            plex_language(&second).1
+        return (
+            format!("{} + {}", plex_language(&first).1, plex_language(&second).1),
+            format!("Bilingual {format} External"),
         );
     }
     let (_, language) = plex_language(&external_subtitle_language_token(stem, candidate));
     if language == "Unknown" {
-        format!("{format} (External)")
+        (format, "External".to_owned())
     } else {
-        format!("{language} ({format} External)")
+        (language.to_owned(), format!("{format} External"))
     }
 }
 
