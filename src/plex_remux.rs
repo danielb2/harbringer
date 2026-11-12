@@ -74,6 +74,18 @@ struct AudioScan {
     timestamp_scale: u64,
 }
 
+struct SourceAudioTrack {
+    number: u64,
+    codec_id: String,
+    codec_private: Vec<u8>,
+    sample_rate: u32,
+    packet_timescale: u32,
+    channels: u16,
+    codec_delay: Option<u64>,
+    seek_pre_roll: Option<u64>,
+}
+
+
 struct BuiltSegments {
     video: Vec<SegmentInfo>,
     audio: Vec<SegmentInfo>,
@@ -86,6 +98,7 @@ struct VideoScan {
     segment_start_pts: Vec<i64>,
     frame_timings: Vec<VideoFrameTiming>,
     codec: String,
+    codec_id: String,
     width: u16,
     height: u16,
 }
@@ -298,6 +311,7 @@ pub struct RemuxedPlayback {
     audio_segments: Vec<SegmentInfo>,
     progress: Arc<PlaybackProgress>,
     video_codec: String,
+    video_codec_id: String,
     audio_codec: Option<String>,
     width: u16,
     height: u16,
@@ -346,10 +360,13 @@ impl RemuxedPlayback {
             .tempdir()
             .map_err(|error| format!("create playback cache: {error}"))?;
         let scan = Self::scan_video_segments(path)?;
+        if transcode_video && scan.codec_id != "V_MPEGH/ISO/HEVC" {
+            return Err("video transcoding currently requires an HEVC source".to_owned());
+        }
         if scan.segment_durations.is_empty() {
             return Err("media did not contain a complete playback segment".to_owned());
         }
-        let audio_codec = Self::validate_source(path, transcode_audio)?;
+        let audio_codec = Self::validate_source(path, transcode_audio, matroska_hls)?;
         let source_size = fs::metadata(path).map_err(media_error)?.len();
         let source_duration = scan.segment_durations.iter().sum::<f64>();
         if !offset_seconds.is_finite() || offset_seconds < 0.0 || offset_seconds > source_duration {
@@ -466,6 +483,7 @@ impl RemuxedPlayback {
             audio_segments,
             progress: Arc::default(),
             video_codec,
+            video_codec_id: scan.codec_id.clone(),
             audio_codec,
             width: scan.width,
             height: scan.height,
@@ -510,6 +528,7 @@ impl RemuxedPlayback {
             self.directory.path(),
             self.transcode_audio,
             self.video_transcode.as_ref(),
+            &self.video_codec_id,
             &self.video_timings,
             &self.video_segment_start_pts,
             &self.video_segment_start_ticks,
@@ -681,22 +700,55 @@ impl RemuxedPlayback {
             .then(|| self.directory.path().join(format!("segment-{index}.m4s")))
     }
 
-    fn validate_source(path: &Path, transcode_audio: bool) -> Result<Option<String>, String> {
+    fn validate_source(
+        path: &Path,
+        transcode_audio: bool,
+        matroska_hls: bool,
+    ) -> Result<Option<String>, String> {
         let source =
             MatroskaFile::open(File::open(path).map_err(media_error)?).map_err(media_error)?;
-        let audio = source
-            .tracks()
-            .iter()
-            .find(|track| track.track_type() == TrackType::Audio && track.codec_id() == "A_EAC3");
+        let audio = source.tracks().iter().find(|track| {
+            track.track_type() == TrackType::Audio
+                && (track.codec_id() == "A_EAC3"
+                    || (matroska_hls && !transcode_audio && track.codec_id() == "A_OPUS"))
+        });
         if source
             .tracks()
             .iter()
             .any(|track| track.track_type() == TrackType::Audio)
             && audio.is_none()
         {
-            return Err("source audio codec is not supported for remuxing".to_owned());
+            let codecs = source
+                .tracks()
+                .iter()
+                .filter(|track| track.track_type() == TrackType::Audio)
+                .map(|track| track.codec_id())
+                .collect::<Vec<_>>();
+            return Err(format!(
+                "source audio codec is not supported for remuxing; audio CodecIDs: {codecs:?}"
+            ));
         }
         match audio {
+            Some(track) if track.codec_id() == "A_OPUS" => {
+                let settings = track
+                    .audio()
+                    .ok_or_else(|| "Opus track has no audio settings".to_owned())?;
+                let codec_private = track
+                    .codec_private()
+                    .ok_or_else(|| "Opus track has no OpusHead".to_owned())?;
+                let (_, _, codec_delay) = opus_track_config(
+                    codec_private,
+                    settings.sampling_frequency().round() as u32,
+                    u16::try_from(settings.channels().get()).map_err(media_error)?,
+                )?;
+                if track
+                    .codec_delay()
+                    .is_some_and(|delay| delay != codec_delay)
+                {
+                    return Err("Opus CodecDelay does not match OpusHead pre-skip".to_owned());
+                }
+                Ok(Some("opus".to_owned()))
+            }
             Some(track) if transcode_audio => {
                 let sample_rate = track
                     .audio()
@@ -809,28 +861,55 @@ impl RemuxedPlayback {
             .tracks()
             .iter()
             .find(|track| {
-                track.track_type() == TrackType::Video && track.codec_id() == "V_MPEGH/ISO/HEVC"
+                track.track_type() == TrackType::Video
+                    && matches!(track.codec_id(), "V_MPEGH/ISO/HEVC" | "V_MPEG4/ISO/AVC")
             })
-            .ok_or_else(|| "source has no remux-supported HEVC video track".to_owned())?;
+            .ok_or_else(|| {
+                let codecs = source
+                    .tracks()
+                    .iter()
+                    .filter(|track| track.track_type() == TrackType::Video)
+                    .map(|track| track.codec_id())
+                    .collect::<Vec<_>>();
+                format!("source has no remux-supported video track; video CodecIDs: {codecs:?}")
+            })?;
         let video_number = video.track_number().get();
+        let video_codec_id = video.codec_id().to_owned();
         let video_private = video
             .codec_private()
-            .ok_or_else(|| "HEVC track has no decoder configuration".to_owned())?;
-        let hevc_config = HEVCConfigurationBox::parse_body(video_private).map_err(media_error)?;
-        let codec = hevc_config.config.rfc6381();
+            .ok_or_else(|| "video track has no decoder configuration".to_owned())?;
+        let (codec, nal_length_size) = match video_codec_id.as_str() {
+            "V_MPEGH/ISO/HEVC" => {
+                let config =
+                    HEVCConfigurationBox::parse_body(video_private).map_err(media_error)?;
+                let length_size = usize::from(
+                    *video_private
+                        .get(21)
+                        .ok_or_else(|| "HEVC decoder configuration is too short".to_owned())?
+                        & 0x03,
+                ) + 1;
+                (config.config.rfc6381(), length_size)
+            }
+            "V_MPEG4/ISO/AVC" => {
+                if video_private.len() < 5 {
+                    return Err("AVC decoder configuration is too short".to_owned());
+                }
+                AVCConfigurationBox::parse_body(video_private).map_err(media_error)?;
+                let codec = format!(
+                    "avc1.{:02X}{:02X}{:02X}",
+                    video_private[1], video_private[2], video_private[3]
+                );
+                (codec, usize::from(video_private[4] & 0x03) + 1)
+            }
+            _ => unreachable!(),
+        };
         let video_settings = video
             .video()
-            .ok_or_else(|| "HEVC track has no video settings".to_owned())?;
+            .ok_or_else(|| "video track has no video settings".to_owned())?;
         let width = u16::try_from(video_settings.pixel_width().get())
-            .map_err(|_| "HEVC video width is outside the CMAF range".to_owned())?;
+            .map_err(|_| "video width is outside the supported range".to_owned())?;
         let height = u16::try_from(video_settings.pixel_height().get())
-            .map_err(|_| "HEVC video height is outside the CMAF range".to_owned())?;
-        let nal_length_size = usize::from(
-            *video_private
-                .get(21)
-                .ok_or_else(|| "HEVC decoder configuration is too short".to_owned())?
-                & 0x03,
-        ) + 1;
+            .map_err(|_| "video height is outside the supported range".to_owned())?;
         let default_duration = video.default_duration().map(|duration| duration.get());
         let codec_delay = video.codec_delay().unwrap_or(0);
         let target_ticks = (f64::from(VIDEO_TIMESCALE) * SEGMENT_TARGET_SECONDS) as u64;
@@ -851,16 +930,16 @@ impl RemuxedPlayback {
                 .duration
                 .map(|duration| duration.saturating_mul(timestamp_scale))
                 .or(default_duration)
-                .ok_or_else(|| "HEVC track has no frame duration metadata".to_owned())?;
+                .ok_or_else(|| "video track has no frame duration metadata".to_owned())?;
             let pts = ns_to_ticks(
                 frame_timestamp_ns(frame.timestamp, timestamp_scale)?.saturating_sub(codec_delay),
                 VIDEO_TIMESCALE,
             )?;
             let duration = ns_to_duration(duration_ns, VIDEO_TIMESCALE)?;
             frame_timings.push(VideoFrameTiming { pts, duration });
-            let is_sync = frame
-                .is_keyframe
-                .unwrap_or_else(|| is_hevc_sync_sample(&frame.data, nal_length_size));
+            let is_sync = frame.is_keyframe.unwrap_or_else(|| {
+                is_video_sync_sample(&video_codec_id, &frame.data, nal_length_size)
+            });
             if is_sync {
                 if pending_ticks >= target_ticks {
                     if let Some(segment_start) = start {
@@ -885,8 +964,8 @@ impl RemuxedPlayback {
             last_video_end = Some(pts.saturating_add(i64::from(duration)));
         }
 
-        let start = start.ok_or_else(|| "HEVC track has no sync sample".to_owned())?;
-        let end = last_video_end.ok_or_else(|| "HEVC track has no frames".to_owned())?;
+        let start = start.ok_or_else(|| "video track has no sync sample".to_owned())?;
+        let end = last_video_end.ok_or_else(|| "video track has no frames".to_owned())?;
         durations.push(ticks_to_seconds(end.saturating_sub(start), VIDEO_TIMESCALE).max(0.001));
         frame_timings.sort_by_key(|timing| timing.pts);
         Ok(VideoScan {
@@ -895,11 +974,46 @@ impl RemuxedPlayback {
             segment_start_pts,
             frame_timings,
             codec,
+            codec_id: video_codec_id,
             width,
             height,
         })
     }
 }
+
+fn opus_track_config(
+    codec_private: &[u8],
+    fallback_sample_rate: u32,
+    fallback_channels: u16,
+) -> Result<(u32, u16, u64), String> {
+    if codec_private.len() < 19 || !codec_private.starts_with(b"OpusHead") {
+        return Err("invalid OpusHead codec private data".to_owned());
+    }
+    let channels = u16::from(codec_private[9]);
+    if channels == 0 || channels != fallback_channels {
+        return Err("OpusHead channel count does not match track metadata".to_owned());
+    }
+    let mapping_family = codec_private[18];
+    if (mapping_family == 0 && channels > 2)
+        || (mapping_family != 0 && codec_private.len() < 21 + usize::from(channels))
+    {
+        return Err("OpusHead channel mapping is incomplete".to_owned());
+    }
+    let input_sample_rate =
+        u32::from_le_bytes(codec_private[12..16].try_into().map_err(media_error)?);
+    let sample_rate = if input_sample_rate == 0 {
+        fallback_sample_rate
+    } else {
+        input_sample_rate
+    };
+    if sample_rate == 0 {
+        return Err("OpusHead input sample rate is missing".to_owned());
+    }
+    let pre_skip_samples = u16::from_le_bytes([codec_private[10], codec_private[11]]);
+    let codec_delay = u64::from(pre_skip_samples) * 1_000_000_000 / 48_000;
+    Ok((sample_rate, channels, codec_delay))
+}
+
 
 fn scan_audio_timings(path: &Path, transcode_audio: bool) -> Result<Option<AudioScan>, String> {
     let mut source = MatroskaFile::open(File::open(path).map_err(media_error)?).map_err(media_error)?;
@@ -1533,6 +1647,7 @@ fn remux_matroska(
     cache: &Path,
     transcode_audio: bool,
     video_transcode: Option<&VideoTranscodeConfig>,
+    video_codec_id: &str,
     video_timings: &[VideoFrameTiming],
     video_segment_start_pts: &[i64],
     video_segment_start_ticks: &[u64],
@@ -1560,51 +1675,98 @@ fn remux_matroska(
     let video_track = probe
         .tracks()
         .iter()
-        .find(|track| {
-            track.track_type() == TrackType::Video && track.codec_id() == "V_MPEGH/ISO/HEVC"
-        })
-        .ok_or_else(|| "source has no remux-supported HEVC video track".to_owned())?;
-    let audio_track = probe
-        .tracks()
-        .iter()
-        .find(|track| track.track_type() == TrackType::Audio && track.codec_id() == "A_EAC3");
+        .find(|track| track.track_type() == TrackType::Video && track.codec_id() == video_codec_id)
+        .ok_or_else(|| format!("source video track {video_codec_id} is unavailable"))?;
+    let audio_track = probe.tracks().iter().find(|track| {
+        track.track_type() == TrackType::Audio
+            && (track.codec_id() == "A_EAC3"
+                || (matroska_hls && !transcode_audio && track.codec_id() == "A_OPUS"))
+    });
     let has_audio = probe
         .tracks()
         .iter()
         .any(|track| track.track_type() == TrackType::Audio);
     if has_audio && audio_track.is_none() {
-        return Err("source audio codec is not supported for remuxing".to_owned());
+        let codecs = probe
+            .tracks()
+            .iter()
+            .filter(|track| track.track_type() == TrackType::Audio)
+            .map(|track| track.codec_id())
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "source audio codec is not supported for remuxing; audio CodecIDs: {codecs:?}"
+        ));
     }
+    let source_audio = audio_track
+        .map(|track| -> Result<SourceAudioTrack, String> {
+            let audio_settings = track
+                .audio()
+                .ok_or_else(|| "audio track has no audio settings".to_owned())?;
+            let source_sample_rate = audio_settings.sampling_frequency().round() as u32;
+            let source_channels =
+                u16::try_from(audio_settings.channels().get()).map_err(media_error)?;
+            let codec_id = track.codec_id().to_owned();
+            let codec_private = track.codec_private().unwrap_or_default().to_vec();
+            let (sample_rate, packet_timescale, channels, codec_delay, seek_pre_roll) =
+                if codec_id == "A_OPUS" {
+                    let (sample_rate, channels, codec_delay) =
+                        opus_track_config(&codec_private, source_sample_rate, source_channels)?;
+                    if track
+                        .codec_delay()
+                        .is_some_and(|delay| delay != codec_delay)
+                    {
+                        return Err("Opus CodecDelay does not match OpusHead pre-skip".to_owned());
+                    }
+                    (
+                        sample_rate,
+                        48_000,
+                        channels,
+                        Some(codec_delay),
+                        Some(80_000_000),
+                    )
+                } else {
+                    (
+                        source_sample_rate,
+                        source_sample_rate,
+                        source_channels,
+                        track.codec_delay(),
+                        None,
+                    )
+                };
+            Ok(SourceAudioTrack {
+                number: track.track_number().get(),
+                codec_id,
+                codec_private,
+                sample_rate,
+                packet_timescale,
+                channels,
+                codec_delay,
+                seek_pre_roll,
+            })
+        })
+        .transpose()?;
 
     let video_number = video_track.track_number().get();
     let video_private = video_track
         .codec_private()
-        .ok_or_else(|| "HEVC track has no decoder configuration".to_owned())?
+        .ok_or_else(|| "video track has no decoder configuration".to_owned())?
         .to_vec();
-    let nal_length_size = usize::from(
-        *video_private
-            .get(21)
-            .ok_or_else(|| "HEVC decoder configuration is too short".to_owned())?
-            & 0x03,
-    ) + 1;
+    let nal_length_size = video_nal_length_size(video_codec_id, &video_private)?;
     let video_settings = video_track
         .video()
-        .ok_or_else(|| "HEVC track has no video settings".to_owned())?;
+        .ok_or_else(|| "video track has no video settings".to_owned())?;
     let width = u16::try_from(video_settings.pixel_width().get())
-        .map_err(|_| "HEVC video width is outside the CMAF range".to_owned())?;
+        .map_err(|_| "video width is outside the supported range".to_owned())?;
     let height = u16::try_from(video_settings.pixel_height().get())
-        .map_err(|_| "HEVC video height is outside the CMAF range".to_owned())?;
+        .map_err(|_| "video height is outside the supported range".to_owned())?;
     let video_default_duration = video_track
         .default_duration()
         .map(|duration| duration.get());
     let video_codec_delay = video_track.codec_delay().unwrap_or(0);
 
-    let (audio_number, audio_spec, mut audio_transcoder) = if let Some(track) = audio_track {
-        let number = track.track_number().get();
-        let audio_settings = track
-            .audio()
-            .ok_or_else(|| "E-AC-3 track has no audio settings".to_owned())?;
-        let sample_rate = audio_settings.sampling_frequency().round() as u32;
+    let audio_number = source_audio.as_ref().map(|audio| audio.number);
+    let (audio_spec, mut audio_transcoder) = if let Some(audio) = source_audio.as_ref() {
+        let sample_rate = audio.packet_timescale;
         if transcode_audio {
             let asc = rusty_aac::encode::audio_specific_config_bytes(sample_rate, 2);
             let config = transmux::rtp_sdp::aac_config_from_asc_bytes(asc).map_err(media_error)?;
@@ -1614,15 +1776,16 @@ fn remux_matroska(
             } else {
                 None
             };
-            let transcoder = Eac3AacTranscoder::new(sample_rate, initial_pts, !separate_dash_tracks)?;
-            (Some(number), Some(spec), Some(transcoder))
+            let transcoder =
+                Eac3AacTranscoder::new(sample_rate, initial_pts, !separate_dash_tracks)?;
+            (Some(spec), Some(transcoder))
+        } else if matroska_hls {
+            (None, None)
         } else {
-            let channels = u16::try_from(audio_settings.channels().get())
-                .map_err(|_| "E-AC-3 channel count is outside the CMAF range".to_owned())?;
             let mut first_audio = None;
             let mut frame = Frame::default();
             while probe.next_frame(&mut frame).map_err(media_error)? {
-                if frame.track == number {
+                if frame.track == audio.number {
                     first_audio = Some(frame.data.clone());
                     break;
                 }
@@ -1631,7 +1794,7 @@ fn remux_matroska(
                 first_audio.ok_or_else(|| "E-AC-3 track has no samples".to_owned())?;
             let syncframes = Ec3SyncframeInfo::from_es_first_au(&first_audio);
             let config = Ec3SpecificBox::from_syncframes(&syncframes).map_err(media_error)?;
-            let channels = u16::from(config.channel_count()).max(channels);
+            let channels = u16::from(config.channel_count()).max(audio.channels);
             let config = CodecConfig::Eac3 {
                 config,
                 channel_count: channels,
@@ -1639,20 +1802,27 @@ fn remux_matroska(
                 sample_size: 16,
             };
             let spec = TrackSpec::new(TrackId::new(AUDIO_TRACK_ID), sample_rate, config);
-            (Some(number), Some(spec), None)
+            (Some(spec), None)
         }
+    } else if transcode_audio {
+        return Err("audio transcoding was requested for a source with no E-AC-3 track".to_owned());
     } else {
-        if transcode_audio {
-            return Err(
-                "audio transcoding was requested for a source with no E-AC-3 track".to_owned(),
-            );
-        }
-        (None, None, None)
+        (None, None)
     };
 
-    let hevc_config = HEVCConfigurationBox::parse_body(&video_private).map_err(media_error)?;
+    let hevc_config = if video_codec_id == "V_MPEGH/ISO/HEVC" {
+        Some(HEVCConfigurationBox::parse_body(&video_private).map_err(media_error)?)
+    } else {
+        None
+    };
     let mut video_decoder = video_transcode
-        .map(|_| hevc_decoder_from_config(&hevc_config))
+        .map(|_| {
+            hevc_decoder_from_config(
+                hevc_config
+                    .as_ref()
+                    .ok_or_else(|| "video transcoding requires an HEVC source".to_owned())?,
+            )
+        })
         .transpose()?;
     let mut video_encoder = video_transcode
         .map(|config| config.encoder(width, height))
@@ -1660,14 +1830,28 @@ fn remux_matroska(
     let video_config = if let Some(config) = video_transcode {
         config.codec_config(width, height)
     } else {
-        CodecConfig::Hevc {
-            config: hevc_config,
-            width,
-            height,
+        match video_codec_id {
+            "V_MPEGH/ISO/HEVC" => CodecConfig::Hevc {
+                config: hevc_config.ok_or_else(|| "HEVC configuration is missing".to_owned())?,
+                width,
+                height,
+            },
+            "V_MPEG4/ISO/AVC" => CodecConfig::Avc {
+                config: AVCConfigurationBox::parse_body(&video_private).map_err(media_error)?,
+                width,
+                height,
+            },
+            _ => return Err(format!("video codec {video_codec_id} is not supported")),
         }
     };
     let video_spec = TrackSpec::new(TrackId::new(VIDEO_TRACK_ID), VIDEO_TIMESCALE, video_config);
-    let audio_sample_rate = audio_spec.as_ref().map(|spec| spec.timescale);
+    let audio_sample_rate = audio_spec.as_ref().map(|spec| spec.timescale).or_else(|| {
+        if matroska_hls {
+            source_audio.as_ref().map(|audio| audio.packet_timescale)
+        } else {
+            None
+        }
+    });
     if audio_sample_rate_hint.is_some_and(|expected| Some(expected) != audio_sample_rate) {
         return Err("audio sample rate changed between DASH preparation and remux".to_owned());
     }
@@ -1675,25 +1859,49 @@ fn remux_matroska(
     let mut video_segmenter = None;
     let mut audio_segmenter = None;
     if matroska_hls {
-        if separate_dash_tracks || video_transcode.is_some() || !transcode_audio {
-            return Err("Matroska HLS currently requires copied HEVC video and AAC audio conversion".to_owned());
+        if separate_dash_tracks || video_transcode.is_some() {
+            return Err("Matroska HLS requires copied video".to_owned());
         }
-        let sample_rate = audio_sample_rate
-            .ok_or_else(|| "Matroska HLS requires an audio track".to_owned())?;
-        let asc = rusty_aac::encode::audio_specific_config_bytes(sample_rate, 2);
+        let sample_rate =
+            audio_sample_rate.ok_or_else(|| "Matroska HLS requires an audio track".to_owned())?;
+        let asc = if transcode_audio {
+            Some(rusty_aac::encode::audio_specific_config_bytes(
+                sample_rate,
+                2,
+            ))
+        } else {
+            None
+        };
+        let audio = if let Some(asc) = asc.as_ref() {
+            Some(mkv_hls::AudioTrack {
+                codec_id: "A_AAC",
+                codec_private: asc,
+                sample_rate,
+                channels: 2,
+                codec_delay: None,
+                seek_pre_roll: None,
+            })
+        } else {
+            let source = source_audio
+                .as_ref()
+                .ok_or_else(|| "Matroska HLS requires an audio track".to_owned())?;
+            Some(mkv_hls::AudioTrack {
+                codec_id: &source.codec_id,
+                codec_private: &source.codec_private,
+                sample_rate: source.sample_rate,
+                channels: source.channels,
+                codec_delay: source.codec_delay,
+                seek_pre_roll: source.seek_pre_roll,
+            })
+        };
         let header = mkv_hls::initialization_segment(
             mkv_hls::VideoTrack {
-                codec_id: "V_MPEGH/ISO/HEVC",
+                codec_id: video_codec_id,
                 codec_private: &video_private,
                 width,
                 height,
             },
-            Some(mkv_hls::AudioTrack {
-                codec_id: "A_AAC",
-                codec_private: &asc,
-                sample_rate,
-                channels: 2,
-            }),
+            audio,
         )?;
         fs::write(cache.join("init.mkv"), header).map_err(media_error)?;
         on_resource_ready("init.mkv");
@@ -1915,7 +2123,7 @@ fn remux_matroska(
                     .duration
                     .map(|duration| duration.saturating_mul(timestamp_scale))
                     .or(video_default_duration)
-                    .ok_or_else(|| "HEVC track has no frame duration metadata".to_owned())?;
+                    .ok_or_else(|| "video track has no frame duration metadata".to_owned())?;
                 let pts = ns_to_ticks(
                     presentation_ns.saturating_sub(video_codec_delay),
                     VIDEO_TIMESCALE,
@@ -1925,11 +2133,11 @@ fn remux_matroska(
                 let first_dts = *video_first_dts.get_or_insert(dts);
                 let segment_start = video_segment_start.unwrap_or(first_dts);
                 if dts.saturating_sub(segment_start) > MAX_PENDING_VIDEO_TICKS {
-                    return Err("HEVC GOP exceeds the bounded segment window".to_owned());
+                    return Err("video GOP exceeds the bounded segment window".to_owned());
                 }
-                let is_sync = frame
-                    .is_keyframe
-                    .unwrap_or_else(|| is_hevc_sync_sample(&frame.data, nal_length_size));
+                let is_sync = frame.is_keyframe.unwrap_or_else(|| {
+                    is_video_sync_sample(video_codec_id, &frame.data, nal_length_size)
+                });
                 let sample = Sample::new(
                     Bytes::from(frame.data.clone()),
                     Some(dts),
@@ -1986,14 +2194,22 @@ fn remux_matroska(
             let Some(sample_rate) = audio_sample_rate else {
                 continue;
             };
-            let pts = ns_to_ticks(
-                presentation_ns.saturating_sub(audio_codec_delay),
-                sample_rate,
-            )?;
+            let audio_presentation_ns = if matroska_hls && !transcode_audio {
+                presentation_ns
+            } else {
+                presentation_ns.saturating_sub(audio_codec_delay)
+            };
+            let pts = ns_to_ticks(audio_presentation_ns, sample_rate)?;
             if should_seek_source && pts < audio_source_seek_pts {
                 continue;
             }
-            if let Some(transcoder) = audio_transcoder.as_mut() {
+            if matroska_hls && !transcode_audio {
+                let builder = matroska_hls_builder
+                    .as_mut()
+                    .ok_or_else(|| "Matroska HLS segment builder is not available".to_owned())?;
+                builder.push_audio(pts, sample_rate, Bytes::from(frame.data.clone()))?;
+                builder.flush_ready(segment_templates, &mut segments, cache, on_resource_ready)?;
+            } else if let Some(transcoder) = audio_transcoder.as_mut() {
                 for sample in transcoder.push(&frame.data, pts)? {
                     if let Some(builder) = matroska_hls_builder.as_mut() {
                         let sample_pts = sample
@@ -2279,6 +2495,55 @@ fn ns_to_duration(nanoseconds: u64, timescale: u32) -> Result<u32, String> {
 
 fn ticks_to_seconds(ticks: i64, timescale: u32) -> f64 {
     ticks as f64 / f64::from(timescale)
+}
+
+fn video_nal_length_size(codec_id: &str, private: &[u8]) -> Result<usize, String> {
+    let offset = match codec_id {
+        "V_MPEGH/ISO/HEVC" => 21,
+        "V_MPEG4/ISO/AVC" => 4,
+        _ => return Err(format!("video codec {codec_id} is not supported")),
+    };
+    let length_size = private
+        .get(offset)
+        .ok_or_else(|| "video decoder configuration is too short".to_owned())?;
+    Ok(usize::from(*length_size & 0x03) + 1)
+}
+
+fn is_video_sync_sample(codec_id: &str, data: &[u8], length_size: usize) -> bool {
+    match codec_id {
+        "V_MPEGH/ISO/HEVC" => is_hevc_sync_sample(data, length_size),
+        "V_MPEG4/ISO/AVC" => is_avc_sync_sample(data, length_size),
+        _ => false,
+    }
+}
+
+fn is_avc_sync_sample(data: &[u8], length_size: usize) -> bool {
+    if !(1..=4).contains(&length_size) {
+        return false;
+    }
+    let mut offset: usize = 0;
+    while let Some(nal_start) = offset.checked_add(length_size) {
+        if nal_start >= data.len() {
+            return false;
+        }
+        let Some(length_bytes) = data.get(offset..nal_start) else {
+            return false;
+        };
+        let length = length_bytes.iter().fold(0_usize, |value, byte| {
+            value.saturating_mul(256).saturating_add(usize::from(*byte))
+        });
+        let Some(nal_end) = nal_start.checked_add(length) else {
+            return false;
+        };
+        if length == 0 || nal_end > data.len() {
+            return false;
+        }
+        if data[nal_start] & 0x1f == 5 {
+            return true;
+        }
+        offset = nal_end;
+    }
+    false
 }
 
 fn is_hevc_sync_sample(data: &[u8], length_size: usize) -> bool {
@@ -2621,6 +2886,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn avc_sync_samples_detect_idr_nal_units() {
+        let idr = [0, 0, 0, 2, 0x65, 0x88];
+        let inter_frame = [0, 0, 0, 2, 0x41, 0x88];
+        let malformed = [0, 0, 0, 4, 0x65, 0x88];
+
+        assert!(is_video_sync_sample("V_MPEG4/ISO/AVC", &idr, 4));
+        assert!(!is_avc_sync_sample(&inter_frame, 4));
+        assert!(!is_avc_sync_sample(&malformed, 4));
+    }
+
+    #[test]
+    fn avc_nal_length_size_comes_from_decoder_configuration() {
+        assert_eq!(
+            video_nal_length_size("V_MPEG4/ISO/AVC", &[1, 0, 0, 0, 0xff]),
+            Ok(4)
+        );
+    }
+
+
+
+
+    #[test]
+    fn avc_configuration_box_parses_encoder_parameter_sets() {
+        let mut encoder = H264Encoder::new(h264_encoder_config(32, 32, 2, 1_000_000, 24.0))
+            .unwrap();
+        let first = encoder.try_encode(&YuvFrame::black(32, 32)).unwrap();
+        let (sps, pps) = extract_avc_parameter_sets(&first).unwrap();
+        let mut private = vec![1, sps[1], sps[2], sps[3], 0xff, 0xe1];
+        private.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+        private.extend_from_slice(&sps);
+        private.push(1);
+        private.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+        private.extend_from_slice(&pps);
+
+        let config = AVCConfigurationBox::parse_body(&private).unwrap();
+        assert_eq!(config.config.length_size_minus_one, 3);
+    }
+
+
+    #[test]
     fn manifests_reference_each_cached_fmp4_segment() {
         let directory = tempfile::tempdir().unwrap();
         let playback = RemuxedPlayback {
@@ -2631,6 +2936,7 @@ mod tests {
             }],
             progress: Arc::default(),
             video_codec: "hvc1.1.6.L93.B0".to_owned(),
+            video_codec_id: "V_MPEGH/ISO/HEVC".to_owned(),
             audio_codec: Some("mp4a.40.2".to_owned()),
             width: 1280,
             height: 720,
@@ -2698,6 +3004,7 @@ mod tests {
             audio_segments: Vec::new(),
             progress: Arc::default(),
             video_codec: "hvc1.1.6.L93.B0".to_owned(),
+            video_codec_id: "V_MPEGH/ISO/HEVC".to_owned(),
             audio_codec: Some("mp4a.40.2".to_owned()),
             width: 1280,
             height: 720,
@@ -2735,6 +3042,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn opus_audio_is_only_accepted_for_matroska_hls_copy() {
+        let opus_private = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00\x00";
+        assert_eq!(
+            opus_track_config(opus_private, 48_000, 2),
+            Ok((48_000, 2, 6_500_000))
+        );
+
+        let mut source = mkv_hls::initialization_segment(
+            mkv_hls::VideoTrack {
+                codec_id: "V_MPEGH/ISO/HEVC",
+                codec_private: &[0; 22],
+                width: 640,
+                height: 360,
+            },
+            Some(mkv_hls::AudioTrack {
+                codec_id: "A_OPUS",
+                codec_private: opus_private,
+                sample_rate: 48_000,
+                channels: 2,
+                codec_delay: Some(6_500_000),
+                seek_pre_roll: Some(80_000_000),
+            }),
+        )
+        .unwrap();
+        source.extend(
+            mkv_hls::cluster_segment(
+                0,
+                &[
+                    mkv_hls::Block {
+                        track_number: 1,
+                        timestamp_ms: 0,
+                        data: &[0, 0, 0, 2, 0x26, 0x01],
+                        keyframe: true,
+                    },
+                    mkv_hls::Block {
+                        track_number: 2,
+                        timestamp_ms: 0,
+                        data: &[0xf8, 0xff, 0xfe],
+                        keyframe: true,
+                    },
+                ],
+            )
+            .unwrap(),
+        );
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(file.as_file_mut(), &source).unwrap();
+
+        assert_eq!(
+            RemuxedPlayback::validate_source(file.path(), false, true).unwrap(),
+            Some("opus".to_owned())
+        );
+        let error = RemuxedPlayback::validate_source(file.path(), false, false).unwrap_err();
+        assert!(error.contains("A_OPUS"));
+        assert!(RemuxedPlayback::validate_source(file.path(), true, true).is_err());
+    }
 
     #[test]
     fn dash_manifest_uses_separate_audio_and_video_tracks() {
@@ -2763,6 +3126,7 @@ mod tests {
             ],
             progress: Arc::default(),
             video_codec: "avc1.42E029".to_owned(),
+            video_codec_id: "V_MPEG4/ISO/AVC".to_owned(),
             audio_codec: Some("mp4a.40.2".to_owned()),
             width: 1280,
             height: 720,
@@ -2827,6 +3191,7 @@ mod tests {
             }],
             progress: Arc::default(),
             video_codec: "hvc1.1.6.L93.B0".to_owned(),
+            video_codec_id: "V_MPEGH/ISO/HEVC".to_owned(),
             audio_codec: Some("mp4a.40.2".to_owned()),
             width: 1280,
             height: 720,

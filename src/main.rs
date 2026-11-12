@@ -9996,6 +9996,7 @@ async fn log_not_found(State(state): State<AppState>, req: Request<Body>) -> Res
             plex_product = ?query.get("X-Plex-Product"),
             client_profile = ?query.get("X-Plex-Client-Profile-Name"),
             client_platform = ?query.get("X-Plex-Platform"),
+            profile_requests_hls_mkv = plex_profile_requests_hls_mkv(&query),
             "Plex universal stream start requested"
         );
         if extension.eq_ignore_ascii_case("mpd") || extension.eq_ignore_ascii_case("m3u8") {
@@ -10161,10 +10162,8 @@ async fn plex_remux_start(
         return plex_remux_unavailable(protocol);
     }
     let transcode_video = direct_stream == Some("0");
-    let matroska_hls = protocol == "hls"
-        && direct_stream == Some("1")
-        && query.get("directStreamAudio").map(String::as_str) == Some("0")
-        && plex_profile_requests_hls_mkv(&query);
+    let matroska_hls =
+        protocol == "hls" && direct_stream == Some("1") && plex_profile_requests_hls_mkv(&query);
 
     let offset_seconds = match query.get("offset") {
         Some(offset) => match offset.parse::<f64>() {

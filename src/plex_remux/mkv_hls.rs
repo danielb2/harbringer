@@ -17,6 +17,8 @@ pub(super) struct AudioTrack<'a> {
     pub codec_private: &'a [u8],
     pub sample_rate: u32,
     pub channels: u16,
+    pub codec_delay: Option<u64>,
+    pub seek_pre_roll: Option<u64>,
 }
 
 pub(super) struct Block<'a> {
@@ -259,7 +261,15 @@ pub(super) fn initialization_segment(
         uint_element(0x83, 2, &mut audio_entry)?;
         uint_element(0x9c, 0, &mut audio_entry)?;
         string_element(0x86, audio.codec_id, &mut audio_entry)?;
-        element(0x63a2, audio.codec_private, &mut audio_entry)?;
+        if !audio.codec_private.is_empty() {
+            element(0x63a2, audio.codec_private, &mut audio_entry)?;
+        }
+        if let Some(codec_delay) = audio.codec_delay {
+            uint_element(0x56aa, codec_delay, &mut audio_entry)?;
+        }
+        if let Some(seek_pre_roll) = audio.seek_pre_roll {
+            uint_element(0x56bb, seek_pre_roll, &mut audio_entry)?;
+        }
         let mut audio_settings = Vec::new();
         float_element(0xb5, audio.sample_rate as f32, &mut audio_settings)?;
         uint_element(0x9f, u64::from(audio.channels), &mut audio_settings)?;
@@ -353,6 +363,36 @@ mod tests {
 
     #[test]
     fn initialization_and_cluster_are_demuxable() {
+        let avc_private = [1, 0x42, 0, 0x1e, 0xff];
+        let mut avc_init = initialization_segment(
+            VideoTrack {
+                codec_id: "V_MPEG4/ISO/AVC",
+                codec_private: &avc_private,
+                width: 640,
+                height: 360,
+            },
+            None,
+        )
+        .unwrap();
+        avc_init.extend(
+            cluster_segment(
+                0,
+                &[Block {
+                    track_number: 1,
+                    timestamp_ms: 0,
+                    data: &[0, 0, 0, 2, 0x65, 0x88],
+                    keyframe: true,
+                }],
+            )
+            .unwrap(),
+        );
+        let mut avc_file = tempfile::NamedTempFile::new().unwrap();
+        avc_file.write_all(&avc_init).unwrap();
+        let avc = MatroskaFile::open(avc_file.reopen().unwrap()).unwrap();
+        assert_eq!(avc.tracks()[0].codec_id(), "V_MPEG4/ISO/AVC");
+        assert_eq!(avc.tracks()[0].codec_private(), Some(&avc_private[..]));
+
+
         let mut stream = initialization_segment(
             VideoTrack {
                 codec_id: "V_MPEGH/ISO/HEVC",
@@ -365,6 +405,8 @@ mod tests {
                 codec_private: &[0x11, 0x90],
                 sample_rate: 48_000,
                 channels: 2,
+                codec_delay: None,
+                seek_pre_roll: None,
             }),
         )
         .unwrap();
@@ -399,6 +441,60 @@ mod tests {
             track_numbers.push(frame.track);
         }
         assert_eq!(track_numbers, [1, 2]);
+    }
+
+    #[test]
+    fn opus_matroska_track_preserves_codec_delay_and_seek_pre_roll() {
+        let opus_private = b"OpusHead\x01\x02\x38\x01\x80\xbb\x00\x00\x00\x00\x00\x00";
+        let mut stream = initialization_segment(
+            VideoTrack {
+                codec_id: "V_MPEGH/ISO/HEVC",
+                codec_private: &[0; 22],
+                width: 640,
+                height: 360,
+            },
+            Some(AudioTrack {
+                codec_id: "A_OPUS",
+                codec_private: opus_private,
+                sample_rate: 48_000,
+                channels: 2,
+                codec_delay: Some(6_500_000),
+                seek_pre_roll: Some(80_000_000),
+            }),
+        )
+        .unwrap();
+        stream.extend(
+            cluster_segment(
+                0,
+                &[
+                    Block {
+                        track_number: 1,
+                        timestamp_ms: 0,
+                        data: &[0, 0, 0, 2, 0x26, 0x01],
+                        keyframe: true,
+                    },
+                    Block {
+                        track_number: 2,
+                        timestamp_ms: 0,
+                        data: &[0xf8, 0xff, 0xfe],
+                        keyframe: true,
+                    },
+                ],
+            )
+            .unwrap(),
+        );
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&stream).unwrap();
+        let matroska = MatroskaFile::open(file.reopen().unwrap()).unwrap();
+        let audio = matroska
+            .tracks()
+            .iter()
+            .find(|track| track.codec_id() == "A_OPUS")
+            .unwrap();
+        assert_eq!(audio.codec_id(), "A_OPUS");
+        assert_eq!(audio.codec_private(), Some(&opus_private[..]));
+        assert_eq!(audio.codec_delay(), Some(6_500_000));
+        assert!(stream.windows(2).any(|bytes| bytes == [0x56, 0xbb]));
     }
 
     #[test]
