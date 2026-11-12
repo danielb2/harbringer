@@ -49,9 +49,13 @@ rusty_h264-encoder = "=0.16.1"
 
 [profile.dev]
 opt-level = 3
+incremental = false
 
 
 [profile.dev.package.oxideav-aac]
+opt-level = 3
+
+[profile.dev.package.oxideav-core]
 opt-level = 3
 
 [profile.dev.package.oxideav-ac3]

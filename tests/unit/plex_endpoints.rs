@@ -3317,7 +3317,7 @@ async fn plex_android_audio_conversion_decision_selects_aac() {
     let response = send(
         &fixture.app,
         Method::GET,
-        "/video/:/transcode/universal/decision?ratingKey=1-1&protocol=hls&directPlay=0&directStream=1&directStreamAudio=0",
+        "/video/:/transcode/universal/decision?ratingKey=1-1&protocol=hls&directPlay=0&directStream=1&directStreamAudio=0&X-Plex-Platform=Android&X-Plex-Product=Plex%20for%20Android%20(Mobile)",
         Body::empty(),
     )
     .await;
@@ -3326,13 +3326,31 @@ async fn plex_android_audio_conversion_decision_selects_aac() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(decision["MediaContainer"]["generalDecisionCode"], 1001);
     assert_eq!(decision["MediaContainer"]["transcodeDecisionCode"], 1001);
+    assert_eq!(decision["MediaContainer"]["Metadata"][0]["Media"][0]["container"], "mp4");
     let part = &decision["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0];
     assert_eq!(part["decision"], "transcode");
     assert_eq!(part["Stream"][0]["codec"], "hevc");
     assert_eq!(part["Stream"][0]["decision"], "copy");
     assert_eq!(part["Stream"][1]["codec"], "aac");
     assert_eq!(part["Stream"][1]["decision"], "transcode");
+    let mkv_response = send(
+        &fixture.app,
+        Method::GET,
+        "/video/:/transcode/universal/decision?ratingKey=1-1&protocol=hls&directPlay=0&directStream=1&directStreamAudio=0&X-Plex-Client-Profile-Extra=add-transcode-target%28type%3DvideoProfile%26context%3Dall%26protocol%3Dhls%26container%3Dmkv%26videoCodec%3Dh264%2Chevc%26audioCodec%3Daac%2Cac3%29",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(mkv_response.status(), StatusCode::OK);
+    let mkv_decision: serde_json::Value = serde_json::from_slice(
+        &to_bytes(mkv_response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let mkv_media = &mkv_decision["MediaContainer"]["Metadata"][0]["Media"][0];
+    assert_eq!(mkv_media["container"], "mkv");
+    assert_eq!(mkv_media["Part"][0]["container"], "mkv");
 }
+
+
 
 
 #[tokio::test]

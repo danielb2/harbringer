@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
 
@@ -23,12 +23,20 @@ use transmux::{
     TrackId, TrackSpec,
 };
 
+mod mkv_hls;
+
 const VIDEO_TRACK_ID: u32 = 1;
 const AUDIO_TRACK_ID: u32 = 2;
 const VIDEO_TIMESCALE: u32 = 90_000;
 const SEGMENT_TARGET_SECONDS: f64 = 2.0;
+const AAC_FRAME_SAMPLES: usize = 1024;
+const AAC_CHANNELS: usize = 2;
+const AAC_BOUNDED_CHUNK_FRAMES: usize = 94;
+const AAC_BOUNDED_CHUNK_SAMPLES: usize = AAC_FRAME_SAMPLES * AAC_CHANNELS * AAC_BOUNDED_CHUNK_FRAMES;
+
 const MAX_PENDING_VIDEO_TICKS: i64 = VIDEO_TIMESCALE as i64 * 30;
 const BUILD_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_SEGMENTS_AHEAD: usize = 3;
 
 #[derive(Clone)]
 struct SegmentInfo {
@@ -69,6 +77,7 @@ struct AudioScan {
 struct BuiltSegments {
     video: Vec<SegmentInfo>,
     audio: Vec<SegmentInfo>,
+    video_start_segment: usize,
 }
 
 struct VideoScan {
@@ -85,11 +94,16 @@ struct VideoScan {
 struct PlaybackProgressState {
     complete: bool,
     error: Option<String>,
+    requested_video_segment: Option<usize>,
+    requested_audio_segment: Option<usize>,
+    requested_muxed_segment: Option<usize>,
+    first_requested_muxed_segment: Option<usize>,
 }
 
 struct PlaybackProgress {
     state: Mutex<PlaybackProgressState>,
     changed: tokio::sync::Notify,
+    demand_changed: Condvar,
     last_request: Mutex<Instant>,
 }
 
@@ -98,6 +112,7 @@ impl Default for PlaybackProgress {
         Self {
             state: Mutex::default(),
             changed: tokio::sync::Notify::new(),
+            demand_changed: Condvar::new(),
             last_request: Mutex::new(Instant::now()),
         }
     }
@@ -116,6 +131,165 @@ impl PlaybackProgress {
             .map(|last_request| last_request.elapsed() >= timeout)
             .unwrap_or(true)
     }
+
+    fn request_resource(&self, name: &str, separate_dash_tracks: bool) -> Result<(), String> {
+        self.touch();
+        let filename = name.rsplit('/').next().unwrap_or(name);
+        let segment_name = filename.strip_prefix("segment-").unwrap_or(filename);
+        let Some(index) = segment_name
+            .strip_suffix(".m4s")
+            .or_else(|| segment_name.strip_suffix(".mkv"))
+            .and_then(|index| index.parse::<usize>().ok())
+        else {
+            return Ok(());
+        };
+        let requested_segment = if separate_dash_tracks {
+            let track = name
+                .split_once('/')
+                .map(|(track, _)| track)
+                .unwrap_or_default();
+            match track {
+                "0" => 0,
+                "1" => 1,
+                _ => return Ok(()),
+            }
+        } else {
+            2
+        };
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "playback progress lock failed".to_owned())?;
+        let requested = match requested_segment {
+            0 => &mut state.requested_video_segment,
+            1 => &mut state.requested_audio_segment,
+            _ => &mut state.requested_muxed_segment,
+        };
+        *requested = Some((*requested).map_or(index, |previous| previous.max(index)));
+        if requested_segment == 2 {
+            state.first_requested_muxed_segment.get_or_insert(index);
+        }
+        self.demand_changed.notify_all();
+        Ok(())
+    }
+
+    fn wait_for_capacity(
+        &self,
+        video_segments: usize,
+        audio_segments: usize,
+        video_start_segment: usize,
+        audio_start_segment: usize,
+        separate_dash_tracks: bool,
+        has_audio: bool,
+        idle_timeout: Duration,
+        limiter: &Arc<tokio::sync::Semaphore>,
+        permit: &mut Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "playback progress lock failed".to_owned())?;
+        loop {
+            let at_capacity = if separate_dash_tracks {
+                segment_window_is_full(
+                    video_segments,
+                    state.requested_video_segment,
+                    video_start_segment,
+                ) || (has_audio
+                    && segment_window_is_full(
+                        audio_segments,
+                        state.requested_audio_segment,
+                        audio_start_segment,
+                    ))
+            } else {
+                segment_window_is_full(
+                    video_segments,
+                    state.requested_muxed_segment,
+                    video_start_segment,
+                )
+            };
+            if !at_capacity {
+                drop(state);
+                if permit.is_none() {
+                    *permit = Some(
+                        Arc::clone(limiter)
+                            .blocking_acquire_owned()
+                            .map_err(|_| "playback build limiter closed".to_owned())?,
+                    );
+                }
+                return Ok(());
+            }
+            if self.is_idle_for(idle_timeout) {
+                return Err("playback build stopped after the client became idle".to_owned());
+            }
+            drop(permit.take());
+            let elapsed = self
+                .last_request
+                .lock()
+                .map_err(|_| "playback request timer lock failed".to_owned())?
+                .elapsed();
+            let wait = idle_timeout.saturating_sub(elapsed);
+            let (next_state, _) = self
+                .demand_changed
+                .wait_timeout(state, wait)
+                .map_err(|_| "playback progress lock failed".to_owned())?;
+            state = next_state;
+        }
+    }
+
+
+    fn wait_for_initial_muxed_segment(
+        &self,
+        idle_timeout: Duration,
+        limiter: &Arc<tokio::sync::Semaphore>,
+        permit: &mut Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<usize, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "playback progress lock failed".to_owned())?;
+        loop {
+            if let Some(index) = state.first_requested_muxed_segment {
+                drop(state);
+                if permit.is_none() {
+                    *permit = Some(
+                        Arc::clone(limiter)
+                            .blocking_acquire_owned()
+                            .map_err(|_| "playback build limiter closed".to_owned())?,
+                    );
+                }
+                return Ok(index);
+            }
+            if self.is_idle_for(idle_timeout) {
+                return Err("playback build stopped after the client became idle".to_owned());
+            }
+            drop(permit.take());
+            let elapsed = self
+                .last_request
+                .lock()
+                .map_err(|_| "playback request timer lock failed".to_owned())?
+                .elapsed();
+            let wait = idle_timeout.saturating_sub(elapsed);
+            let (next_state, _) = self
+                .demand_changed
+                .wait_timeout(state, wait)
+                .map_err(|_| "playback progress lock failed".to_owned())?;
+            state = next_state;
+        }
+    }
+}
+
+fn segment_window_is_full(
+    generated: usize,
+    requested: Option<usize>,
+    start_segment: usize,
+) -> bool {
+    generated
+        >= requested
+            .unwrap_or(start_segment)
+            .max(start_segment)
+            .saturating_add(MAX_SEGMENTS_AHEAD)
+            .saturating_add(1)
 }
 
 pub struct RemuxedPlayback {
@@ -133,8 +307,11 @@ pub struct RemuxedPlayback {
     audio_sample_rate: Option<u32>,
     audio_channels: Option<u16>,
     separate_dash_tracks: bool,
+    matroska_hls: bool,
     video_transcode: Option<VideoTranscodeConfig>,
     video_start_segment: usize,
+    video_segment_start_pts: Vec<i64>,
+    video_segment_start_ticks: Vec<u64>,
     audio_start_segment: usize,
     video_start_pts: i64,
     video_decode_start_pts: i64,
@@ -146,11 +323,22 @@ pub struct RemuxedPlayback {
 }
 
 impl RemuxedPlayback {
+    #[cfg(test)]
+    pub fn build(&self, path: &Path) -> Result<(), String> {
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&limiter)
+            .try_acquire_owned()
+            .map_err(|_| "playback build limiter unavailable".to_owned())?;
+        self.build_with_permit(path, limiter, permit)
+    }
+
+
     pub fn prepare(
         path: &Path,
         transcode_audio: bool,
         transcode_video: bool,
         separate_dash_tracks: bool,
+        matroska_hls: bool,
         offset_seconds: f64,
     ) -> Result<Self, String> {
         let directory = tempfile::Builder::new()
@@ -164,6 +352,9 @@ impl RemuxedPlayback {
         let audio_codec = Self::validate_source(path, transcode_audio)?;
         let source_size = fs::metadata(path).map_err(media_error)?.len();
         let source_duration = scan.segment_durations.iter().sum::<f64>();
+        if !offset_seconds.is_finite() || offset_seconds < 0.0 || offset_seconds > source_duration {
+            return Err("playback offset is outside the source duration".to_owned());
+        }
         let target_bitrate = ((source_size as f64 * 8.0 / source_duration) * 1.5)
             .clamp(2_000_000.0, 12_000_000.0) as u32;
         let video_transcode = if transcode_video {
@@ -181,20 +372,8 @@ impl RemuxedPlayback {
         } else {
             scan.segment_durations.clone()
         };
-        let should_seek_source = separate_dash_tracks
-            && offset_seconds.is_finite()
-            && offset_seconds > 0.0;
-        if !offset_seconds.is_finite() || offset_seconds < 0.0 {
-            return Err("playback offset must be a non-negative number of seconds".to_owned());
-        }
-        if offset_seconds >= source_duration {
-            return Err("playback offset is outside the source duration".to_owned());
-        }
-        let video_start_segment = if should_seek_source {
-            segment_index_for_offset(&segment_durations, offset_seconds)
-        } else {
-            0
-        };
+        let (should_seek_source, video_start_segment) =
+            playback_segment_start(&segment_durations, offset_seconds);
         let video_start_pts = if let Some(config) = &video_transcode {
             let frame_index = video_start_segment
                 .checked_mul(usize::try_from(config.gop_size).map_err(media_error)?)
@@ -296,8 +475,11 @@ impl RemuxedPlayback {
             audio_sample_rate: audio_scan.as_ref().map(|scan| scan.sample_rate),
             audio_channels: audio_scan.as_ref().map(|scan| scan.channels),
             separate_dash_tracks,
+            matroska_hls,
             video_transcode,
             video_start_segment,
+            video_segment_start_pts: scan.segment_start_pts.clone(),
+            video_segment_start_ticks: scan.segment_start_ticks.clone(),
             audio_start_segment,
             video_start_pts,
             video_decode_start_pts,
@@ -311,21 +493,31 @@ impl RemuxedPlayback {
 
     #[cfg(test)]
     pub fn remux_with_audio_transcoding(path: &Path, transcode_audio: bool) -> Result<Self, String> {
-        let playback = Self::prepare(path, transcode_audio, false, false, 0.0)?;
+        let playback = Self::prepare(path, transcode_audio, false, false, false, 0.0)?;
         playback.build(path)?;
         Ok(playback)
     }
 
-    pub fn build(&self, path: &Path) -> Result<(), String> {
+    pub fn build_with_permit(
+        &self,
+        path: &Path,
+        limiter: Arc<tokio::sync::Semaphore>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<(), String> {
+        let permit = std::cell::RefCell::new(Some(permit));
         let result = remux_matroska(
             path,
             self.directory.path(),
             self.transcode_audio,
             self.video_transcode.as_ref(),
             &self.video_timings,
+            &self.video_segment_start_pts,
+            &self.video_segment_start_ticks,
             &self.audio_timings,
             self.audio_sample_rate,
             self.separate_dash_tracks,
+            self.matroska_hls,
+            &self.segments,
             self.video_start_segment,
             self.audio_start_segment,
             self.video_start_pts,
@@ -335,12 +527,33 @@ impl RemuxedPlayback {
             self.audio_source_seek_pts,
             self.source_seek_timestamp,
             self.should_seek_source,
-            &|| self.progress.is_idle_for(BUILD_IDLE_TIMEOUT),
+            &mut || {
+                if self.separate_dash_tracks || self.video_transcode.is_some() {
+                    return Ok(None);
+                }
+                let mut permit = permit.borrow_mut();
+                self.progress
+                    .wait_for_initial_muxed_segment(BUILD_IDLE_TIMEOUT, &limiter, &mut permit)
+                    .map(Some)
+            },
+            &mut |video_segments, audio_segments, video_start_segment, audio_start_segment| {
+                self.progress.wait_for_capacity(
+                    video_segments,
+                    audio_segments,
+                    video_start_segment,
+                    audio_start_segment,
+                    self.separate_dash_tracks,
+                    self.audio_codec.is_some(),
+                    BUILD_IDLE_TIMEOUT,
+                    &limiter,
+                    &mut permit.borrow_mut(),
+                )
+            },
             &mut |_name| self.progress.changed.notify_waiters(),
         );
         let result = result.and_then(|mut actual| {
-            actual.video[..self.video_start_segment]
-                .clone_from_slice(&self.segments[..self.video_start_segment]);
+            actual.video[..actual.video_start_segment]
+                .clone_from_slice(&self.segments[..actual.video_start_segment]);
             actual.audio[..self.audio_start_segment]
                 .clone_from_slice(&self.audio_segments[..self.audio_start_segment]);
             if !segment_timelines_match(&actual.video, &self.segments)
@@ -375,7 +588,8 @@ impl RemuxedPlayback {
         let path = self
             .resource(name)
             .ok_or_else(|| "unknown playback resource".to_owned())?;
-        self.progress.touch();
+        self.progress
+            .request_resource(name, self.separate_dash_tracks)?;
         loop {
             let notified = self.progress.changed.notified();
             tokio::pin!(notified);
@@ -399,6 +613,11 @@ impl RemuxedPlayback {
             }
             notified.await;
         }
+    }
+
+
+    pub fn matroska_hls(&self) -> bool {
+        self.matroska_hls
     }
 
     pub fn resource(&self, name: &str) -> Option<PathBuf> {
@@ -439,6 +658,15 @@ impl RemuxedPlayback {
                 _ => None,
             };
         }
+
+        if self.matroska_hls {
+            if name == "init.mkv" {
+                return Some(self.directory.path().join("init.mkv"));
+            }
+            let index = name.strip_suffix(".mkv")?.strip_prefix("segment-")?.parse::<usize>().ok()?;
+            return (index >= self.video_start_segment && index < self.segments.len())
+                .then(|| self.directory.path().join(format!("segment-{index}.mkv")));
+        }
         if name == "init.mp4" || name == "0/header" {
             return Some(self.directory.path().join("init.mp4"));
         }
@@ -475,7 +703,7 @@ impl RemuxedPlayback {
                     .ok_or_else(|| "E-AC-3 track has no audio settings".to_owned())?
                     .sampling_frequency()
                     .round() as u32;
-                Eac3AacTranscoder::new(sample_rate, None)?;
+                Eac3AacTranscoder::new(sample_rate, None, false)?;
                 Ok(Some("mp4a.40.2".to_owned()))
             }
             Some(_) => Ok(Some("ec-3".to_owned())),
@@ -492,13 +720,17 @@ impl RemuxedPlayback {
             .fold(1.0_f64, f64::max)
             .ceil() as u64;
         let mut output = format!(
-            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"/video/:/transcode/universal/session/{session_id}/init.mp4\"\n"
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:{target_duration}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI=\"/video/:/transcode/universal/session/{session_id}/{}\"\n",
+            if self.matroska_hls { "init.mkv" } else { "init.mp4" }
+
         );
         for (index, segment) in self.segments.iter().enumerate() {
-            output.push_str(&format!(
-                "#EXTINF:{:.3},\n/video/:/transcode/universal/session/{session_id}/segment-{index}.m4s\n",
-                segment.duration
-            ));
+            let resource = if self.matroska_hls {
+                format!("segment-{index}.mkv")
+            } else {
+                format!("segment-{index}.m4s")
+            };
+            output.push_str(&format!("#EXTINF:{:.3},\n/video/:/transcode/universal/session/{session_id}/{resource}\n", segment.duration));
         }
         output.push_str("#EXT-X-ENDLIST\n");
         output
@@ -786,6 +1018,40 @@ fn segment_index_for_offset(durations: &[f64], offset_seconds: f64) -> usize {
         start += duration;
     }
     0
+}
+
+fn playback_segment_start(durations: &[f64], offset_seconds: f64) -> (bool, usize) {
+    if offset_seconds > 0.0 {
+        (true, segment_index_for_offset(durations, offset_seconds))
+    } else {
+        (false, 0)
+    }
+}
+
+
+fn hls_segment_start(
+    requested_segment: usize,
+    prepared_segment: usize,
+    segment_start_pts: &[i64],
+    segment_start_ticks: &[u64],
+) -> Result<(usize, i64, u64), String> {
+    let segment = requested_segment.max(prepared_segment);
+    let pts = *segment_start_pts
+        .get(segment)
+        .ok_or_else(|| "requested HLS segment has no source start timestamp".to_owned())?;
+    let ticks = *segment_start_ticks
+        .get(segment)
+        .ok_or_else(|| "requested HLS segment has no source seek point".to_owned())?;
+    Ok((segment, pts, ticks))
+}
+
+
+fn should_seek_matroska_source(
+    should_seek_source: bool,
+    separate_dash_tracks: bool,
+    transcode_video: bool,
+) -> bool {
+    should_seek_source && (separate_dash_tracks || transcode_video)
 }
 
 fn audio_segment_start_pts(
@@ -1268,9 +1534,13 @@ fn remux_matroska(
     transcode_audio: bool,
     video_transcode: Option<&VideoTranscodeConfig>,
     video_timings: &[VideoFrameTiming],
+    video_segment_start_pts: &[i64],
+    video_segment_start_ticks: &[u64],
     audio_timings: &[AudioFrameTiming],
     audio_sample_rate_hint: Option<u32>,
     separate_dash_tracks: bool,
+    matroska_hls: bool,
+    segment_templates: &[SegmentInfo],
     video_start_segment: usize,
     audio_start_segment: usize,
     video_start_pts: i64,
@@ -1280,7 +1550,8 @@ fn remux_matroska(
     audio_source_seek_pts: i64,
     source_seek_timestamp: u64,
     should_seek_source: bool,
-    should_cancel: &impl Fn() -> bool,
+    wait_for_initial_muxed_segment: &mut impl FnMut() -> Result<Option<usize>, String>,
+    wait_for_capacity: &mut impl FnMut(usize, usize, usize, usize) -> Result<(), String>,
     on_resource_ready: &mut impl FnMut(&str),
 ) -> Result<BuiltSegments, String> {
     let mut probe =
@@ -1338,10 +1609,12 @@ fn remux_matroska(
             let asc = rusty_aac::encode::audio_specific_config_bytes(sample_rate, 2);
             let config = transmux::rtp_sdp::aac_config_from_asc_bytes(asc).map_err(media_error)?;
             let spec = TrackSpec::new(TrackId::new(AUDIO_TRACK_ID), sample_rate, config);
-            let transcoder = Eac3AacTranscoder::new(
-                sample_rate,
-                should_seek_source.then_some(audio_decode_start_pts),
-            )?;
+            let initial_pts = if separate_dash_tracks && should_seek_source {
+                Some(audio_decode_start_pts)
+            } else {
+                None
+            };
+            let transcoder = Eac3AacTranscoder::new(sample_rate, initial_pts, !separate_dash_tracks)?;
             (Some(number), Some(spec), Some(transcoder))
         } else {
             let channels = u16::try_from(audio_settings.channels().get())
@@ -1401,7 +1674,30 @@ fn remux_matroska(
     let mut segmenter = None;
     let mut video_segmenter = None;
     let mut audio_segmenter = None;
-    if separate_dash_tracks {
+    if matroska_hls {
+        if separate_dash_tracks || video_transcode.is_some() || !transcode_audio {
+            return Err("Matroska HLS currently requires copied HEVC video and AAC audio conversion".to_owned());
+        }
+        let sample_rate = audio_sample_rate
+            .ok_or_else(|| "Matroska HLS requires an audio track".to_owned())?;
+        let asc = rusty_aac::encode::audio_specific_config_bytes(sample_rate, 2);
+        let header = mkv_hls::initialization_segment(
+            mkv_hls::VideoTrack {
+                codec_id: "V_MPEGH/ISO/HEVC",
+                codec_private: &video_private,
+                width,
+                height,
+            },
+            Some(mkv_hls::AudioTrack {
+                codec_id: "A_AAC",
+                codec_private: &asc,
+                sample_rate,
+                channels: 2,
+            }),
+        )?;
+        fs::write(cache.join("init.mkv"), header).map_err(media_error)?;
+        on_resource_ready("init.mkv");
+    } else if separate_dash_tracks {
         let video = Segmenter::new(vec![video_spec], 1000, SEGMENT_TARGET_SECONDS)
             .map_err(media_error)?;
         fs::write(cache.join("init-video.mp4"), video.init_segment().map_err(media_error)?)
@@ -1428,6 +1724,39 @@ fn remux_matroska(
         segmenter = Some(muxed);
     }
 
+    let mut video_start_segment = video_start_segment;
+    let mut video_start_pts = video_start_pts;
+    let mut video_decode_start_pts = video_decode_start_pts;
+    let mut audio_source_seek_pts = audio_source_seek_pts;
+    let mut source_seek_timestamp = source_seek_timestamp;
+    let mut should_seek_source = should_seek_source;
+    if let Some(requested_segment) = wait_for_initial_muxed_segment()? {
+        if !separate_dash_tracks && video_transcode.is_none() {
+            let (requested_segment, requested_pts, requested_ticks) = hls_segment_start(
+                requested_segment,
+                video_start_segment,
+                video_segment_start_pts,
+                video_segment_start_ticks,
+            )?;
+            if requested_segment > video_start_segment {
+                video_start_segment = requested_segment;
+                video_start_pts = requested_pts;
+                video_decode_start_pts = requested_pts;
+                source_seek_timestamp = requested_ticks;
+                should_seek_source = true;
+            }
+        }
+    }
+    if !separate_dash_tracks && should_seek_source {
+        if let Some(sample_rate) = audio_sample_rate {
+            audio_source_seek_pts = i64::try_from(
+                i128::from(video_start_pts) * i128::from(sample_rate)
+                    / i128::from(VIDEO_TIMESCALE),
+            )
+            .map_err(|_| "HLS audio seek timestamp is outside the supported range".to_owned())?;
+        }
+    }
+
     let mut source =
         MatroskaFile::open(File::open(path).map_err(media_error)?).map_err(media_error)?;
     let mut frame = Frame::default();
@@ -1447,6 +1776,15 @@ fn remux_matroska(
     })
     .take(audio_start_segment)
     .collect::<Vec<_>>();
+    let mut matroska_hls_builder = if matroska_hls {
+        Some(mkv_hls::SegmentBuilder::new(
+            video_segment_start_pts,
+            video_start_segment,
+            audio_number.is_some(),
+        ))
+    } else {
+        None
+    };
     let mut audio_segment_start = None::<i64>;
     let mut last_audio_end = None::<i64>;
     let audio_index_start_pts = if transcode_audio {
@@ -1469,6 +1807,11 @@ fn remux_matroska(
     } else {
         0
     };
+    let mut video_processing_time = Duration::ZERO;
+    let mut video_processing_frames = 0_usize;
+    let mut audio_processing_time = Duration::ZERO;
+    let mut audio_processing_frames = 0_usize;
+    let mut last_processing_report = Instant::now();
     let mut audio_codec_delay = 0_u64;
     if let Some(number) = audio_number {
         audio_codec_delay = source
@@ -1478,15 +1821,30 @@ fn remux_matroska(
             .and_then(|track| track.codec_delay())
             .unwrap_or(0);
     }
-    if should_seek_source {
+    let perform_matroska_seek = should_seek_matroska_source(
+        should_seek_source,
+        separate_dash_tracks,
+        video_transcode.is_some(),
+    );
+    if perform_matroska_seek {
         source
             .seek(source_seek_timestamp.saturating_sub(1))
             .map_err(media_error)?;
     }
 
-    while source.next_frame(&mut frame).map_err(media_error)? {
-        if should_cancel() {
-            return Err("playback build stopped after the client became idle".to_owned());
+    loop {
+        let video_work_ahead = segments.len()
+            + matroska_hls_builder
+                .as_ref()
+                .map_or(0, mkv_hls::SegmentBuilder::pending_count);
+        wait_for_capacity(
+            video_work_ahead,
+            audio_segments.len(),
+            video_start_segment,
+            audio_start_segment,
+        )?;
+        if !source.next_frame(&mut frame).map_err(media_error)? {
+            break;
         }
         let presentation_ns = frame_timestamp_ns(frame.timestamp, timestamp_scale)?;
         if should_seek_source && video_transcode.is_none() && frame.track == video_number {
@@ -1499,6 +1857,7 @@ fn remux_matroska(
             }
         }
         if frame.track == video_number {
+            let processing_started = Instant::now();
             if let Some(config) = video_transcode {
                 let decoder = video_decoder
                     .as_mut()
@@ -1578,31 +1937,52 @@ fn remux_matroska(
                     Some(duration),
                     is_sync,
                 );
-                let target_segmenter = if separate_dash_tracks {
-                    video_segmenter
-                        .as_mut()
-                        .ok_or_else(|| "video segmenter is not available".to_owned())?
+                if let Some(builder) = matroska_hls_builder.as_mut() {
+                    if is_sync {
+                        video_segment_start = Some(pts);
+                    }
+                    builder.push_video(
+                        pts,
+                        dts,
+                        Bytes::from(frame.data.clone()),
+                        is_sync,
+                    )?;
+                    builder.flush_ready(
+                        segment_templates,
+                        &mut segments,
+                        cache,
+                        on_resource_ready,
+                    )?;
                 } else {
-                    segmenter
-                        .as_mut()
-                        .ok_or_else(|| "muxed segmenter is not available".to_owned())?
-                };
-                let prefix = if separate_dash_tracks { "video-segment" } else { "segment" };
-                push_video_sample(
-                    target_segmenter,
-                    sample,
-                    pts,
-                    is_sync,
-                    &mut video_segment_start,
-                    cache,
-                    prefix,
-                    &mut segments,
-                    on_resource_ready,
-                )?;
+                    let target_segmenter = if separate_dash_tracks {
+                        video_segmenter
+                            .as_mut()
+                            .ok_or_else(|| "video segmenter is not available".to_owned())?
+                    } else {
+                        segmenter
+                            .as_mut()
+                            .ok_or_else(|| "muxed segmenter is not available".to_owned())?
+                    };
+                    let prefix = if separate_dash_tracks { "video-segment" } else { "segment" };
+                    push_video_sample(
+                        target_segmenter,
+                        sample,
+                        pts,
+                        is_sync,
+                        &mut video_segment_start,
+                        cache,
+                        prefix,
+                        &mut segments,
+                        on_resource_ready,
+                    )?;
+                }
                 video_dts = Some(dts.saturating_add(i64::from(duration)));
                 last_video_end = Some(pts.saturating_add(i64::from(duration)));
             }
+            video_processing_time += processing_started.elapsed();
+            video_processing_frames += 1;
         } else if Some(frame.track) == audio_number {
+            let processing_started = Instant::now();
             let Some(sample_rate) = audio_sample_rate else {
                 continue;
             };
@@ -1615,7 +1995,18 @@ fn remux_matroska(
             }
             if let Some(transcoder) = audio_transcoder.as_mut() {
                 for sample in transcoder.push(&frame.data, pts)? {
-                    if separate_dash_tracks {
+                    if let Some(builder) = matroska_hls_builder.as_mut() {
+                        let sample_pts = sample
+                            .pts
+                            .ok_or_else(|| "AAC transcoder returned a sample without PTS".to_owned())?;
+                        builder.push_audio(sample_pts, sample_rate, sample.data.clone())?;
+                        builder.flush_ready(
+                            segment_templates,
+                            &mut segments,
+                            cache,
+                            on_resource_ready,
+                        )?;
+                    } else if separate_dash_tracks {
                         let sample_pts = sample
                             .pts
                             .ok_or_else(|| "AAC transcoder returned a sample without PTS".to_owned())?;
@@ -1692,6 +2083,22 @@ fn remux_matroska(
                         .map_err(media_error)?;
                 }
             }
+            audio_processing_time += processing_started.elapsed();
+            audio_processing_frames += 1;
+        }
+        if last_processing_report.elapsed() >= Duration::from_secs(5) {
+            tracing::info!(
+                video_frames = video_processing_frames,
+                video_processing_ms = video_processing_time.as_secs_f64() * 1000.0,
+                audio_frames = audio_processing_frames,
+                audio_processing_ms = audio_processing_time.as_secs_f64() * 1000.0,
+                "Plex remux processing timing"
+            );
+            video_processing_time = Duration::ZERO;
+            video_processing_frames = 0;
+            audio_processing_time = Duration::ZERO;
+            audio_processing_frames = 0;
+            last_processing_report = Instant::now();
         }
     }
     if let Some(config) = video_transcode {
@@ -1743,7 +2150,17 @@ fn remux_matroska(
 
     if let Some(transcoder) = audio_transcoder.as_mut() {
         for sample in transcoder.finish()? {
-            if separate_dash_tracks {
+            if let Some(builder) = matroska_hls_builder.as_mut() {
+                let pts = sample
+                    .pts
+                    .ok_or_else(|| "AAC transcoder returned a sample without PTS".to_owned())?;
+                builder.push_audio(
+                    pts,
+                    audio_sample_rate.ok_or_else(|| "audio sample rate is missing".to_owned())?,
+                    sample.data.clone(),
+                )?;
+                builder.flush_ready(segment_templates, &mut segments, cache, on_resource_ready)?;
+            } else if separate_dash_tracks {
                 let pts = sample
                     .pts
                     .ok_or_else(|| "AAC transcoder returned a sample without PTS".to_owned())?;
@@ -1813,6 +2230,8 @@ fn remux_matroska(
                 audio_segments.push(SegmentInfo { duration, size });
             }
         }
+    } else if let Some(builder) = matroska_hls_builder.as_mut() {
+        builder.finish(segment_templates, &mut segments, cache, on_resource_ready)?;
     } else {
         let mut muxed = segmenter
             .take()
@@ -1832,6 +2251,7 @@ fn remux_matroska(
     Ok(BuiltSegments {
         video: segments,
         audio: audio_segments,
+        video_start_segment,
     })
 }
 
@@ -1906,39 +2326,64 @@ fn media_error(error: impl std::fmt::Display) -> String {
 
 struct Eac3AacTranscoder {
     decoder: Box<dyn Decoder>,
-    encoder: AacStreamEncoder,
+    encoder: Option<AacStreamEncoder>,
+    bounded_encoder: bool,
+    pcm_preroll: Vec<i16>,
     pending_pcm: Vec<i16>,
+    pending_pcm_start: usize,
     sample_rate: u32,
     first_pts: Option<i64>,
     encoded_frames: u64,
+    audio_decode_pcm_time: Duration,
+    aac_encode_time: Duration,
+    audio_packets_since_report: usize,
 }
 
 impl Eac3AacTranscoder {
-    fn new(sample_rate: u32, initial_pts: Option<i64>) -> Result<Self, String> {
+    fn new(
+        sample_rate: u32,
+        initial_pts: Option<i64>,
+        bounded_encoder: bool,
+    ) -> Result<Self, String> {
         let mut params = CodecParameters::audio(CodecId::new("eac3"));
         params.sample_rate = Some(sample_rate);
         params.channels = Some(2);
         params.sample_format = Some(SampleFormat::F32);
         let decoder = make_eac3_decoder(&params).map_err(media_error)?;
-        let encoder = AacStreamEncoder::new(AacEncoderConfig {
-            sample_rate,
-            channels: 2,
-            bitrate: 128_000,
-        })
-        .map_err(media_error)?;
+        let encoder = (!bounded_encoder)
+            .then(|| {
+                AacStreamEncoder::new(AacEncoderConfig {
+                    sample_rate,
+                    channels: 2,
+                    bitrate: 128_000,
+                })
+            })
+            .transpose()
+            .map_err(media_error)?;
         Ok(Self {
             decoder,
             encoder,
-            pending_pcm: Vec::with_capacity(1024 * 2),
+            bounded_encoder,
+            pcm_preroll: Vec::with_capacity(AAC_FRAME_SAMPLES * AAC_CHANNELS),
+            pending_pcm: Vec::with_capacity(if bounded_encoder {
+                AAC_BOUNDED_CHUNK_SAMPLES
+            } else {
+                AAC_FRAME_SAMPLES * AAC_CHANNELS
+            }),
+            pending_pcm_start: 0,
             sample_rate,
             first_pts: initial_pts,
             encoded_frames: 0,
+            audio_decode_pcm_time: Duration::ZERO,
+            aac_encode_time: Duration::ZERO,
+            audio_packets_since_report: 0,
         })
     }
 
     fn push(&mut self, data: &[u8], pts: i64) -> Result<Vec<Sample>, String> {
-        const CHANNELS: usize = 2;
-        const HOP_SAMPLES: usize = 1024 * CHANNELS;
+        const HOP_SAMPLES: usize = AAC_FRAME_SAMPLES * AAC_CHANNELS;
+        let push_started = Instant::now();
+        let mut encode_time = Duration::ZERO;
 
         let packet = Packet::new(
             0,
@@ -1954,7 +2399,7 @@ impl Eac3AacTranscoder {
                     let Some(pcm) = audio.data.first() else {
                         return Err("E-AC-3 decoder returned no PCM samples".to_owned());
                     };
-                    if pcm.len() != audio.samples as usize * CHANNELS * 4 {
+                    if pcm.len() != audio.samples as usize * AAC_CHANNELS * 4 {
                         return Err("E-AC-3 decoder returned an unexpected PCM format".to_owned());
                     }
                     self.first_pts.get_or_insert(audio.pts.unwrap_or(pts));
@@ -1963,11 +2408,44 @@ impl Eac3AacTranscoder {
                             .round()
                             .clamp(i16::MIN as f32, i16::MAX as f32) as i16
                     }));
-                    while self.pending_pcm.len() >= HOP_SAMPLES {
-                        let hop = self.pending_pcm.drain(..HOP_SAMPLES).collect::<Vec<_>>();
-                        if let Some(sample) = self.encode_hop(&hop)? {
-                            samples.push(sample);
+                    let chunk_samples = if self.bounded_encoder {
+                        AAC_BOUNDED_CHUNK_SAMPLES
+                    } else {
+                        HOP_SAMPLES
+                    };
+                    while self.pending_pcm.len().saturating_sub(self.pending_pcm_start)
+                        >= chunk_samples
+                    {
+                        let start = self.pending_pcm_start;
+                        let end = start + chunk_samples;
+                        let pcm_chunk = self.pending_pcm[start..end].to_vec();
+                        let encode_started = Instant::now();
+                        if self.bounded_encoder {
+                            samples.extend(self.encode_bounded_chunk(&pcm_chunk)?);
+                        } else {
+                            let frame = self
+                                .encoder
+                                .as_mut()
+                                .ok_or_else(|| "AAC encoder is not available".to_owned())?
+                                .encode_frame(&pcm_chunk)
+                                .map_err(media_error)?;
+                            if let Some(sample) = self.aac_sample(frame)? {
+                                samples.push(sample);
+                            }
                         }
+                        let frame_encode_time = encode_started.elapsed();
+                        encode_time += frame_encode_time;
+                        self.aac_encode_time += frame_encode_time;
+                        self.pending_pcm_start = end;
+                    }
+                    if self.pending_pcm_start == self.pending_pcm.len() {
+                        self.pending_pcm.clear();
+                        self.pending_pcm_start = 0;
+                    } else if self.pending_pcm_start >= chunk_samples {
+                        let remaining = self.pending_pcm.len() - self.pending_pcm_start;
+                        self.pending_pcm.copy_within(self.pending_pcm_start.., 0);
+                        self.pending_pcm.truncate(remaining);
+                        self.pending_pcm_start = 0;
                     }
                 }
                 Ok(_) => return Err("E-AC-3 decoder returned a non-audio frame".to_owned()),
@@ -1975,26 +2453,129 @@ impl Eac3AacTranscoder {
                 Err(error) => return Err(media_error(error)),
             }
         }
+        self.audio_decode_pcm_time += push_started.elapsed().saturating_sub(encode_time);
+        self.audio_packets_since_report += 1;
+        if self.audio_packets_since_report >= 100 {
+            tracing::info!(
+                audio_packets = self.audio_packets_since_report,
+                decode_and_pcm_ms = self.audio_decode_pcm_time.as_secs_f64() * 1000.0,
+                aac_encode_ms = self.aac_encode_time.as_secs_f64() * 1000.0,
+                "Plex audio transcode timing"
+            );
+            self.audio_decode_pcm_time = Duration::ZERO;
+            self.aac_encode_time = Duration::ZERO;
+            self.audio_packets_since_report = 0;
+        }
         Ok(samples)
     }
 
     fn finish(&mut self) -> Result<Vec<Sample>, String> {
         let mut samples = Vec::new();
-        if !self.pending_pcm.is_empty() {
-            let tail = std::mem::take(&mut self.pending_pcm);
-            if let Some(sample) = self.encode_hop(&tail)? {
+        if self.pending_pcm_start < self.pending_pcm.len() {
+            let pcm = self.pending_pcm[self.pending_pcm_start..].to_vec();
+            if self.bounded_encoder {
+                samples.extend(self.encode_bounded_chunk(&pcm)?);
+            } else {
+                if let Some(sample) = self.encode_hop(&pcm)? {
+                    samples.push(sample);
+                }
+            }
+        }
+        self.pending_pcm.clear();
+        self.pending_pcm_start = 0;
+        if let Some(encoder) = self.encoder.as_mut() {
+            let frame = encoder.finish().map_err(media_error)?;
+            if let Some(sample) = self.aac_sample(frame)? {
                 samples.push(sample);
             }
         }
-        let frame = self.encoder.finish().map_err(media_error)?;
-        if let Some(sample) = self.aac_sample(frame)? {
-            samples.push(sample);
+        Ok(samples)
+    }
+
+    fn encode_bounded_chunk(&mut self, pcm: &[i16]) -> Result<Vec<Sample>, String> {
+        let base_pts = self.first_pts.unwrap_or(0).saturating_add(
+            i64::try_from(self.encoded_frames)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(AAC_FRAME_SAMPLES as i64),
+        );
+        let samples = Self::encode_aac_chunk(
+            pcm,
+            &mut self.pcm_preroll,
+            self.sample_rate,
+            base_pts,
+        )?;
+        self.encoded_frames = self.encoded_frames.saturating_add(samples.len() as u64);
+        Ok(samples)
+    }
+
+    fn encode_aac_chunk(
+        pcm: &[i16],
+        preroll: &mut Vec<i16>,
+        sample_rate: u32,
+        base_pts: i64,
+    ) -> Result<Vec<Sample>, String> {
+        if pcm.len() % AAC_CHANNELS != 0 {
+            return Err("AAC PCM chunk has an incomplete sample frame".to_owned());
+        }
+        let preroll_len = AAC_FRAME_SAMPLES * AAC_CHANNELS;
+        let mut input = Vec::with_capacity(preroll_len + pcm.len());
+        if preroll.is_empty() {
+            input.resize(preroll_len, 0.0_f32);
+        } else {
+            input.extend(preroll.iter().map(|sample| f32::from(*sample) / 32768.0));
+        }
+        input.extend(pcm.iter().map(|sample| f32::from(*sample) / 32768.0));
+
+        let mut encoder = rusty_aac::encode::AacEncoder::new(
+            rusty_aac::encode::AacEncoderConfig {
+                bitrate_bps: 128_000,
+                ..Default::default()
+            },
+        );
+        encoder
+            .push_pcm(&input, AAC_CHANNELS as u16, sample_rate)
+            .map_err(media_error)?;
+        encoder.finish();
+
+        let valid_samples = pcm.len() / AAC_CHANNELS;
+        let mut samples = Vec::new();
+        loop {
+            let packet = match encoder.next_packet() {
+                Ok(packet) => packet,
+                Err(rusty_aac::Error::Eof) => break,
+                Err(error) => return Err(media_error(error)),
+            };
+            let relative_pts = packet.pts.saturating_sub(AAC_FRAME_SAMPLES as i64);
+            if relative_pts < 0 || relative_pts >= valid_samples as i64 {
+                continue;
+            }
+            if packet.data.is_empty() || packet.duration == 0 {
+                return Err("AAC encoder returned an empty access unit".to_owned());
+            }
+            let pts = base_pts.saturating_add(relative_pts);
+            samples.push(Sample::new(
+                Bytes::from(packet.data),
+                Some(pts),
+                Some(pts),
+                Some(packet.duration),
+                true,
+            ));
+        }
+
+        if pcm.len() >= preroll_len {
+            preroll.clear();
+            preroll.extend_from_slice(&pcm[pcm.len() - preroll_len..]);
         }
         Ok(samples)
     }
 
     fn encode_hop(&mut self, pcm: &[i16]) -> Result<Option<Sample>, String> {
-        let frame = self.encoder.encode_frame(pcm).map_err(media_error)?;
+        let frame = self
+            .encoder
+            .as_mut()
+            .ok_or_else(|| "AAC encoder is not available".to_owned())?
+            .encode_frame(pcm)
+            .map_err(media_error)?;
         self.aac_sample(frame)
     }
 
@@ -2030,6 +2611,9 @@ impl Eac3AacTranscoder {
             true,
         )))
     }
+
+
+
 }
 
 #[cfg(test)]
@@ -2055,10 +2639,13 @@ mod tests {
             audio_sample_rate: Some(48_000),
             audio_channels: Some(2),
             separate_dash_tracks: false,
+            matroska_hls: false,
             transcode_audio: false,
             video_timings: Vec::new(),
             video_transcode: None,
             video_start_segment: 0,
+            video_segment_start_pts: Vec::new(),
+            video_segment_start_ticks: Vec::new(),
             audio_start_segment: 0,
             video_start_pts: 0,
             video_decode_start_pts: 0,
@@ -2100,6 +2687,56 @@ mod tests {
 
 
     #[test]
+    fn mkv_hls_manifest_references_initialization_and_cluster_resources() {
+        let directory = tempfile::tempdir().unwrap();
+        let playback = RemuxedPlayback {
+            directory,
+            segments: vec![SegmentInfo {
+                duration: 2.25,
+                size: 1_000,
+            }],
+            audio_segments: Vec::new(),
+            progress: Arc::default(),
+            video_codec: "hvc1.1.6.L93.B0".to_owned(),
+            audio_codec: Some("mp4a.40.2".to_owned()),
+            width: 1280,
+            height: 720,
+            transcode_audio: true,
+            video_timings: Vec::new(),
+            audio_timings: Vec::new(),
+            audio_sample_rate: Some(48_000),
+            audio_channels: Some(2),
+            separate_dash_tracks: false,
+            matroska_hls: true,
+            video_transcode: None,
+            video_start_segment: 0,
+            video_segment_start_pts: vec![0],
+            video_segment_start_ticks: vec![0],
+            audio_start_segment: 0,
+            video_start_pts: 0,
+            video_decode_start_pts: 0,
+            audio_start_pts: 0,
+            audio_decode_start_pts: 0,
+            audio_source_seek_pts: 0,
+            source_seek_timestamp: 0,
+            should_seek_source: false,
+        };
+
+        let manifest = playback.hls_manifest("mkv-session");
+        assert!(manifest.contains("/mkv-session/init.mkv"));
+        assert!(manifest.contains("/mkv-session/segment-0.mkv"));
+        assert_eq!(
+            playback.resource("init.mkv"),
+            Some(playback.directory.path().join("init.mkv"))
+        );
+        assert_eq!(
+            playback.resource("segment-0.mkv"),
+            Some(playback.directory.path().join("segment-0.mkv"))
+        );
+    }
+
+
+    #[test]
     fn dash_manifest_uses_separate_audio_and_video_tracks() {
         let directory = tempfile::tempdir().unwrap();
         let playback = RemuxedPlayback {
@@ -2135,8 +2772,11 @@ mod tests {
             audio_sample_rate: Some(48_000),
             audio_channels: Some(2),
             separate_dash_tracks: true,
+            matroska_hls: false,
             video_transcode: None,
             video_start_segment: 1,
+            video_segment_start_pts: Vec::new(),
+            video_segment_start_ticks: Vec::new(),
             audio_start_segment: 1,
             video_start_pts: 0,
             video_decode_start_pts: 0,
@@ -2195,10 +2835,13 @@ mod tests {
             audio_sample_rate: Some(48_000),
             audio_channels: Some(2),
             separate_dash_tracks: false,
+            matroska_hls: false,
             transcode_audio: false,
             video_timings: Vec::new(),
             video_transcode: None,
             video_start_segment: 0,
+            video_segment_start_pts: Vec::new(),
+            video_segment_start_ticks: Vec::new(),
             audio_start_segment: 0,
             video_start_pts: 0,
             video_decode_start_pts: 0,
@@ -2236,23 +2879,43 @@ mod tests {
             }
         ));
 
-        let mut encoder = AacStreamEncoder::new(AacEncoderConfig {
+        let pcm = (0..AAC_BOUNDED_CHUNK_SAMPLES)
+            .map(|index| ((index as f32 * 0.037).sin() * 12_000.0) as i16)
+            .collect::<Vec<_>>();
+        let mut preroll = Vec::new();
+        let first_base_pts = 12_345;
+        let first = Eac3AacTranscoder::encode_aac_chunk(
+            &pcm,
+            &mut preroll,
             sample_rate,
-            channels: 2,
-            bitrate: 128_000,
-        })
+            first_base_pts,
+        )
         .unwrap();
-        let pcm = vec![0_i16; 1024 * 2];
-        let frames = [
-            encoder.encode_frame(&pcm).unwrap(),
-            encoder.encode_frame(&pcm).unwrap(),
-            encoder.finish().unwrap(),
-        ];
-        for frame in frames {
-            assert_eq!(frame[0], 0xff);
-            assert_eq!(frame[1] & 0xf6, 0xf0);
-            assert!(frame.len() > 7);
+        assert_eq!(first.len(), AAC_BOUNDED_CHUNK_FRAMES);
+        assert_eq!(first[0].pts, Some(first_base_pts));
+        assert_eq!(first.last().unwrap().duration, Some(AAC_FRAME_SAMPLES as u32));
+
+        let second_base_pts = first_base_pts + AAC_BOUNDED_CHUNK_FRAMES as i64 * 1024;
+        let second = Eac3AacTranscoder::encode_aac_chunk(
+            &pcm,
+            &mut preroll,
+            sample_rate,
+            second_base_pts,
+        )
+        .unwrap();
+        assert_eq!(second.len(), AAC_BOUNDED_CHUNK_FRAMES);
+        assert_eq!(second[0].pts, Some(second_base_pts));
+        assert_eq!(
+            second[0].pts,
+            Some(first.last().unwrap().pts.unwrap() + 1024)
+        );
+        let mut decoder = rusty_aac::decode::Decoder::new(sample_rate);
+        for sample in first.iter().chain(&second) {
+            decoder
+                .decode(sample.data.as_ref(), sample.pts)
+                .unwrap();
         }
+
     }
 
     #[test]
@@ -2344,6 +3007,14 @@ mod tests {
 
 
     #[test]
+    fn nonzero_offset_starts_at_matching_video_segment() {
+        let durations = [2.0; 10];
+        assert_eq!(playback_segment_start(&durations, 14.0), (true, 7));
+        assert_eq!(playback_segment_start(&durations, 0.0), (false, 0));
+    }
+
+
+    #[test]
     fn audio_transcode_seek_preserves_aac_sample_phase() {
         let first_pts = 1_000;
         let timings = (0..600)
@@ -2386,5 +3057,220 @@ mod tests {
         assert!(progress.is_idle_for(BUILD_IDLE_TIMEOUT));
         progress.touch();
         assert!(!progress.is_idle_for(BUILD_IDLE_TIMEOUT));
+    }
+
+
+    #[test]
+    fn muxed_build_waits_until_client_demand_advances() {
+        let progress = Arc::new(PlaybackProgress::default());
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&limiter).try_acquire_owned().unwrap();
+        progress
+            .request_resource("segment-0.m4s", false)
+            .unwrap();
+        let worker_progress = Arc::clone(&progress);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut permit = Some(permit);
+            sender
+                .send(worker_progress.wait_for_capacity(
+                    4,
+                    0,
+                    0,
+                    0,
+                    false,
+                    false,
+                    Duration::from_secs(2),
+                    &limiter,
+                    &mut permit,
+                ))
+                .unwrap();
+        });
+
+        assert!(receiver.recv_timeout(Duration::from_millis(20)).is_err());
+        progress
+            .request_resource("segment-1.m4s", false)
+            .unwrap();
+        assert!(receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_ok());
+        worker.join().unwrap();
+    }
+
+
+    #[test]
+    fn paused_build_releases_limiter_until_demand_advances() {
+        let progress = Arc::new(PlaybackProgress::default());
+        progress.request_resource("segment-0.m4s", false).unwrap();
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&limiter).try_acquire_owned().unwrap();
+        let worker_progress = Arc::clone(&progress);
+        let worker_limiter = Arc::clone(&limiter);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut permit = Some(permit);
+            sender
+                .send(worker_progress.wait_for_capacity(
+                    4,
+                    0,
+                    0,
+                    0,
+                    false,
+                    false,
+                    Duration::from_secs(2),
+                    &worker_limiter,
+                    &mut permit,
+                ))
+                .unwrap();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let other_permit = loop {
+            if let Ok(permit) = Arc::clone(&limiter).try_acquire_owned() {
+                break permit;
+            }
+            assert!(Instant::now() < deadline, "paused build kept the limiter permit");
+            std::thread::yield_now();
+        };
+        progress.request_resource("segment-1.m4s", false).unwrap();
+        assert!(receiver.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(other_permit);
+        assert!(receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_ok());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn separate_dash_build_waits_for_demand_on_both_tracks() {
+        let progress = Arc::new(PlaybackProgress::default());
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&limiter).try_acquire_owned().unwrap();
+        progress.request_resource("0/0.m4s", true).unwrap();
+        progress.request_resource("1/0.m4s", true).unwrap();
+        let worker_progress = Arc::clone(&progress);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut permit = Some(permit);
+            sender
+                .send(worker_progress.wait_for_capacity(
+                    4,
+                    4,
+                    0,
+                    0,
+                    true,
+                    true,
+                    Duration::from_secs(2),
+                    &limiter,
+                    &mut permit,
+                ))
+                .unwrap();
+        });
+
+        progress.request_resource("0/1.m4s", true).unwrap();
+        assert!(receiver.recv_timeout(Duration::from_millis(20)).is_err());
+        progress.request_resource("1/1.m4s", true).unwrap();
+        assert!(receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_ok());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn paused_build_stops_after_client_becomes_idle() {
+        let progress = PlaybackProgress::default();
+        progress
+            .request_resource("segment-0.m4s", false)
+            .unwrap();
+        *progress.last_request.lock().unwrap() =
+            Instant::now() - Duration::from_millis(20);
+
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut permit = Some(Arc::clone(&limiter).try_acquire_owned().unwrap());
+        let error = progress
+            .wait_for_capacity(
+                4,
+                0,
+                0,
+                0,
+                false,
+                false,
+                Duration::from_millis(10),
+                &limiter,
+                &mut permit,
+            )
+            .unwrap_err();
+        assert_eq!(error, "playback build stopped after the client became idle");
+    }
+
+
+    #[test]
+    fn hls_build_uses_the_first_requested_segment() {
+        let progress = PlaybackProgress::default();
+        progress.request_resource("init.mp4", false).unwrap();
+        progress.request_resource("segment-7.m4s", false).unwrap();
+        progress.request_resource("segment-9.m4s", false).unwrap();
+
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut permit = Some(Arc::clone(&limiter).try_acquire_owned().unwrap());
+        let first_segment = progress
+            .wait_for_initial_muxed_segment(Duration::from_secs(1), &limiter, &mut permit)
+            .unwrap();
+
+        assert_eq!(first_segment, 7);
+    }
+
+    #[test]
+    fn mkv_hls_build_uses_the_first_requested_segment() {
+        let progress = PlaybackProgress::default();
+        progress.request_resource("init.mkv", false).unwrap();
+        progress.request_resource("segment-25.mkv", false).unwrap();
+
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut permit = Some(Arc::clone(&limiter).try_acquire_owned().unwrap());
+        let first_segment = progress
+            .wait_for_initial_muxed_segment(Duration::from_secs(1), &limiter, &mut permit)
+            .unwrap();
+
+        assert_eq!(first_segment, 25);
+    }
+
+
+    #[test]
+    fn hls_seek_point_uses_requested_source_boundary() {
+        let starts = hls_segment_start(
+            7,
+            0,
+            &[0, 10, 20, 30, 40, 50, 60, 70],
+            &[0, 100, 200, 300, 400, 500, 600, 700],
+        )
+        .unwrap();
+        assert_eq!(starts, (7, 70, 700));
+
+        let prepared = hls_segment_start(
+            2,
+            5,
+            &[0, 10, 20, 30, 40, 50],
+            &[0, 100, 200, 300, 400, 500],
+        )
+        .unwrap();
+        assert_eq!(prepared, (5, 50, 500));
+    }
+
+    #[test]
+    fn hls_seek_point_rejects_missing_source_boundary() {
+        assert!(hls_segment_start(8, 0, &[0, 10], &[0, 100]).is_err());
+    }
+
+
+    #[test]
+    fn direct_hls_playback_filters_frames_without_matroska_seek() {
+        assert!(!should_seek_matroska_source(true, false, false));
+        assert!(should_seek_matroska_source(true, true, false));
+        assert!(should_seek_matroska_source(true, false, true));
+        assert!(!should_seek_matroska_source(false, true, true));
     }
 }

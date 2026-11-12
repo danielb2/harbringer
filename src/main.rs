@@ -9991,6 +9991,7 @@ async fn log_not_found(State(state): State<AppState>, req: Request<Body>) -> Res
             direct_play = ?query.get("directPlay"),
             direct_stream = ?query.get("directStream"),
             direct_stream_audio = ?query.get("directStreamAudio"),
+            offset = ?query.get("offset"),
             media_path = ?query.get("path"),
             plex_product = ?query.get("X-Plex-Product"),
             client_profile = ?query.get("X-Plex-Client-Profile-Name"),
@@ -10160,17 +10161,17 @@ async fn plex_remux_start(
         return plex_remux_unavailable(protocol);
     }
     let transcode_video = direct_stream == Some("0");
+    let matroska_hls = protocol == "hls"
+        && direct_stream == Some("1")
+        && query.get("directStreamAudio").map(String::as_str) == Some("0")
+        && plex_profile_requests_hls_mkv(&query);
+
     let offset_seconds = match query.get("offset") {
         Some(offset) => match offset.parse::<f64>() {
             Ok(offset) if offset.is_finite() && offset >= 0.0 => offset,
             _ => return StatusCode::BAD_REQUEST.into_response(),
         },
         None => 0.0,
-    };
-    let offset_seconds = if protocol == "dash" {
-        offset_seconds
-    } else {
-        0.0
     };
     let Some(transcode_audio) = plex_remux_audio_mode(protocol, query) else {
         warn!(
@@ -10195,6 +10196,7 @@ async fn plex_remux_start(
                 && session.transcode_audio == transcode_audio
                 && session.transcode_video == transcode_video
                 && session.offset_seconds == offset_seconds
+                && session.playback.matroska_hls() == matroska_hls
                 && !session.playback.has_failed()
             {
                 session.expires_at = Instant::now() + PLEX_REMUX_SESSION_TTL;
@@ -10226,6 +10228,7 @@ async fn plex_remux_start(
             transcode_audio,
             transcode_video,
             protocol == "dash",
+            matroska_hls,
             offset_seconds,
         )
     })
@@ -10270,12 +10273,12 @@ async fn plex_remux_start(
         PLEX_REMUX_BUILD_LIMITER.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1))),
     );
     let worker = tokio::spawn(async move {
-        let Ok(permit) = limiter.acquire_owned().await else {
+        let Ok(permit) = Arc::clone(&limiter).acquire_owned().await else {
             return;
         };
+        let build_limiter = Arc::clone(&limiter);
         let result = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            worker_playback.build(&path)
+            worker_playback.build_with_permit(&path, build_limiter, permit)
         })
         .await;
         match result {
@@ -10314,6 +10317,31 @@ fn plex_remux_audio_mode(protocol: &str, query: &BTreeMap<String, String>) -> Op
         _ => None,
     }
 }
+
+
+fn plex_profile_requests_hls_mkv(query: &BTreeMap<String, String>) -> bool {
+    query
+        .get("X-Plex-Client-Profile-Extra")
+        .is_some_and(|profile| {
+            profile
+                .split("add-transcode-target(")
+                .skip(1)
+                .filter_map(|target| target.split_once(')').map(|(target, _)| target))
+                .any(|target| {
+                    let mut hls = false;
+                    let mut matroska = false;
+                    for parameter in target.split('&') {
+                        let Some((key, value)) = parameter.split_once('=') else {
+                            continue;
+                        };
+                        hls |= key == "protocol" && value == "hls";
+                        matroska |= key == "container" && value == "mkv";
+                    }
+                    hls && matroska
+                })
+        })
+}
+
 
 fn plex_remux_unavailable(protocol: &str) -> Response {
     let message = if protocol == "dash" {
@@ -10368,8 +10396,13 @@ async fn plex_remux_resource(
         title: "Plex playback segment".to_owned(),
         path,
         size: metadata.len(),
-        container: "mp4".to_owned(),
-        mime: "video/mp4".to_owned(),
+        container: if playback.matroska_hls() { "mkv" } else { "mp4" }.to_owned(),
+        mime: if playback.matroska_hls() {
+            "video/x-matroska"
+        } else {
+            "video/mp4"
+        }
+        .to_owned(),
         metadata_revision: 0,
     };
     plex_protocol_response(stream_file(&media, method, headers, false).await)
@@ -16986,8 +17019,8 @@ async fn plex_playback_decision(
     let protocol = query.get("protocol").map(String::as_str).unwrap_or("http");
     let direct_stream = query.get("directStream").map(String::as_str);
     let audio_copy_disabled = query.get("directStreamAudio").map(String::as_str) == Some("0");
-    let transcode_audio = audio_copy_disabled
-        || (protocol == "dash" && query.get("directStreamAudio").is_none());
+    let transcode_audio =
+        audio_copy_disabled || (protocol == "dash" && query.get("directStreamAudio").is_none());
     if direct_stream == Some("0")
         && matches!(protocol, "hls" | "dash")
         && plex_can_transcode_video(&video)
@@ -17007,7 +17040,16 @@ async fn plex_playback_decision(
         && matches!(protocol, "hls" | "dash")
         && plex_can_transcode_audio(&video)
     {
-        plex_mark_audio_transcode_decision(&mut video, protocol);
+        let container = if protocol == "hls"
+            && direct_stream == Some("1")
+            && audio_copy_disabled
+            && plex_profile_requests_hls_mkv(&query)
+        {
+            "mkv"
+        } else {
+            "mp4"
+        };
+        plex_mark_audio_transcode_decision(&mut video, protocol, container);
         info!(
             media_id,
             section, protocol, "Plex audio conversion decision returned"
@@ -17096,7 +17138,11 @@ fn plex_can_transcode_video(video: &serde_json::Value) -> bool {
     has_hevc_video && !unsupported_selected_audio && !has_selected_subtitle
 }
 
-fn plex_mark_audio_transcode_decision(video: &mut serde_json::Value, protocol: &str) {
+fn plex_mark_audio_transcode_decision(
+    video: &mut serde_json::Value,
+    protocol: &str,
+    container_name: &str,
+) {
     let Some(media) = video
         .get_mut("Media")
         .and_then(serde_json::Value::as_array_mut)
@@ -17107,7 +17153,7 @@ fn plex_mark_audio_transcode_decision(video: &mut serde_json::Value, protocol: &
     media["decision"] = serde_json::json!("transcode");
     media["selected"] = serde_json::json!(true);
     media["protocol"] = serde_json::json!(protocol);
-    media["container"] = serde_json::json!("mp4");
+    media["container"] = serde_json::json!(container_name);
     media["audioCodec"] = serde_json::json!("aac");
     media["audioChannels"] = serde_json::json!(2);
     let Some(part) = media
@@ -17119,7 +17165,7 @@ fn plex_mark_audio_transcode_decision(video: &mut serde_json::Value, protocol: &
     };
     part["decision"] = serde_json::json!("transcode");
     part["protocol"] = serde_json::json!(protocol);
-    part["container"] = serde_json::json!("mp4");
+    part["container"] = serde_json::json!(container_name);
     if let Some(streams) = part
         .get_mut("Stream")
         .and_then(serde_json::Value::as_array_mut)
@@ -17140,6 +17186,8 @@ fn plex_mark_audio_transcode_decision(video: &mut serde_json::Value, protocol: &
         }
     }
 }
+
+
 
 
 fn plex_mark_video_transcode_decision(
