@@ -14,7 +14,7 @@ Harbringer is an alternative, independent implementation of Plex Media Server. I
 - Store matched metadata in the server database or beside your media files as portable sidecars.
 - Play supported files directly, with seeking and playback progress.
 - Use Plex Desktop for playback of supported H.264 Matroska media, including optional AAC audio.
-- Create bilingual subtitles from external or supported embedded text tracks. Completed pairs are saved beside the video as `<video>.en-vi.srt` and reused on later playback.
+- Create bilingual subtitles from external or supported embedded text tracks. Progress is staged beside the video as `<video>.en-vi.vtt.part`; the completed sidecar keeps the source subtitle format and is available to Plex clients.
 
 ## Run Harbringer
 
@@ -54,7 +54,7 @@ Open `http://localhost:32400/`. In **Settings**, add `/media` as a library folde
 
 The media mount is read-only by default while Harbringer is in alpha. For disposable test media, remove `:ro` (`./media:/media`) to let server actions delete files.
 
-Bilingual subtitle generation also writes the finished SRT beside the video. The read-only `:ro` media mount prevents that; use a writable media mount to generate bilingual sidecars.
+Bilingual subtitle generation writes progress and the finished sidecar beside the video. The read-only `:ro` media mount prevents that; use a writable media mount to generate bilingual sidecars. Plex playback can continue while translation runs in the background.
 
 Harbringer currently indexes visible `.mp4`, `.m4v`, `.mkv`, and `.webm` files. The **Files** view also shows other visible files in your library folders.
 
@@ -78,6 +78,6 @@ Removing a folder from a library only detaches it. It does not delete the media 
 
 ## Current limitations
 
-Harbringer is under active development and is not yet a complete replacement for Plex Media Server. API coverage and client behavior are incomplete. Playback support is limited: HLS and video codecs other than H.264 are not supported by the current transcoding path, and Plex Web playback remains under validation. Embedded subtitle extraction currently supports text tracks in Matroska files; image-based subtitles cannot be translated. Google Translate can rate-limit requests; completed cue translations are saved so a later attempt can resume.
+Harbringer is under active development and is not yet a complete replacement for Plex Media Server. API coverage and client behavior are incomplete. Playback support is limited: HLS and video codecs other than H.264 are not supported by the current transcoding path, and Plex Web playback remains under validation. Embedded subtitle extraction currently supports text tracks in Matroska files; image-based subtitles cannot be translated. Google Translate can rate-limit requests; completed bilingual cues are staged beside the video so a later attempt can resume.
 
 See [`ROADMAP.md`](ROADMAP.md) for the compatibility status and remaining work.

@@ -169,7 +169,7 @@ fn plex_library_uuid_for_id(machine_identifier: &str, stable_id: i64) -> String 
 struct AppState {
     config: Arc<Mutex<Config>>,
     config_path: Arc<PathBuf>,
-    translated_subtitles_dir: Arc<PathBuf>,
+    subtitle_checkpoints_dir: Arc<PathBuf>,
     db: Arc<Mutex<Connection>>,
     server_name: Arc<RwLock<String>>,
     machine_identifier: Arc<str>,
@@ -203,6 +203,7 @@ const PLEX_REMUX_SESSION_TTL: Duration = Duration::from_secs(4 * 60 * 60);
 static PLEX_REMUX_BUILD_LIMITER: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 static TRANSLATION_CACHE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     OnceLock::new();
+static ACTIVE_TRANSLATION_JOBS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 #[derive(Clone)]
 struct Media {
@@ -537,7 +538,7 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
     let (plex_notifications, _) = tokio::sync::broadcast::channel(64);
     let state = AppState {
         config: Arc::new(Mutex::new(config.clone())),
-        translated_subtitles_dir: Arc::new(
+        subtitle_checkpoints_dir: Arc::new(
             config_path
                 .parent()
                 .unwrap_or(std::path::Path::new("."))
@@ -2161,9 +2162,13 @@ async fn translate_subtitle_cached(
     first: &str,
     second: &str,
 ) -> Result<String, String> {
-    let sidecar_path = bilingual_subtitle_path(media, first, second);
+    let output_extension = match extension.to_ascii_lowercase().as_str() {
+        "srt" | "vtt" | "ass" => extension.to_ascii_lowercase(),
+        _ => return Err("This subtitle format cannot be translated".to_owned()),
+    };
+    let sidecar_path = bilingual_subtitle_path(media, first, second, &output_extension);
     if let Ok(contents) = tokio::fs::read_to_string(&sidecar_path).await {
-        return Ok(srt_to_vtt(&contents));
+        return Ok(subtitle_to_vtt(&contents, &output_extension));
     }
     let translation_input = match extension {
         "srt" | "vtt" => contents.to_owned(),
@@ -2176,60 +2181,174 @@ async fn translate_subtitle_cached(
     hash.update(source.as_bytes());
     hash.update(first.as_bytes());
     hash.update(second.as_bytes());
-    let name = format!(
-        "{}.vtt",
-        hash.finalize()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    );
-    let path = state.translated_subtitles_dir.join(name);
+    let checkpoint_key = hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     let cache_lock = TRANSLATION_CACHE_LOCKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .map_err(|_| "Translation cache is unavailable".to_owned())?
-        .entry(path.to_string_lossy().into_owned())
+        .entry(sidecar_path.to_string_lossy().into_owned())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone();
     let _cache_guard = cache_lock.lock().await;
-    if let Ok(cached) = tokio::fs::read_to_string(&path).await {
-        save_bilingual_sidecar(&sidecar_path, &cached).await?;
+    if let Ok(contents) = tokio::fs::read_to_string(&sidecar_path).await {
+        return Ok(subtitle_to_vtt(&contents, &output_extension));
+    }
+    let legacy_cache_path = state
+        .subtitle_checkpoints_dir
+        .join(format!("{checkpoint_key}.vtt"));
+    if let Ok(cached) = tokio::fs::read_to_string(&legacy_cache_path).await {
+        save_bilingual_sidecar(&sidecar_path, &cached, &output_extension).await?;
         return Ok(cached);
     }
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(45))
         .build()
         .map_err(|_| "Could not initialize Google Translate".to_owned())?;
-    tokio::fs::create_dir_all(state.translated_subtitles_dir.as_path())
+    tokio::fs::create_dir_all(state.subtitle_checkpoints_dir.as_path())
         .await
-        .map_err(|_| "Could not create subtitle cache".to_owned())?;
-    let checkpoint_path = PathBuf::from(format!("{}.part", path.to_string_lossy()));
+        .map_err(|_| "Could not create subtitle checkpoint directory".to_owned())?;
+    let sidecar_part_path = bilingual_subtitle_path(media, first, second, "vtt");
+    let sidecar_part_path = PathBuf::from(format!("{}.part", sidecar_part_path.to_string_lossy()));
+    if tokio::fs::metadata(&sidecar_part_path).await.is_err() {
+        for suffix in ["jsonl.part", "vtt.part"] {
+            let legacy_checkpoint_path = state
+                .subtitle_checkpoints_dir
+                .join(format!("{checkpoint_key}.{suffix}"));
+            if tokio::fs::metadata(&legacy_checkpoint_path).await.is_ok() {
+                let _ = subtitles::migrate_legacy_checkpoint_to_vtt(
+                    &translation_input,
+                    &legacy_checkpoint_path,
+                    &sidecar_part_path,
+                )
+                .await;
+                break;
+            }
+        }
+    }
     let vtt = subtitles::translate_bilingual_resumable(
         &client,
         &translation_input,
         source,
         first,
         second,
-        &checkpoint_path,
+        &sidecar_part_path,
     )
     .await?;
-    tokio::fs::write(path, &vtt)
-        .await
-        .map_err(|_| "Could not save translated subtitles".to_owned())?;
-    save_bilingual_sidecar(&sidecar_path, &vtt).await?;
-    let _ = tokio::fs::remove_file(checkpoint_path).await;
+    save_bilingual_sidecar(&sidecar_path, &vtt, &output_extension).await?;
     Ok(vtt)
 }
 
-async fn save_bilingual_sidecar(path: &std::path::Path, vtt: &str) -> Result<(), String> {
+async fn save_bilingual_sidecar(
+    path: &std::path::Path,
+    vtt: &str,
+    extension: &str,
+) -> Result<(), String> {
     let temporary = PathBuf::from(format!("{}.part", path.to_string_lossy()));
-    let contents = vtt_to_srt(vtt);
+    let contents = match extension {
+        "srt" => vtt_to_srt(vtt),
+        "vtt" => vtt.to_owned(),
+        "ass" => vtt_to_ass(vtt),
+        _ => return Err("This subtitle format cannot be written".to_owned()),
+    };
     tokio::fs::write(&temporary, contents)
         .await
-        .map_err(|_| "Could not write bilingual SRT sidecar".to_owned())?;
+        .map_err(|_| "Could not write bilingual subtitle sidecar".to_owned())?;
     tokio::fs::rename(&temporary, path)
         .await
-        .map_err(|_| "Could not finalize bilingual SRT sidecar".to_owned())
+        .map_err(|_| "Could not finalize bilingual subtitle sidecar".to_owned())
+}
+
+async fn translated_subtitle_preview(
+    state: &AppState,
+    media: &Media,
+    source_contents: &str,
+    source_language: &str,
+    source_format: &str,
+    first: &str,
+    second: &str,
+) -> String {
+    let extension = source_format.to_ascii_lowercase();
+    let final_path = bilingual_subtitle_path(media, first, second, &extension);
+    if let Ok(contents) = tokio::fs::read_to_string(&final_path).await {
+        return subtitle_to_vtt(&contents, &extension);
+    }
+
+    let checkpoint_path = bilingual_subtitle_path(media, first, second, "vtt");
+    let checkpoint_path = PathBuf::from(format!("{}.part", checkpoint_path.to_string_lossy()));
+    let job_key = final_path.to_string_lossy().into_owned();
+    let state = state.clone();
+    let media = media.clone();
+    let source_contents = source_contents.to_owned();
+    let source_language = source_language.to_owned();
+    let source_format = source_format.to_owned();
+    let first = first.to_owned();
+    let second = second.to_owned();
+    staged_subtitle_preview(
+        &final_path,
+        &checkpoint_path,
+        job_key,
+        async move {
+            if let Err(error) = translate_subtitle_cached(
+                &state,
+                &media,
+                &source_contents,
+                &source_language,
+                &source_format,
+                &first,
+                &second,
+            )
+            .await
+            {
+                tracing::error!(media = %media.title, error = %error, "background bilingual subtitle generation failed");
+            }
+        },
+    )
+    .await
+}
+
+async fn staged_subtitle_preview(
+    final_path: &std::path::Path,
+    checkpoint_path: &std::path::Path,
+    job_key: String,
+    background_job: impl std::future::Future<Output = ()> + Send + 'static,
+) -> String {
+    let jobs = ACTIVE_TRANSLATION_JOBS.get_or_init(|| Mutex::new(HashSet::new()));
+    let start_job = jobs.lock().is_ok_and(|mut jobs| jobs.insert(job_key.clone()));
+    if start_job {
+        tokio::spawn(async move {
+            background_job.await;
+            if let Some(jobs) = ACTIVE_TRANSLATION_JOBS.get() {
+                if let Ok(mut jobs) = jobs.lock() {
+                    jobs.remove(&job_key);
+                }
+            }
+        });
+    }
+
+    if let Ok(contents) = tokio::fs::read_to_string(final_path).await {
+        let extension = final_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("srt");
+        return subtitle_to_vtt(&contents, extension);
+    }
+    let mut preview = tokio::fs::read_to_string(checkpoint_path)
+        .await
+        .unwrap_or_else(|_| "WEBVTT\n\n".to_owned());
+    for _ in 0..30 {
+        if subtitles::parse_subtitles(&preview).is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        if let Ok(contents) = tokio::fs::read_to_string(&checkpoint_path).await {
+            preview = contents;
+        }
+    }
+    preview
 }
 
 #[derive(Deserialize)]
@@ -3337,7 +3456,7 @@ async fn translation_settings_page(State(state): State<AppState>) -> Response {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let body = format!(
-        r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Subtitle translation · harbringer</title><style>body{{margin:0;padding:2rem;color:#f9fafb;background:#111827;font:16px system-ui}}main{{max-width:48rem;margin:auto}}form{{display:grid;gap:1rem;padding:1.5rem;border:1px solid #374151;border-radius:.8rem;background:#1f2937}}label{{display:grid;gap:.4rem}}select,button{{padding:.65rem;color:#fff;background:#111827;border:1px solid #4b5563;border-radius:.4rem}}.note{{color:#9ca3af;line-height:1.5}}a{{color:#93c5fd}}</style><main><p><a href="/settings">← Settings</a></p><h1>Subtitle translation</h1><p class="note">Translation uses Google Translate while playing or ahead of time. No API key is required. Subtitle text is sent to Google for translation; completed translations are cached in the server configuration directory.</p><form method="post" action="/settings/translation"><label><span>First subtitle language</span><select name="language_primary">{}</select></label><label><span>Second subtitle language</span><select name="language_secondary">{}</select></label><button type="submit">Save translation settings</button></form></main></html>"#,
+        r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Subtitle translation · harbringer</title><style>body{{margin:0;padding:2rem;color:#f9fafb;background:#111827;font:16px system-ui}}main{{max-width:48rem;margin:auto}}form{{display:grid;gap:1rem;padding:1.5rem;border:1px solid #374151;border-radius:.8rem;background:#1f2937}}label{{display:grid;gap:.4rem}}select,button{{padding:.65rem;color:#fff;background:#111827;border:1px solid #4b5563;border-radius:.4rem}}.note{{color:#9ca3af;line-height:1.5}}a{{color:#93c5fd}}</style><main><p><a href="/settings">← Settings</a></p><h1>Subtitle translation</h1><p class="note">Translation uses Google Translate while playing or ahead of time. No API key is required. Subtitle text is sent to Google for translation. Progress is staged beside the media file, and the completed bilingual subtitle is saved there in the source subtitle format so Plex clients can discover it.</p><form method="post" action="/settings/translation"><label><span>First subtitle language</span><select name="language_primary">{}</select></label><label><span>Second subtitle language</span><select name="language_secondary">{}</select></label><button type="submit">Save translation settings</button></form></main></html>"#,
         translation_language_options(&config.subtitle_language_primary),
         translation_language_options(&config.subtitle_language_secondary),
     );
@@ -9003,7 +9122,7 @@ fn external_subtitle_pair(
     Some((first, second))
 }
 
-fn bilingual_subtitle_path(media: &Media, first: &str, second: &str) -> PathBuf {
+fn bilingual_subtitle_path(media: &Media, first: &str, second: &str, extension: &str) -> PathBuf {
     let stem = media
         .path
         .file_stem()
@@ -9014,10 +9133,67 @@ fn bilingual_subtitle_path(media: &Media, first: &str, second: &str) -> PathBuf 
         .parent()
         .unwrap_or(std::path::Path::new("."))
         .join(format!(
-            "{stem}.{}-{}.srt",
+            "{stem}.{}-{}.{}",
             first.to_ascii_lowercase(),
-            second.to_ascii_lowercase()
+            second.to_ascii_lowercase(),
+            extension.to_ascii_lowercase()
         ))
+}
+
+fn subtitle_to_vtt(contents: &str, extension: &str) -> String {
+    match extension {
+        "srt" => srt_to_vtt(contents),
+        "ass" => ass_to_vtt(contents),
+        _ => contents.to_owned(),
+    }
+}
+
+fn vtt_to_ass(contents: &str) -> String {
+    let mut output = String::from(
+        "[Script Info]\nScriptType: v4.00+\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,1,2,0,2,20,20,20,1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
+    );
+    for block in contents.replace("\r\n", "\n").split("\n\n") {
+        let mut lines = block.lines();
+        let first = lines.next().unwrap_or_default();
+        if first.trim_start().starts_with("WEBVTT") || !first.contains(" --> ") {
+            continue;
+        }
+        let mut timing = first.split(" --> ");
+        let Some(start) = timing.next() else { continue };
+        let Some(end) = timing.next() else { continue };
+        let text = lines.collect::<Vec<_>>().join("\\N");
+        if text.is_empty() {
+            continue;
+        }
+        output.push_str(&format!(
+            "Dialogue: 0,{},{},Default,,0,0,0,,{}\n",
+            vtt_time_to_ass(start),
+            vtt_time_to_ass(end),
+            text
+        ));
+    }
+    output
+}
+
+fn vtt_time_to_ass(value: &str) -> String {
+    let value = value.split_whitespace().next().unwrap_or(value);
+    let mut parts = value.split(':');
+    let hours = parts
+        .next()
+        .unwrap_or("0")
+        .parse::<u32>()
+        .unwrap_or_default();
+    let minutes = parts
+        .next()
+        .unwrap_or("0")
+        .parse::<u32>()
+        .unwrap_or_default();
+    let seconds = parts
+        .next()
+        .unwrap_or("0")
+        .parse::<f64>()
+        .unwrap_or_default();
+    format!("{}:{:02}:{:05.2}", hours, minutes, seconds)
 }
 
 fn external_subtitle_language_token<'a>(stem: &str, candidate: &'a str) -> String {
@@ -18339,7 +18515,7 @@ async fn plex_stream(
             else {
                 return StatusCode::NOT_FOUND.into_response();
             };
-            return match translate_subtitle_cached(
+            let contents = translated_subtitle_preview(
                 &state,
                 media,
                 &source,
@@ -18348,22 +18524,17 @@ async fn plex_stream(
                 first,
                 second,
             )
-            .await
-            {
-                Ok(contents) => {
-                    let requested = query.get("format").map(String::as_str).unwrap_or(extension);
-                    let (mime, body) = if requested == "srt" {
-                        ("text/srt; charset=utf-8", vtt_to_srt(&contents))
-                    } else {
-                        ("text/vtt; charset=utf-8", contents)
-                    };
-                    ([(header::CONTENT_TYPE, mime)], body).into_response()
-                }
-                Err(error) => {
-                    tracing::error!(media = %media.title, stream_id, error = %error, "generated Plex subtitle stream failed");
-                    (StatusCode::BAD_GATEWAY, error).into_response()
-                }
+            .await;
+            let requested = query
+                .get("format")
+                .map(|format| format.to_ascii_lowercase())
+                .unwrap_or_else(|| extension.to_owned());
+            let (mime, body) = if requested == "srt" {
+                ("text/srt; charset=utf-8", vtt_to_srt(&contents))
+            } else {
+                ("text/vtt; charset=utf-8", contents)
             };
+            return ([(header::CONTENT_TYPE, mime)], body).into_response();
         }
     }
     for media in media_index.iter() {

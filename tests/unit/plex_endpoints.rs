@@ -155,7 +155,7 @@ fn fixture() -> Fixture {
     let (plex_notifications, _) = tokio::sync::broadcast::channel(64);
     let state = AppState {
         config: shared_config.clone(),
-        translated_subtitles_dir: Arc::new(config_dir.join("translated_subtitles")),
+        subtitle_checkpoints_dir: Arc::new(config_dir.join("translated_subtitles")),
         config_path: Arc::new(config_path),
         db: shared_db.clone(),
         server_name: Arc::new(super::RwLock::new("harbringer".to_owned())),
@@ -252,7 +252,7 @@ fn tv_fixture() -> Fixture {
     let (plex_notifications, _) = tokio::sync::broadcast::channel(64);
     let state = AppState {
         config: shared_config.clone(),
-        translated_subtitles_dir: Arc::new(config_dir.join("translated_subtitles")),
+        subtitle_checkpoints_dir: Arc::new(config_dir.join("translated_subtitles")),
         config_path: Arc::new(config_path),
         db: shared_db.clone(),
         server_name: Arc::new(super::RwLock::new("harbringer".to_owned())),
@@ -2390,16 +2390,76 @@ async fn bilingual_sidecar_is_recognized_and_reused_without_translation() {
 async fn completed_bilingual_track_is_written_as_a_named_srt_sidecar() {
     let fixture = fixture();
     let media = fixture.state.media.read().unwrap()[0].clone();
-    let sidecar = super::bilingual_subtitle_path(&media, "en", "vi");
+    let sidecar = super::bilingual_subtitle_path(&media, "en", "vi", "srt");
     super::save_bilingual_sidecar(
         &sidecar,
         "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n",
+        "srt",
     )
     .await
     .unwrap();
     assert_eq!(sidecar.file_name().unwrap(), "Demo.en-vi.srt");
     let contents = std::fs::read_to_string(sidecar).unwrap();
     assert!(contents.starts_with("1\n00:00:01,000 --> 00:00:02,000"));
+    assert!(contents.contains("Hello\nXin chào"));
+}
+
+#[tokio::test]
+async fn bilingual_sidecar_keeps_vtt_or_ass_source_format() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let vtt = super::bilingual_subtitle_path(&media, "en", "vi", "vtt");
+    super::save_bilingual_sidecar(
+        &vtt,
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n",
+        "vtt",
+    )
+    .await
+    .unwrap();
+    assert_eq!(vtt.extension().unwrap(), "vtt");
+    assert!(std::fs::read_to_string(vtt).unwrap().starts_with("WEBVTT"));
+
+    let ass = super::bilingual_subtitle_path(&media, "en", "vi", "ass");
+    super::save_bilingual_sidecar(
+        &ass,
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n",
+        "ass",
+    )
+    .await
+    .unwrap();
+    assert_eq!(ass.extension().unwrap(), "ass");
+    let contents = std::fs::read_to_string(ass).unwrap();
+    assert!(contents.contains("[Events]"));
+    assert!(contents.contains("Hello\\NXin chào"));
+}
+
+#[tokio::test]
+async fn plex_translated_stream_returns_the_staged_part_without_waiting_for_completion() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let checkpoint = super::bilingual_subtitle_path(&media, "en", "vi", "vtt");
+    let checkpoint = std::path::PathBuf::from(format!("{}.part", checkpoint.to_string_lossy()));
+    std::fs::write(
+        &checkpoint,
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n",
+    )
+    .unwrap();
+    let final_path = super::bilingual_subtitle_path(&media, "en", "vi", "vtt");
+    let (resume_job, wait_for_resume) = tokio::sync::oneshot::channel::<()>();
+    let contents = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        super::staged_subtitle_preview(
+            &final_path,
+            &checkpoint,
+            final_path.to_string_lossy().into_owned(),
+            async move {
+                let _ = wait_for_resume.await;
+            },
+        ),
+    )
+    .await
+    .expect("subtitle request waited for the stalled background translation");
+    resume_job.send(()).unwrap();
     assert!(contents.contains("Hello\nXin chào"));
 }
 

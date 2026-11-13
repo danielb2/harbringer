@@ -67,22 +67,21 @@ fn escape_vtt(text: &str) -> String {
         .replace("-->", "—›")
 }
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 struct CueCheckpoint {
     index: usize,
     first: Option<String>,
     second: Option<String>,
 }
 
-/// Translate subtitles incrementally. Each completed cue is appended to a
-/// checkpoint so later attempts can continue after a rate limit or restart.
+/// Translate subtitles incrementally into a WebVTT checkpoint beside the video.
 pub async fn translate_bilingual_resumable(
     client: &reqwest::Client,
     contents: &str,
     source_language: &str,
     first_language: &str,
     second_language: &str,
-    checkpoint_path: &Path,
+    output_part_path: &Path,
 ) -> Result<String, String> {
     translate_bilingual_resumable_at(
         client,
@@ -91,7 +90,7 @@ pub async fn translate_bilingual_resumable(
         source_language,
         first_language,
         second_language,
-        checkpoint_path,
+        output_part_path,
     )
     .await
 }
@@ -103,95 +102,126 @@ async fn translate_bilingual_resumable_at(
     source_language: &str,
     first_language: &str,
     second_language: &str,
-    checkpoint_path: &Path,
+    output_part_path: &Path,
 ) -> Result<String, String> {
     let cues = parse_subtitles(contents)?;
-    let mut checkpoint_records = read_checkpoint(checkpoint_path, cues.len()).await?;
-    if let Some(parent) = checkpoint_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|_| "Could not create subtitle checkpoint directory".to_owned())?;
+    let staged_cues = read_staged_vtt(output_part_path, &cues).await?;
+    for cue in cues.iter().skip(staged_cues.len()) {
+        let first = if source_language == first_language {
+            cue.text.clone()
+        } else {
+            translate_batch(
+                client,
+                endpoint,
+                std::slice::from_ref(&cue.text),
+                source_language,
+                first_language,
+            )
+            .await?
+            .remove(0)
+        };
+        let second = if source_language == second_language {
+            cue.text.clone()
+        } else if first_language == second_language {
+            first.clone()
+        } else {
+            translate_batch(
+                client,
+                endpoint,
+                std::slice::from_ref(&cue.text),
+                source_language,
+                second_language,
+            )
+            .await?
+            .remove(0)
+        };
+        append_staged_vtt_cue(output_part_path, cue, &first, &second).await?;
     }
-    for (index, cue) in cues.iter().enumerate() {
-        if index == checkpoint_records.len() {
-            checkpoint_records.push(CueCheckpoint {
-                index,
-                first: None,
-                second: None,
-            });
-        }
-        if checkpoint_records[index].first.is_none() {
-            let first = if source_language == first_language {
-                cue.text.clone()
-            } else {
-                translate_batch(
-                    client,
-                    endpoint,
-                    std::slice::from_ref(&cue.text),
-                    source_language,
-                    first_language,
-                )
-                .await?
-                .remove(0)
-            };
-            checkpoint_records[index].first = Some(first);
-            append_checkpoint(checkpoint_path, &checkpoint_records[index]).await?;
-        }
-        if checkpoint_records[index].second.is_none() {
-            let second = if source_language == second_language {
-                cue.text.clone()
-            } else if first_language == second_language {
-                checkpoint_records[index].first.clone().unwrap_or_default()
-            } else {
-                translate_batch(
-                    client,
-                    endpoint,
-                    std::slice::from_ref(&cue.text),
-                    source_language,
-                    second_language,
-                )
-                .await?
-                .remove(0)
-            };
-            checkpoint_records[index].second = Some(second);
-            append_checkpoint(checkpoint_path, &checkpoint_records[index]).await?;
-        }
-    }
-
-    let first = checkpoint_records
-        .iter()
-        .map(|record| record.first.clone().unwrap_or_default())
-        .collect::<Vec<_>>();
-    let second = checkpoint_records
-        .iter()
-        .map(|record| record.second.clone().unwrap_or_default())
-        .collect::<Vec<_>>();
-    bilingual_vtt(&cues, &first, &second)
+    tokio::fs::read_to_string(output_part_path)
+        .await
+        .map_err(|_| "Could not read completed subtitle checkpoint".to_owned())
 }
 
-async fn append_checkpoint(path: &Path, record: &CueCheckpoint) -> Result<(), String> {
-    let mut line = serde_json::to_vec(record)
-        .map_err(|_| "Could not encode subtitle checkpoint".to_owned())?;
-    line.push(b'\n');
+async fn read_staged_vtt(output_path: &Path, source_cues: &[Cue]) -> Result<Vec<Cue>, String> {
+    let contents = match tokio::fs::read_to_string(output_path).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return Err("Could not read subtitle checkpoint in the media folder".to_owned()),
+    };
+    let parsed = if contents.trim().is_empty() {
+        Vec::new()
+    } else {
+        parse_subtitles(&contents).unwrap_or_default()
+    };
+    let completed = parsed
+        .iter()
+        .zip(source_cues)
+        .take_while(|(saved, source)| {
+            saved.start.replace(',', ".") == source.start.replace(',', ".")
+                && saved.end.replace(',', ".") == source.end.replace(',', ".")
+        })
+        .count();
+    let completed = parsed.into_iter().take(completed).collect::<Vec<_>>();
+    write_staged_vtt(output_path, &completed).await?;
+    Ok(completed)
+}
+
+async fn write_staged_vtt(output_path: &Path, cues: &[Cue]) -> Result<(), String> {
+    if let Some(parent) = output_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|_| "Could not create subtitle output directory".to_owned())?;
+    }
+    let mut output = String::from("WEBVTT\n\n");
+    for cue in cues {
+        output.push_str(&format!(
+            "{} --> {}\n{}\n\n",
+            cue.start.replace(',', "."),
+            cue.end.replace(',', "."),
+            cue.text
+        ));
+    }
+    tokio::fs::write(output_path, output)
+        .await
+        .map_err(|_| "Could not create subtitle checkpoint in the media folder".to_owned())
+}
+
+async fn append_staged_vtt_cue(
+    output_path: &Path,
+    cue: &Cue,
+    first: &str,
+    second: &str,
+) -> Result<(), String> {
+    let cue_text = format!(
+        "{} --> {}\n{}\n{}\n\n",
+        cue.start.replace(',', "."),
+        cue.end.replace(',', "."),
+        escape_vtt(first),
+        escape_vtt(second)
+    );
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(output_path)
         .await
-        .map_err(|_| "Could not open subtitle checkpoint".to_owned())?;
-    file.write_all(&line)
+        .map_err(|_| "Could not open subtitle checkpoint in the media folder".to_owned())?;
+    file.write_all(cue_text.as_bytes())
         .await
-        .map_err(|_| "Could not save subtitle checkpoint".to_owned())?;
+        .map_err(|_| "Could not append subtitle checkpoint in the media folder".to_owned())?;
     file.flush()
         .await
-        .map_err(|_| "Could not save subtitle checkpoint".to_owned())
+        .map_err(|_| "Could not save subtitle checkpoint in the media folder".to_owned())
 }
 
-async fn read_checkpoint(path: &Path, cue_count: usize) -> Result<Vec<CueCheckpoint>, String> {
-    let contents = match tokio::fs::read_to_string(path).await {
+pub async fn migrate_legacy_checkpoint_to_vtt(
+    source_contents: &str,
+    legacy_checkpoint_path: &Path,
+    output_part_path: &Path,
+) -> Result<(), String> {
+    let source_cues = parse_subtitles(source_contents)?;
+    let contents = match tokio::fs::read_to_string(legacy_checkpoint_path).await {
         Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(_) => return Err("Could not read subtitle checkpoint".to_owned()),
+        Err(_) => return Err("Could not read previous subtitle progress".to_owned()),
     };
     let mut records = Vec::new();
     for line in contents.lines() {
@@ -199,7 +229,7 @@ async fn read_checkpoint(path: &Path, cue_count: usize) -> Result<Vec<CueCheckpo
             break;
         };
         let index = record.index;
-        if index > records.len() || index >= cue_count {
+        if index > records.len() || index >= source_cues.len() {
             break;
         }
         if index == records.len() {
@@ -208,21 +238,23 @@ async fn read_checkpoint(path: &Path, cue_count: usize) -> Result<Vec<CueCheckpo
             records[index] = record;
         }
     }
-    if records.len() != contents.lines().count() {
-        let mut valid = records
-            .iter()
-            .map(serde_json::to_string)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| "Could not repair subtitle checkpoint".to_owned())?
-            .join("\n");
-        if !valid.is_empty() {
-            valid.push('\n');
-        }
-        tokio::fs::write(path, valid)
-            .await
-            .map_err(|_| "Could not repair subtitle checkpoint".to_owned())?;
-    }
-    Ok(records)
+    let completed = records
+        .iter()
+        .take_while(|record| record.first.is_some() && record.second.is_some())
+        .count();
+    let records = records.into_iter().take(completed).collect::<Vec<_>>();
+    let first = records
+        .iter()
+        .map(|record| record.first.clone().unwrap_or_default())
+        .collect::<Vec<_>>();
+    let second = records
+        .iter()
+        .map(|record| record.second.clone().unwrap_or_default())
+        .collect::<Vec<_>>();
+    let vtt = bilingual_vtt(&source_cues[..completed], &first, &second)?;
+    tokio::fs::write(output_part_path, vtt)
+        .await
+        .map_err(|_| "Could not migrate subtitle progress into the media folder".to_owned())
 }
 
 #[cfg(test)]
@@ -424,10 +456,10 @@ mod tests {
         );
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let directory = tempfile::tempdir().unwrap();
-        let checkpoint = directory.path().join("translated.vtt.part");
+        let output_part = directory.path().join("Movie.en-vi.vtt.part");
         tokio::fs::write(
-            &checkpoint,
-            "{\"index\":0,\"first\":\"Hello\",\"second\":\"Xin chào\"}\n",
+            &output_part,
+            "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n",
         )
         .await
         .unwrap();
@@ -439,7 +471,7 @@ mod tests {
             "en",
             "en",
             "vi",
-            &checkpoint,
+            &output_part,
         )
         .await
         .unwrap();
@@ -447,5 +479,8 @@ mod tests {
         assert!(output.contains("Hello\nXin chào"));
         assert!(output.contains("World\nvi:World"));
         assert_eq!(*requested_texts.lock().unwrap(), vec!["World"]);
+        let staged = tokio::fs::read_to_string(output_part).await.unwrap();
+        assert!(staged.contains("Hello\nXin chào"));
+        assert!(staged.contains("World\nvi:World"));
     }
 }
