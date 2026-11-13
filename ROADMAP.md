@@ -90,6 +90,7 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 
 ### 2026-11-13
 
+- Subtitle controls now live in a collapsible section on the main Settings page. The global switch hides generated and merged bilingual tracks from Plex metadata and the built-in player; playback-driven translation is cancellable on stop, while per-episode full preparation remains available. The web player polls staged cues during playback, and matching individual language sidecars are merged and marked `Merged`. Checks: full `cargo test` passed all 176 tests and `git diff --check` passed; live Plex client display still needs validation.
 - Plex Desktop logs showed translated subtitle stream requests remaining open while every subtitle cue was translated, delaying playback and leaving the selected bilingual track without a response. The stream now returns the staged WebVTT preview while cue translation continues in a background job; progress is stored beside the media and a completed sidecar keeps the source subtitle format for Plex clients to discover. Added a regression test with a deliberately stalled background job. Live Plex display and playback still need client validation. Checks: full `cargo test` passed all 172 tests and `git diff --check` passed.
 
 ### 2026-11-12

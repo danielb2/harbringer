@@ -72,6 +72,8 @@ struct Config {
     subtitle_language_primary: String,
     #[serde(default = "default_subtitle_language_secondary")]
     subtitle_language_secondary: String,
+    #[serde(default = "default_true")]
+    bilingual_subtitles_enabled: bool,
     #[serde(default)]
     plex_account_preferences: BTreeMap<String, String>,
 }
@@ -203,7 +205,66 @@ const PLEX_REMUX_SESSION_TTL: Duration = Duration::from_secs(4 * 60 * 60);
 static PLEX_REMUX_BUILD_LIMITER: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 static TRANSLATION_CACHE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     OnceLock::new();
-static ACTIVE_TRANSLATION_JOBS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static ACTIVE_TRANSLATION_JOBS: OnceLock<Mutex<HashMap<String, ActiveTranslationJob>>> =
+    OnceLock::new();
+
+struct ActiveTranslationJob {
+    media_id: String,
+    explicit: bool,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn start_translation_job(
+    job_key: String,
+    media_id: String,
+    explicit: bool,
+) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+    let mut jobs = ACTIVE_TRANSLATION_JOBS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()?;
+    if jobs.contains_key(&job_key) {
+        return None;
+    }
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    jobs.insert(
+        job_key,
+        ActiveTranslationJob {
+            media_id,
+            explicit,
+            cancelled: cancelled.clone(),
+        },
+    );
+    Some(cancelled)
+}
+
+fn finish_translation_job(job_key: &str) {
+    if let Some(jobs) = ACTIVE_TRANSLATION_JOBS.get() {
+        if let Ok(mut jobs) = jobs.lock() {
+            jobs.remove(job_key);
+        }
+    }
+}
+
+fn cancel_streaming_translation_jobs(media_id: &str) {
+    if let Some(jobs) = ACTIVE_TRANSLATION_JOBS.get() {
+        if let Ok(jobs) = jobs.lock() {
+            for job in jobs.values().filter(|job| job.media_id == media_id && !job.explicit) {
+                job.cancelled.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+}
+
+fn cancel_all_translation_jobs() {
+    if let Some(jobs) = ACTIVE_TRANSLATION_JOBS.get() {
+        if let Ok(jobs) = jobs.lock() {
+            for job in jobs.values() {
+                job.cancelled.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 struct Media {
@@ -698,6 +759,7 @@ fn build_app(state: AppState) -> Router {
         .route("/", get(root_handler))
         .route("/web/stream", any(web_stream))
         .route("/web/progress", get(web_progress).post(update_web_progress))
+        .route("/web/translation-stop", post(stop_web_translation))
         .route("/web/watch-action", post(web_watch_action))
         .route(
             "/web/subtitle-selection",
@@ -709,7 +771,7 @@ fn build_app(state: AppState) -> Router {
         .route("/web/info", get(web_info))
         .route("/web/tv-match/search", get(tv_match_search))
         .route("/web/tv-match/select", post(tv_match_select))
-        .route("/settings", get(settings_page))
+        .route("/settings", get(settings_page).post(save_translation_settings))
         .route("/settings/translation", get(translation_settings_page).post(save_translation_settings))
         .route("/settings/logs/socket", get(settings_logs_socket))
         .route("/settings/libraries", post(create_library))
@@ -1443,6 +1505,7 @@ fn load_config(path: &std::path::Path) -> Result<Config, Box<dyn std::error::Err
             tmdb_bearer_token: None,
             subtitle_language_primary: default_subtitle_language_primary(),
             subtitle_language_secondary: default_subtitle_language_secondary(),
+            bilingual_subtitles_enabled: default_true(),
             plex_account_preferences: BTreeMap::new(),
         });
     }
@@ -2028,6 +2091,12 @@ struct ProgressUpdate {
 }
 
 #[derive(Deserialize)]
+struct WebTranslationStopRequest {
+    path: String,
+    library: Option<usize>,
+}
+
+#[derive(Deserialize)]
 struct WebSubtitleSelectionUpdate {
     path: String,
     library: Option<usize>,
@@ -2067,6 +2136,14 @@ async fn web_translated_subtitle(
     State(state): State<AppState>,
     Json(request): Json<WebTranslatedSubtitleRequest>,
 ) -> Response {
+    if !state
+        .config
+        .lock()
+        .is_ok_and(|config| config.bilingual_subtitles_enabled)
+    {
+        return (StatusCode::FORBIDDEN, "Bilingual subtitles are disabled in Settings")
+            .into_response();
+    }
     if request.first_language == request.second_language
         || isolang::Language::from_639_1(&request.first_language).is_none()
         || isolang::Language::from_639_1(&request.second_language).is_none()
@@ -2106,17 +2183,42 @@ async fn web_translated_subtitle(
             Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
         }
     };
-    match translate_subtitle_cached(
-        &state,
-        &media,
-        &contents,
-        &source_language,
-        &format,
-        &request.first_language,
-        &request.second_language,
-    )
-    .await
-    {
+    let translated = if request.prepared {
+        let job_key = format!(
+            "prepared:{}:{}:{}",
+            media.id, request.first_language, request.second_language
+        );
+        let Some(cancellation) = start_translation_job(job_key.clone(), media.id.clone(), true)
+        else {
+            return (StatusCode::CONFLICT, "This bilingual subtitle is already being prepared")
+                .into_response();
+        };
+        let result = translate_subtitle_cached_cancellable(
+            &state,
+            &media,
+            &contents,
+            &source_language,
+            &format,
+            &request.first_language,
+            &request.second_language,
+            Some(cancellation),
+        )
+        .await;
+        finish_translation_job(&job_key);
+        result
+    } else {
+        Ok(translated_subtitle_preview(
+            &state,
+            &media,
+            &contents,
+            &source_language,
+            &format,
+            &request.first_language,
+            &request.second_language,
+        )
+        .await)
+    };
+    match translated {
         Ok(vtt) => {
             info!(media = %media.title, prepared = request.prepared, "bilingual subtitle translation cached");
             ([(header::CONTENT_TYPE, "text/vtt; charset=utf-8")], vtt).into_response()
@@ -2161,6 +2263,22 @@ async fn translate_subtitle_cached(
     extension: &str,
     first: &str,
     second: &str,
+) -> Result<String, String> {
+    translate_subtitle_cached_cancellable(
+        state, media, contents, source, extension, first, second, None,
+    )
+    .await
+}
+
+async fn translate_subtitle_cached_cancellable(
+    state: &AppState,
+    media: &Media,
+    contents: &str,
+    source: &str,
+    extension: &str,
+    first: &str,
+    second: &str,
+    cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<String, String> {
     let output_extension = match extension.to_ascii_lowercase().as_str() {
         "srt" | "vtt" | "ass" => extension.to_ascii_lowercase(),
@@ -2229,15 +2347,34 @@ async fn translate_subtitle_cached(
             }
         }
     }
-    let vtt = subtitles::translate_bilingual_resumable(
-        &client,
-        &translation_input,
-        source,
-        first,
-        second,
-        &sidecar_part_path,
-    )
-    .await?;
+    let translated = if let Some(token) = cancellation.clone() {
+        subtitles::translate_bilingual_resumable_cancellable(
+            &client,
+            &translation_input,
+            source,
+            first,
+            second,
+            &sidecar_part_path,
+            Some(token),
+        )
+        .await
+    } else {
+        subtitles::translate_bilingual_resumable(
+            &client,
+            &translation_input,
+            source,
+            first,
+            second,
+            &sidecar_part_path,
+        )
+        .await
+    };
+    let vtt = translated?;
+    if cancellation.as_ref().is_some_and(|token| {
+        token.load(std::sync::atomic::Ordering::Acquire)
+    }) {
+        return Err("Bilingual translation stopped with playback".to_owned());
+    }
     save_bilingual_sidecar(&sidecar_path, &vtt, &output_extension).await?;
     Ok(vtt)
 }
@@ -2287,12 +2424,15 @@ async fn translated_subtitle_preview(
     let source_format = source_format.to_owned();
     let first = first.to_owned();
     let second = second.to_owned();
+    let media_id = media.id.clone();
     staged_subtitle_preview(
         &final_path,
         &checkpoint_path,
+        &media_id,
         job_key,
-        async move {
-            if let Err(error) = translate_subtitle_cached(
+        false,
+        move |cancellation| async move {
+            if let Err(error) = translate_subtitle_cached_cancellable(
                 &state,
                 &media,
                 &source_contents,
@@ -2300,32 +2440,37 @@ async fn translated_subtitle_preview(
                 &source_format,
                 &first,
                 &second,
+                Some(cancellation),
             )
             .await
             {
-                tracing::error!(media = %media.title, error = %error, "background bilingual subtitle generation failed");
+                if error == "Bilingual translation stopped with playback" {
+                    info!(media = %media.title, "background bilingual subtitle generation paused with playback");
+                } else {
+                    tracing::error!(media = %media.title, error = %error, "background bilingual subtitle generation failed");
+                }
             }
         },
     )
     .await
 }
 
-async fn staged_subtitle_preview(
+async fn staged_subtitle_preview<F, Fut>(
     final_path: &std::path::Path,
     checkpoint_path: &std::path::Path,
+    media_id: &str,
     job_key: String,
-    background_job: impl std::future::Future<Output = ()> + Send + 'static,
-) -> String {
-    let jobs = ACTIVE_TRANSLATION_JOBS.get_or_init(|| Mutex::new(HashSet::new()));
-    let start_job = jobs.lock().is_ok_and(|mut jobs| jobs.insert(job_key.clone()));
-    if start_job {
+    explicit: bool,
+    background_job: F,
+) -> String
+where
+    F: FnOnce(Arc<std::sync::atomic::AtomicBool>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Some(cancellation) = start_translation_job(job_key.clone(), media_id.to_owned(), explicit) {
         tokio::spawn(async move {
-            background_job.await;
-            if let Some(jobs) = ACTIVE_TRANSLATION_JOBS.get() {
-                if let Ok(mut jobs) = jobs.lock() {
-                    jobs.remove(&job_key);
-                }
-            }
+            background_job(cancellation).await;
+            finish_translation_job(&job_key);
         });
     }
 
@@ -2387,6 +2532,24 @@ async fn web_progress(
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+async fn stop_web_translation(
+    State(state): State<AppState>,
+    Json(request): Json<WebTranslationStopRequest>,
+) -> Response {
+    let Some(relative) = clean_relative_path(&request.path) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if contains_hidden_component(&relative) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let root = selected_library_root(&state, request.library);
+    let Some(media) = web_media_for_relative(&state, &root, &relative).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    cancel_streaming_translation_jobs(&media.id);
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn update_web_progress(
@@ -3449,18 +3612,12 @@ fn plex_local_addresses(state: &AppState) -> Vec<std::net::IpAddr> {
 struct TranslationSettingsForm {
     language_primary: String,
     language_secondary: String,
+    #[serde(default)]
+    bilingual_enabled: bool,
 }
 
-async fn translation_settings_page(State(state): State<AppState>) -> Response {
-    let Ok(config) = state.config.lock() else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
-    let body = format!(
-        r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Subtitle translation · harbringer</title><style>body{{margin:0;padding:2rem;color:#f9fafb;background:#111827;font:16px system-ui}}main{{max-width:48rem;margin:auto}}form{{display:grid;gap:1rem;padding:1.5rem;border:1px solid #374151;border-radius:.8rem;background:#1f2937}}label{{display:grid;gap:.4rem}}select,button{{padding:.65rem;color:#fff;background:#111827;border:1px solid #4b5563;border-radius:.4rem}}.note{{color:#9ca3af;line-height:1.5}}a{{color:#93c5fd}}</style><main><p><a href="/settings">← Settings</a></p><h1>Subtitle translation</h1><p class="note">Translation uses Google Translate while playing or ahead of time. No API key is required. Subtitle text is sent to Google for translation. Progress is staged beside the media file, and the completed bilingual subtitle is saved there in the source subtitle format so Plex clients can discover it.</p><form method="post" action="/settings/translation"><label><span>First subtitle language</span><select name="language_primary">{}</select></label><label><span>Second subtitle language</span><select name="language_secondary">{}</select></label><button type="submit">Save translation settings</button></form></main></html>"#,
-        translation_language_options(&config.subtitle_language_primary),
-        translation_language_options(&config.subtitle_language_secondary),
-    );
-    Html(body).into_response()
+async fn translation_settings_page() -> Response {
+    Redirect::to("/settings#subtitle-settings").into_response()
 }
 
 async fn save_translation_settings(
@@ -3482,17 +3639,21 @@ async fn save_translation_settings(
     };
     config.subtitle_language_primary = form.language_primary;
     config.subtitle_language_secondary = form.language_secondary;
+    config.bilingual_subtitles_enabled = form.bilingual_enabled;
     if save_config(&state.config_path, &config).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    Redirect::to("/settings/translation?saved=true").into_response()
+    if !config.bilingual_subtitles_enabled {
+        cancel_all_translation_jobs();
+    }
+    Redirect::to("/settings#subtitle-settings").into_response()
 }
 
 async fn settings_page(
     State(state): State<AppState>,
     Query(query): Query<SettingsQuery>,
 ) -> Response {
-    let (libraries, tmdb_token_saved) = {
+    let (libraries, tmdb_token_saved, bilingual_enabled, subtitle_language_primary, subtitle_language_secondary) = {
         let Ok(config) = state.config.lock() else {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         };
@@ -3522,7 +3683,13 @@ async fn settings_page(
             .tmdb_bearer_token
             .as_deref()
             .is_some_and(|token| !token.trim().is_empty());
-        (libraries, token_saved)
+        (
+            libraries,
+            token_saved,
+            config.bilingual_subtitles_enabled,
+            config.subtitle_language_primary.clone(),
+            config.subtitle_language_secondary.clone(),
+        )
     };
     let list = libraries
         .iter()
@@ -3597,6 +3764,12 @@ async fn settings_page(
     list.insert_str(
         0,
         r#"<form class="library-card" method="post" action="/settings/scan"><button type="submit">Scan all libraries</button></form>"#,
+    );
+    let subtitle_settings = format!(
+        r#"<details class="settings-card settings-section" id="subtitle-settings"><summary class="settings-section-summary"><span><strong>Subtitle translation</strong><small>Choose the bilingual subtitle languages and whether Harbringer generates them.</small></span></summary><form method="post" action="/settings" class="settings-form settings-section-content"><p class="note">Translation uses Google Translate while playing or ahead of time. No API key is required. Subtitle text is sent to Google for translation. Progress is staged beside the media file, and completed subtitles are saved beside the video so Plex clients can discover them.</p><label class="settings-toggle"><input type="checkbox" name="bilingual_enabled" value="true"{}> Enable bilingual subtitles</label><div class="form-grid"><label class="field"><span>First subtitle language</span><select name="language_primary">{}</select></label><label class="field"><span>Second subtitle language</span><select name="language_secondary">{}</select></label></div><div><button type="submit">Save subtitle settings</button></div></form></details>"#,
+        if bilingual_enabled { " checked" } else { "" },
+        translation_language_options(&subtitle_language_primary),
+        translation_language_options(&subtitle_language_secondary),
     );
     let error = query
         .error
@@ -3879,11 +4052,13 @@ button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: 
 #settings-logs-live {{ color: #8fd6a7; font-size: .82rem; }} .log-follow[hidden] {{ display: none; }}
 .log-filters {{ display: flex; flex-wrap: wrap; align-items: end; gap: 1rem; margin-bottom: 1rem; }} .log-filters > label:first-child {{ display: grid; flex: 1 1 16rem; gap: .45rem; color: #c9d4e4; font-size: .84rem; font-weight: 650; }} .log-filters > label:first-child input {{ margin-top: 0; }} .log-filters > label:nth-child(2) {{ display: flex; align-items: center; gap: .45rem; min-height: 2.75rem; color: #c9d4e4; font-size: .84rem; }} #settings-logs-count {{ margin-left: auto; color: #98a6bb; font-size: .82rem; }}
 .settings-tabs {{ display: flex; gap: .35rem; margin: 0 0 1.15rem; padding-bottom: .7rem; border-bottom: 1px solid #29364b; }} .settings-tabs a {{ padding: .55rem .8rem; border-radius: .5rem; color: #aeb9cc; text-decoration: none; }} .settings-tabs a.active, .settings-tabs a:hover {{ color: #fff; background: #1d4ed8; }} .settings-logs {{ max-height: 70vh; margin: 0; padding: 1rem; overflow: auto; border: 1px solid #29364b; border-radius: .65rem; color: #d4deec; background: #0a111e; font: .8rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }}
+.settings-section {{ padding: 0; overflow: hidden; }} .settings-section-summary {{ display: flex; width: 100%; align-items: center; justify-content: space-between; padding: 1.05rem; border: 0; border-radius: 0; background: transparent; text-align: left; }} .settings-section-summary span {{ display: grid; gap: .3rem; }} .settings-section-summary strong {{ color: #e8eef8; font-size: 1rem; }} .settings-section-summary small {{ color: #9aa8bf; font-size: .83rem; font-weight: 400; }} .settings-section-content {{ padding: 0 1.05rem 1.05rem; }} .settings-toggle {{ display: flex; align-items: center; gap: .55rem; color: #d4deec; }}
 </style></head><body><div class="app-shell">{}
-<main><header class="page-heading"><p class="eyebrow">harbringer</p><h1>Settings</h1><p class="page-subtitle">Manage Plex access, metadata storage, and the libraries available on this server.</p><p><a href="/settings/translation">Configure subtitle translation</a></p></header>{}{}
+<main><header class="page-heading"><p class="eyebrow">harbringer</p><h1>Settings</h1><p class="page-subtitle">Manage Plex access, metadata storage, subtitle translation, and the libraries available on this server.</p></header>{}{}
 <div class="settings-stack"{}>
 <section class="settings-card" aria-labelledby="plex-heading"><div class="section-heading"><div><h2 id="plex-heading">Plex account</h2><p class="section-description">Connect harbringer to Plex so compatible clients can discover and authenticate with this server.</p></div></div>{}<form method="post" action="/settings/server-name" class="settings-form server-name-form"><label class="field"><span>Server name</span><input name="server_name" type="text" value="{}" maxlength="64" required><small class="note">This is the name Plex clients see. It defaults to harbringer.</small></label><div><button class="button-secondary" type="submit">Save server name</button></div></form></section>
 <section class="settings-card" aria-labelledby="metadata-heading"><div class="section-heading"><div><h2 id="metadata-heading">Metadata storage</h2><p class="section-description">Choose one place for matched movie and TV metadata. Sidecars let another mplex server reuse matches and artwork without its database or a new TMDB lookup. SQLite still stores server identity, library configuration, and playback progress.</p></div></div><form method="post" action="/settings/preferences" class="settings-form"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="database" {}><span class="option-copy"><strong>SQLite database {}</strong><span class="note">Matched metadata stays in this server’s database.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="sidecar" {}><span class="option-copy"><strong>.mplex files in media folders {}</strong><span class="note">Artwork and metadata are written to <code>.mplex/cover.jpg</code>, <code>banner.jpg</code>, and <code>data.json</code>.</span></span></label></div><label class="field"><span>TMDB bearer token</span><input name="tmdb_bearer_token" type="password" autocomplete="new-password" placeholder="Enter a token to save or replace it"></label>{}<div><button type="submit">Save metadata settings</button></div></form></section>
+{}
 <section class="settings-card" aria-labelledby="libraries-heading"><div class="section-heading"><div><h2 id="libraries-heading">Libraries</h2><p class="section-description">A library groups media of one type from one or more monitored folders. Add a folder to an existing library when the same collection spans multiple locations.</p></div></div><details class="add-library"><summary>Add a library</summary><form method="post" action="/settings/libraries" class="settings-form"><div class="form-grid"><label class="field"><span>Library name</span><input name="name" type="text" placeholder="e.g. Films" required></label><label class="field"><span>Content type</span><select name="kind"><option value="movie">Movies</option><option value="tv">TV Shows</option><option value="other">Other</option></select></label></div><div class="field"><span>Media folders</span><div class="path-list" id="new-library-paths"><div class="path-row"><label class="sr-only" for="new-path-0">Folder path</label><input id="new-path-0" name="path[]" type="text" placeholder="/path/to/folder" value="{}" required><a class="button-link button-secondary" href="/settings/browse">Browse</a><button type="button" class="button-quiet remove-path" aria-label="Remove folder path" title="Remove folder path" disabled>−</button></div></div></div><div class="action-row path-actions"><button type="button" class="button-secondary" id="add-path" aria-label="Add another folder path" title="Add another folder path">＋ Add folder</button><button type="submit">Create library</button></div></form></details>
 <div class="library-list">{}</div></section>
 </div>{}
@@ -3968,6 +4143,7 @@ if (logOutput && logSearch && logReverse && logCount && logEmpty && logFollowBut
         if metadata_enabled { "checked" } else { "" },
         if metadata_enabled { "(current)" } else { "" },
         tmdb_token_status,
+        subtitle_settings,
         html(query.folder.as_deref().unwrap_or("")),
         if list.is_empty() { "<p class=\"empty-state\">No libraries yet. Add a library to start organizing your media.</p>".to_owned() } else { list },
         logs_content
@@ -6015,23 +6191,39 @@ async fn add_plex_technical_metadata(
             None => serde_json::json!({"media": {"track": []}}),
         }
     };
-    let external_subtitles = external_subtitle_files(&media.path).await;
-    let (language_primary, language_secondary) = state
+    let (enabled, language_primary, language_secondary) = state
         .config
         .lock()
         .ok()
         .map(|config| {
             (
+                config.bilingual_subtitles_enabled,
                 config.subtitle_language_primary.clone(),
                 config.subtitle_language_secondary.clone(),
             )
         })
         .unwrap_or_else(|| {
             (
+                false,
                 default_subtitle_language_primary(),
                 default_subtitle_language_secondary(),
             )
         });
+    let external_subtitles = if enabled {
+        let _ = ensure_merged_bilingual_sidecar(
+            media,
+            &language_primary,
+            &language_secondary,
+        )
+        .await;
+        external_subtitle_files(&media.path).await
+    } else {
+        external_subtitle_files(&media.path)
+            .await
+            .into_iter()
+            .filter(|path| external_subtitle_pair(&media.path, path).is_none())
+            .collect()
+    };
     let has_requested_bilingual_file = external_subtitles.iter().any(|path| {
         external_subtitle_pair(&media.path, path).is_some_and(|(first, second)| {
             first == language_primary && second == language_secondary
@@ -6044,7 +6236,7 @@ async fn add_plex_technical_metadata(
             && technical_tracks(&info)
                 .iter()
                 .any(is_translatable_embedded_track);
-    let translation_available = !has_requested_bilingual_file && has_translation_source;
+    let translation_available = enabled && !has_requested_bilingual_file && has_translation_source;
     let selection = state
         .plex_stream_selections
         .lock()
@@ -7556,6 +7748,18 @@ fn cover_artwork_markup(url: &str, label: &str) -> String {
 }
 
 async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>) -> Response {
+    let (bilingual_enabled, language_primary, language_secondary) = s
+        .config
+        .lock()
+        .ok()
+        .map(|config| {
+            (
+                config.bilingual_subtitles_enabled,
+                config.subtitle_language_primary.clone(),
+                config.subtitle_language_secondary.clone(),
+            )
+        })
+        .unwrap_or((false, "en".to_owned(), "vi".to_owned()));
     if query.library.is_none() {
         query.library = s
             .config
@@ -8227,6 +8431,9 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                 &subtitles,
                 artwork,
                 selected_subtitle,
+                bilingual_enabled,
+                &language_primary,
+                &language_secondary,
             ));
         } else {
             items.push_str(&file_item(&name));
@@ -8525,6 +8732,32 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
         let translatedTrackUrl = null;
         let translatedTrack = null;
         let translatedOption = null;
+        let translatedCueKeys = new Set();
+        let translationPollTimer = null;
+        let latestTranslationRequest = null;
+        const addTranslatedCues = (contents, track) => {{
+          if (!track?.track) return;
+          for (const block of contents.split(/\n\s*\n/)) {{
+            const lines = block.split("\n").map(line => line.trim()).filter(Boolean);
+            const timingIndex = lines.findIndex(line => line.includes("-->"));
+            if (timingIndex < 0) continue;
+            const [startText, endText] = lines[timingIndex].split("-->").map(value => value.trim().split(/\\s+/)[0]);
+            const toSeconds = value => {{
+              const parts = value.replace(",", ".").split(":");
+              const seconds = Number(parts.pop());
+              const minutes = Number(parts.pop() || 0);
+              const hours = Number(parts.pop() || 0);
+              return hours * 3600 + minutes * 60 + seconds;
+            }};
+            const text = lines.slice(timingIndex + 1).join("\n");
+            const key = `${{startText}}|${{endText}}|${{text}}`;
+            if (!text || translatedCueKeys.has(key)) continue;
+            try {{
+              track.track.addCue(new VTTCue(toSeconds(startText), toSeconds(endText), text));
+              translatedCueKeys.add(key);
+            }} catch (_) {{}}
+          }}
+        }};
         const translate = async prepared => {{
           const status = translationControls.querySelector(".translation-status");
           const selectedOption = subtitleSelect?.selectedOptions[0];
@@ -8545,17 +8778,19 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
           status.textContent = prepared ? "Preparing bilingual subtitles…" : "Translating subtitles…";
           translationControls.querySelectorAll("button").forEach(button => button.disabled = true);
           try {{
-            const response = await fetch("/web/translated-subtitle", {{ method: "POST", headers: {{ "content-type": "application/json" }},
-              body: JSON.stringify({{ path, library: subtitleSelect.dataset.library ? Number(subtitleSelect.dataset.library) : null,
+            latestTranslationRequest = {{ path, library: subtitleSelect.dataset.library ? Number(subtitleSelect.dataset.library) : null,
                 stream_id: sourceId, first_language: translationControls.querySelector(".translation-first").value,
                 second_language: translationControls.querySelector(".translation-second").value,
-                source_language: sourceLanguage, source_cues: browserCues, prepared }}) }});
+                source_language: sourceLanguage, source_cues: browserCues, prepared }};
+            const response = await fetch("/web/translated-subtitle", {{ method: "POST", headers: {{ "content-type": "application/json" }},
+              body: JSON.stringify(latestTranslationRequest) }});
             if (!response.ok) throw new Error(await response.text());
-            const blob = await response.blob();
+            const initialContents = await response.text();
             if (translatedOption) translatedOption.remove();
             if (translatedTrack) translatedTrack.remove();
             if (translatedTrackUrl) URL.revokeObjectURL(translatedTrackUrl);
-            translatedTrackUrl = URL.createObjectURL(blob);
+            translatedCueKeys = new Set();
+            translatedTrackUrl = URL.createObjectURL(new Blob([prepared ? initialContents : "WEBVTT\n\n"], {{ type: "text/vtt" }}));
             const track = document.createElement("track"); track.kind = "subtitles";
             track.label = `${{translationControls.querySelector(".translation-first").selectedOptions[0].text}} + ${{translationControls.querySelector(".translation-second").selectedOptions[0].text}}`;
             track.src = translatedTrackUrl; track.default = true; video.append(track);
@@ -8570,7 +8805,20 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
               subtitleSelect.value = translatedOption.value;
               subtitleSelect.dataset.selectedStreamId = "0";
             }}
-            track.addEventListener("load", () => {{ track.track.mode = "showing"; }}, {{ once: true }});
+            track.addEventListener("load", () => {{
+              track.track.mode = "showing";
+              if (!prepared) {{
+                addTranslatedCues(initialContents, track);
+                if (translationPollTimer) clearInterval(translationPollTimer);
+                translationPollTimer = setInterval(async () => {{
+                  if (video.paused || video.ended || !latestTranslationRequest) return;
+                  try {{
+                    const update = await fetch("/web/translated-subtitle", {{ method: "POST", headers: {{ "content-type": "application/json" }}, body: JSON.stringify(latestTranslationRequest) }});
+                    if (update.ok) addTranslatedCues(await update.text(), track);
+                  }} catch (_) {{}}
+                }}, 2500);
+              }}
+            }}, {{ once: true }});
             status.textContent = prepared ? "Bilingual subtitle prepared and cached." : "Bilingual subtitles ready.";
           }} catch (error) {{ status.textContent = `Translation unavailable: ${{error.message || "request failed"}}`; }}
           finally {{ translationControls.querySelectorAll("button").forEach(button => button.disabled = false); }}
@@ -8641,7 +8889,19 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
       }};
       video.addEventListener("timeupdate", () => {{ if (!video.paused) save(false); }});
       video.addEventListener("pause", () => save(false));
-      video.addEventListener("ended", () => save(true));
+      const translationStopRequest = JSON.stringify({{ path, library: subtitleSelect?.dataset.library ? Number(subtitleSelect.dataset.library) : null }});
+      const cancelStreamingTranslation = () => fetch("/web/translation-stop", {{
+        method: "POST", headers: {{ "content-type": "application/json" }}, body: translationStopRequest
+      }}).catch(() => {{}});
+      video.addEventListener("ended", () => {{ save(true); if (translationPollTimer) clearInterval(translationPollTimer); cancelStreamingTranslation(); }});
+      window.addEventListener("pagehide", () => {{
+        if (translationPollTimer) clearInterval(translationPollTimer);
+        if (video.currentTime > 0 && navigator.sendBeacon) {{
+          navigator.sendBeacon("/web/translation-stop", new Blob([
+            translationStopRequest
+          ], {{ type: "application/json" }}));
+        }}
+      }}, {{ once: true }});
     }});
     if (!window.__mplexMediaHotkeysBound) {{
       window.__mplexMediaHotkeysBound = true;
@@ -9061,9 +9321,23 @@ fn external_subtitle_titles(
         .unwrap_or_default()
         .to_ascii_uppercase();
     if let Some((first, second)) = external_subtitle_pair(video, subtitle) {
+        let merged = subtitle
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .is_some_and(|candidate| {
+                candidate
+                    .to_ascii_lowercase()
+                    .split(['.', '_', ' '])
+                    .skip(1)
+                    .any(|part| part == "merge")
+            });
         return (
             format!("{} + {}", plex_language(&first).1, plex_language(&second).1),
-            format!("Bilingual {format} External"),
+            if merged {
+                format!("Bilingual {format} External · Merged")
+            } else {
+                format!("Bilingual {format} External")
+            },
         );
     }
     let (_, language) = plex_language(&external_subtitle_language_token(stem, candidate));
@@ -9138,6 +9412,139 @@ fn bilingual_subtitle_path(media: &Media, first: &str, second: &str, extension: 
             second.to_ascii_lowercase(),
             extension.to_ascii_lowercase()
         ))
+}
+
+fn merged_bilingual_subtitle_path(
+    media: &Media,
+    first: &str,
+    second: &str,
+    extension: &str,
+) -> PathBuf {
+    let path = bilingual_subtitle_path(media, first, second, extension);
+    let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("subtitle");
+    path.with_file_name(format!("{stem}.merge.{extension}"))
+}
+
+async fn ensure_merged_bilingual_sidecar(
+    media: &Media,
+    first_language: &str,
+    second_language: &str,
+) -> Result<Option<PathBuf>, String> {
+    let files = external_subtitle_files(&media.path).await;
+    let source_for = |language: &str| {
+        files.iter().find(|path| {
+            external_subtitle_pair(&media.path, path).is_none()
+                && external_subtitle_language(&media.path, path).0 == language
+        })
+    };
+    let (Some(first_path), Some(second_path)) =
+        (source_for(first_language), source_for(second_language))
+    else {
+        return Ok(None);
+    };
+    let first_extension = first_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("srt")
+        .to_ascii_lowercase();
+    let second_extension = second_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("srt")
+        .to_ascii_lowercase();
+    let output_extension = if first_extension == second_extension {
+        first_extension.as_str()
+    } else {
+        "srt"
+    };
+    let output_path = merged_bilingual_subtitle_path(
+        media,
+        first_language,
+        second_language,
+        output_extension,
+    );
+    if tokio::fs::metadata(&output_path).await.is_ok() {
+        return Ok(Some(output_path));
+    }
+    let first_contents = tokio::fs::read_to_string(first_path)
+        .await
+        .map_err(|_| "Could not read the first subtitle track for merging".to_owned())?;
+    let second_contents = tokio::fs::read_to_string(second_path)
+        .await
+        .map_err(|_| "Could not read the second subtitle track for merging".to_owned())?;
+    let first_cues = subtitles::parse_subtitles(&subtitle_to_vtt(&first_contents, &first_extension))?;
+    let second_cues = subtitles::parse_subtitles(&subtitle_to_vtt(&second_contents, &second_extension))?;
+    let merged = merge_subtitle_cues(&first_cues, &second_cues)?;
+    save_bilingual_sidecar(&output_path, &merged, output_extension).await?;
+    Ok(Some(output_path))
+}
+
+fn merge_subtitle_cues(
+    first: &[subtitles::Cue],
+    second: &[subtitles::Cue],
+) -> Result<String, String> {
+    let first_times = first
+        .iter()
+        .map(|cue| Some((subtitle_time_ms(&cue.start)?, subtitle_time_ms(&cue.end)?)))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| "Subtitle merge found an invalid timestamp".to_owned())?;
+    let second_times = second
+        .iter()
+        .map(|cue| Some((subtitle_time_ms(&cue.start)?, subtitle_time_ms(&cue.end)?)))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| "Subtitle merge found an invalid timestamp".to_owned())?;
+    let mut used_second = vec![false; second.len()];
+    let mut merged = Vec::new();
+    for (index, cue) in first.iter().enumerate() {
+        let (start, end) = first_times[index];
+        let candidate = second
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !used_second[*index])
+            .filter_map(|(index, candidate)| {
+                let (other_start, other_end) = second_times[index];
+                let close = (start - other_start).abs() <= 1_500
+                    && start <= other_end
+                    && other_start <= end;
+                close.then_some((index, candidate, other_start, other_end, (start - other_start).abs()))
+            })
+            .min_by_key(|(_, _, _, _, distance)| *distance);
+        let (start_text, end_text, text) = if let Some((index, other, other_start, other_end, _)) = candidate {
+            used_second[index] = true;
+            let merged_start = if start <= other_start { &cue.start } else { &other.start };
+            let merged_end = if end >= other_end { &cue.end } else { &other.end };
+            (merged_start.clone(), merged_end.clone(), format!("{}\n{}", cue.text, other.text))
+        } else {
+            (cue.start.clone(), cue.end.clone(), cue.text.clone())
+        };
+        merged.push(subtitles::Cue { start: start_text, end: end_text, text });
+    }
+    for (index, cue) in second.iter().enumerate() {
+        if !used_second[index] {
+            merged.push(cue.clone());
+        }
+    }
+    merged.sort_by_key(|cue| subtitle_time_ms(&cue.start).unwrap_or_default());
+    let mut vtt = String::from("WEBVTT\n\n");
+    for cue in merged {
+        vtt.push_str(&format!("{} --> {}\n{}\n\n", cue.start.replace(',', "."), cue.end.replace(',', "."), cue.text));
+    }
+    Ok(vtt)
+}
+
+fn subtitle_time_ms(value: &str) -> Option<i64> {
+    let value = value.split_whitespace().next()?;
+    let parts = value.split(':').collect::<Vec<_>>();
+    let (hours, minutes, seconds) = match parts.as_slice() {
+        [minutes, seconds] => (0i64, minutes.parse::<i64>().ok()?, *seconds),
+        [hours, minutes, seconds] => (hours.parse::<i64>().ok()?, minutes.parse::<i64>().ok()?, *seconds),
+        _ => return None,
+    };
+    let (seconds, millis) = seconds.replace(',', ".").split_once('.').map_or_else(
+        || Some((seconds.parse::<i64>().ok()?, 0i64)),
+        |(seconds, millis)| Some((seconds.parse::<i64>().ok()?, millis.chars().take(3).collect::<String>().parse::<i64>().ok()? * 10i64.pow(3u32.saturating_sub(millis.len().min(3) as u32)))),
+    )?;
+    Some(((hours * 60 + minutes) * 60 + seconds) * 1000 + millis)
 }
 
 fn subtitle_to_vtt(contents: &str, extension: &str) -> String {
@@ -9245,7 +9652,22 @@ async fn subtitle_tracks(
     library: Option<usize>,
 ) -> Vec<SubtitleTrack> {
     let mut tracks = Vec::new();
+    let languages = state.config.lock().ok().and_then(|config| {
+        config.bilingual_subtitles_enabled.then(|| {
+            (
+                config.subtitle_language_primary.clone(),
+                config.subtitle_language_secondary.clone(),
+            )
+        })
+    });
+    let bilingual_enabled = languages.is_some();
+    if let Some((first, second)) = languages {
+        let _ = ensure_merged_bilingual_sidecar(media, &first, &second).await;
+    }
     for path in external_subtitle_files(&media.path).await {
+        if !bilingual_enabled && external_subtitle_pair(&media.path, &path).is_some() {
+            continue;
+        }
         tracks.push(SubtitleTrack {
             label: format!("External: {}", external_subtitle_label(&media.path, &path)),
             url: format!(
@@ -9960,6 +10382,9 @@ fn web_client_item(
     subtitles: &[SubtitleTrack],
     artwork: Option<String>,
     selected_subtitle_stream_id: Option<u64>,
+    bilingual_enabled: bool,
+    language_primary: &str,
+    language_secondary: &str,
 ) -> String {
     let stream_path = url_encode(relative);
     let library_query = library
@@ -10011,11 +10436,15 @@ fn web_client_item(
             subtitle_options
         )
     };
-    let translation_controls = format!(
-        r#"<div class="subtitle-translation"><label>First language <select class="translation-first">{}</select></label><label>Second language <select class="translation-second">{}</select></label><button type="button" class="translate-live">Translate while playing</button><button type="button" class="translate-prepare">Prepare subtitle</button><span class="translation-status" role="status" aria-live="polite"></span></div>"#,
-        translation_language_options("en"),
-        translation_language_options("vi")
-    );
+    let translation_controls = if bilingual_enabled {
+        format!(
+            r#"<div class="subtitle-translation"><label>First language <select class="translation-first">{}</select></label><label>Second language <select class="translation-second">{}</select></label><button type="button" class="translate-live">Translate while playing</button><button type="button" class="translate-prepare">Translate full episode</button><span class="translation-status" role="status" aria-live="polite"></span></div>"#,
+            translation_language_options(language_primary),
+            translation_language_options(language_secondary)
+        )
+    } else {
+        String::new()
+    };
     let relative_path = PathBuf::from(relative);
     let info_path = relative_path.parent().unwrap_or(std::path::Path::new(""));
     let info_url = format!(
@@ -12183,6 +12612,9 @@ fn plex_timeline(
                 headers.clone(),
                 request_token.clone(),
             );
+        }
+        if playback_state.eq_ignore_ascii_case("stopped") {
+            cancel_streaming_translation_jobs(&media_id);
         }
     }
     if duration.is_some_and(|duration| plex_scrobble_threshold_reached(position, duration))
@@ -18499,12 +18931,15 @@ async fn plex_stream(
         return StatusCode::NOT_FOUND.into_response();
     };
     let media_index = media_snapshot(&state);
-    let pair = state.config.lock().ok().map(|config| {
-        (
-            config.subtitle_language_primary.clone(),
-            config.subtitle_language_secondary.clone(),
-        )
+    let pair = state.config.lock().ok().and_then(|config| {
+        config.bilingual_subtitles_enabled.then(|| {
+            (
+                config.subtitle_language_primary.clone(),
+                config.subtitle_language_secondary.clone(),
+            )
+        })
     });
+    let bilingual_enabled = pair.is_some();
     if let Some((first, second)) = pair.as_ref() {
         if let Some(media) = media_index
             .iter()
@@ -18539,6 +18974,11 @@ async fn plex_stream(
     }
     for media in media_index.iter() {
         for subtitle_path in external_subtitle_files(&media.path).await {
+            if !bilingual_enabled
+                && external_subtitle_pair(&media.path, &subtitle_path).is_some()
+            {
+                continue;
+            }
             if plex_external_subtitle_id(media, &subtitle_path) != stream_id {
                 continue;
             }

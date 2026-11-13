@@ -14,7 +14,7 @@ Harbringer is an alternative, independent implementation of Plex Media Server. I
 - Store matched metadata in the server database or beside your media files as portable sidecars.
 - Play supported files directly, with seeking and playback progress.
 - Use Plex Desktop for playback of supported H.264 Matroska media, including optional AAC audio.
-- Create bilingual subtitles from external or supported embedded text tracks. Progress is staged beside the video as `<video>.en-vi.vtt.part`; the completed sidecar keeps the source subtitle format and is available to Plex clients.
+- Configure optional bilingual subtitles in the collapsible **Subtitle translation** section of Settings. Choose the two languages, translate while playing, or prepare the full episode; progress is staged beside the video as `<video>.en-vi.vtt.part`. Completed bilingual sidecars keep the source subtitle format and are available to Plex clients. Matching individual language sidecars can be merged automatically. Turning bilingual subtitles off hides bilingual tracks from clients without deleting their files.
 
 ## Run Harbringer
 
@@ -54,7 +54,7 @@ Open `http://localhost:32400/`. In **Settings**, add `/media` as a library folde
 
 The media mount is read-only by default while Harbringer is in alpha. For disposable test media, remove `:ro` (`./media:/media`) to let server actions delete files.
 
-Bilingual subtitle generation writes progress and the finished sidecar beside the video. The read-only `:ro` media mount prevents that; use a writable media mount to generate bilingual sidecars. Plex playback can continue while translation runs in the background.
+Bilingual subtitle generation writes progress and the finished sidecar beside the video. The read-only `:ro` media mount prevents that; use a writable media mount to generate bilingual sidecars. Playback-driven translation stops when playback stops and resumes from staged progress on a later play. Full-episode preparation can be started from that episode in the built-in web player.
 
 Harbringer currently indexes visible `.mp4`, `.m4v`, `.mkv`, and `.webm` files. The **Files** view also shows other visible files in your library folders.
 

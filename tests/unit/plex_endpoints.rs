@@ -134,6 +134,7 @@ fn fixture() -> Fixture {
         tmdb_bearer_token: None,
         subtitle_language_primary: "en".to_owned(),
         subtitle_language_secondary: "vi".to_owned(),
+        bilingual_subtitles_enabled: true,
         plex_account_preferences: BTreeMap::new(),
     };
     sync_config_libraries(&db, &config).unwrap();
@@ -242,6 +243,7 @@ fn tv_fixture() -> Fixture {
         tmdb_bearer_token: None,
         subtitle_language_primary: "en".to_owned(),
         subtitle_language_secondary: "vi".to_owned(),
+        bilingual_subtitles_enabled: true,
         plex_account_preferences: BTreeMap::new(),
     };
     sync_config_libraries(&db, &config).unwrap();
@@ -2242,7 +2244,7 @@ async fn web_and_plex_clients_share_subtitle_selection() {
         fixture.subtitle_id
     )));
     assert!(web_player.contains("Translate while playing"));
-    assert!(web_player.contains("Prepare subtitle"));
+    assert!(web_player.contains("Translate full episode"));
 
     let plex_selection = send(
         &fixture.app,
@@ -2307,7 +2309,7 @@ async fn translation_settings_do_not_require_credentials() {
     let response = send(
         &fixture.app,
         Method::GET,
-        "/settings/translation",
+        "/settings",
         Body::empty(),
     )
     .await;
@@ -2320,7 +2322,57 @@ async fn translation_settings_do_not_require_credentials() {
     )
     .unwrap();
     assert!(page.contains("No API key is required"));
+    assert!(page.contains("Enable bilingual subtitles"));
+    assert!(page.contains("checked"));
+    assert!(page.contains("id=\"subtitle-settings\""));
+    assert!(!page.contains("href=\"/settings/translation\""));
     assert!(!page.contains("google_translate_api_key"));
+}
+
+#[tokio::test]
+async fn bilingual_subtitles_can_be_disabled_globally() {
+    let fixture = fixture();
+    std::fs::write(
+        fixture.root.join("media/Demo.en-vi.srt"),
+        "1\n00:00:01,000 --> 00:00:02,000\nHello\nXin chào\n",
+    )
+    .unwrap();
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings",
+        "language_primary=en&language_secondary=vi",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(!fixture
+        .state
+        .config
+        .lock()
+        .unwrap()
+        .bilingual_subtitles_enabled);
+
+    let metadata = send(&fixture.app, Method::GET, "/library/metadata/1-1", Body::empty()).await;
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &to_bytes(metadata.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let streams = metadata["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["Stream"]
+        .as_array()
+        .unwrap();
+    assert!(!streams.iter().any(|stream| stream["extendedDisplayTitle"] == "Bilingual VTT External"));
+    assert!(streams.iter().any(|stream| stream["displayTitle"] == "English"));
+    assert!(!streams.iter().any(|stream| stream["displayTitle"] == "English + Vietnamese"));
+
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let web_tracks = super::subtitle_tracks(
+        &fixture.state,
+        &media,
+        std::path::Path::new("Demo.mkv"),
+        Some(0),
+    )
+    .await;
+    assert!(!web_tracks.iter().any(|track| track.bilingual));
 }
 
 #[tokio::test]
@@ -2434,6 +2486,39 @@ async fn bilingual_sidecar_keeps_vtt_or_ass_source_format() {
 }
 
 #[tokio::test]
+async fn individual_language_sidecars_are_merged_and_marked_in_extended_title() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    std::fs::write(
+        fixture.root.join("media/Demo.vi.srt"),
+        "1\n00:00:01,000 --> 00:00:02,000\nXin chào\n",
+    )
+    .unwrap();
+    let merged = super::ensure_merged_bilingual_sidecar(&media, "en", "vi")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(merged.file_name().unwrap(), "Demo.en-vi.merge.srt");
+    let contents = std::fs::read_to_string(&merged).unwrap();
+    assert!(contents.contains("Hello\nXin chào"));
+    let (display, extended) = super::external_subtitle_titles(&media.path, &merged);
+    assert_eq!(display, "English + Vietnamese");
+    assert_eq!(extended, "Bilingual SRT External · Merged");
+    let metadata = send(&fixture.app, Method::GET, "/library/metadata/1-1", Body::empty()).await;
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &to_bytes(metadata.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let streams = metadata["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["Stream"]
+        .as_array()
+        .unwrap();
+    assert!(streams.iter().any(|stream| {
+        stream["displayTitle"] == "English + Vietnamese"
+            && stream["extendedDisplayTitle"] == "Bilingual SRT External · Merged"
+    }));
+}
+
+#[tokio::test]
 async fn plex_translated_stream_returns_the_staged_part_without_waiting_for_completion() {
     let fixture = fixture();
     let media = fixture.state.media.read().unwrap()[0].clone();
@@ -2451,16 +2536,57 @@ async fn plex_translated_stream_returns_the_staged_part_without_waiting_for_comp
         super::staged_subtitle_preview(
             &final_path,
             &checkpoint,
+            &media.id,
             final_path.to_string_lossy().into_owned(),
-            async move {
-                let _ = wait_for_resume.await;
-            },
+            false,
+            move |_cancelled| async move { let _ = wait_for_resume.await; },
         ),
     )
     .await
     .expect("subtitle request waited for the stalled background translation");
     resume_job.send(()).unwrap();
     assert!(contents.contains("Hello\nXin chào"));
+}
+
+#[test]
+fn stopping_playback_cancels_stream_translation_but_preserves_explicit_preparation() {
+    let media_id = format!("test-{}", NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed));
+    let streaming = super::start_translation_job(
+        format!("{media_id}.stream"),
+        media_id.clone(),
+        false,
+    )
+    .unwrap();
+    let prepared = super::start_translation_job(
+        format!("{media_id}.prepared"),
+        media_id.clone(),
+        true,
+    )
+    .unwrap();
+    super::cancel_streaming_translation_jobs(&media_id);
+    assert!(streaming.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!prepared.load(std::sync::atomic::Ordering::Acquire));
+    super::finish_translation_job(&format!("{media_id}.stream"));
+    super::finish_translation_job(&format!("{media_id}.prepared"));
+}
+
+#[tokio::test]
+async fn plex_stopped_timeline_cancels_streaming_subtitle_generation() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let job_key = format!("{}.stream", media.path.display());
+    let cancellation = super::start_translation_job(job_key.clone(), media.id.clone(), false)
+        .unwrap();
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/:/timeline?ratingKey=1-1&time=2000&duration=10000&state=stopped",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(cancellation.load(std::sync::atomic::Ordering::Acquire));
+    super::finish_translation_job(&job_key);
 }
 
 #[tokio::test]

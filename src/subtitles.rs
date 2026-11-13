@@ -83,6 +83,27 @@ pub async fn translate_bilingual_resumable(
     second_language: &str,
     output_part_path: &Path,
 ) -> Result<String, String> {
+    translate_bilingual_resumable_cancellable(
+        client,
+        contents,
+        source_language,
+        first_language,
+        second_language,
+        output_part_path,
+        None,
+    )
+    .await
+}
+
+pub async fn translate_bilingual_resumable_cancellable(
+    client: &reqwest::Client,
+    contents: &str,
+    source_language: &str,
+    first_language: &str,
+    second_language: &str,
+    output_part_path: &Path,
+    cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<String, String> {
     translate_bilingual_resumable_at(
         client,
         "https://translate.googleapis.com/translate_a/single",
@@ -91,6 +112,7 @@ pub async fn translate_bilingual_resumable(
         first_language,
         second_language,
         output_part_path,
+        cancellation,
     )
     .await
 }
@@ -103,10 +125,16 @@ async fn translate_bilingual_resumable_at(
     first_language: &str,
     second_language: &str,
     output_part_path: &Path,
+    cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<String, String> {
     let cues = parse_subtitles(contents)?;
     let staged_cues = read_staged_vtt(output_part_path, &cues).await?;
     for cue in cues.iter().skip(staged_cues.len()) {
+        if cancellation.as_ref().is_some_and(|token| {
+            token.load(std::sync::atomic::Ordering::Acquire)
+        }) {
+            return Err("Bilingual translation stopped with playback".to_owned());
+        }
         let first = if source_language == first_language {
             cue.text.clone()
         } else {
@@ -472,6 +500,7 @@ mod tests {
             "en",
             "vi",
             &output_part,
+            None,
         )
         .await
         .unwrap();
