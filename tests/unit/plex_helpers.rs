@@ -65,9 +65,10 @@ fn plex_playback_ids_resolve_rating_keys_and_metadata_paths() {
 
 #[test]
 fn plex_external_stream_urls_accept_client_appended_extensions() {
-    assert_eq!(plex_stream_id_and_format("123.srt"), Some((123, "srt")));
-    assert_eq!(plex_stream_id_and_format("123.srt.srt"), Some((123, "srt")));
-    assert_eq!(plex_stream_id_and_format("123.ass.srt"), Some((123, "srt")));
+    assert_eq!(plex_stream_id_and_format("123"), Some((123, None)));
+    assert_eq!(plex_stream_id_and_format("123.srt"), Some((123, Some("srt"))));
+    assert_eq!(plex_stream_id_and_format("123.srt.srt"), Some((123, Some("srt"))));
+    assert_eq!(plex_stream_id_and_format("123.ass.srt"), Some((123, Some("srt"))));
     assert_eq!(plex_stream_id_and_format("123.srt.exe"), None);
 }
 #[test]
@@ -228,7 +229,10 @@ fn plex_media_advertises_playable_part_audio_video_and_external_subtitle() {
         .as_str()
         .unwrap()
         .starts_with("/library/streams/"));
-    assert!(streams[3]["key"].as_str().unwrap().ends_with(".srt"));
+    assert_eq!(
+        streams[3]["key"],
+        format!("/library/streams/{}", streams[3]["id"])
+    );
 
     let subtitle_id = plex_external_subtitle_id(&media, &PathBuf::from("/media/Film.rum.srt"));
     apply_plex_technical_metadata(
@@ -323,7 +327,10 @@ fn plex_metadata_can_advertise_one_generated_bilingual_track() {
     assert_eq!(generated["displayTitle"], "English + Vietnamese");
     assert_eq!(generated["extendedDisplayTitle"], "Bilingual VTT External");
     assert_eq!(generated["title"], "Bilingual VTT External");
-    assert!(generated["key"].as_str().unwrap().ends_with(".vtt"));
+    assert_eq!(
+        generated["key"],
+        format!("/library/streams/{}", generated["id"])
+    );
     assert_eq!(generated["external"], true);
 }
 
@@ -369,7 +376,10 @@ fn plex_metadata_advertises_translation_for_embedded_text_subtitles() {
         })
         .unwrap();
     assert_eq!(generated["languageTag"], "en");
-    assert!(generated["key"].as_str().unwrap().ends_with(".vtt"));
+    assert_eq!(
+        generated["key"],
+        format!("/library/streams/{}", generated["id"])
+    );
 }
 
 #[test]

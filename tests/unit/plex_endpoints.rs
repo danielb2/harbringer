@@ -2457,6 +2457,43 @@ async fn completed_bilingual_track_is_written_as_a_named_srt_sidecar() {
 }
 
 #[tokio::test]
+async fn successful_translation_removes_its_part_checkpoint_but_failures_keep_it() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let sidecar = super::bilingual_subtitle_path(&media, "en", "vi", "srt");
+    let checkpoint = std::path::PathBuf::from(format!(
+        "{}.part",
+        super::bilingual_subtitle_path(&media, "en", "vi", "vtt").display()
+    ));
+    std::fs::write(&checkpoint, "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n")
+        .unwrap();
+
+    super::finalize_bilingual_translation(
+        &sidecar,
+        &checkpoint,
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n",
+        "srt",
+    )
+    .await
+    .unwrap();
+    assert!(sidecar.exists());
+    assert!(!checkpoint.exists());
+
+    let failed_checkpoint = checkpoint.with_file_name("Demo.en-vi.failed.vtt.part");
+    std::fs::write(&failed_checkpoint, "checkpoint").unwrap();
+    let unsupported_sidecar = sidecar.with_extension("unsupported");
+    assert!(super::finalize_bilingual_translation(
+        &unsupported_sidecar,
+        &failed_checkpoint,
+        "WEBVTT\n\n",
+        "unsupported",
+    )
+    .await
+    .is_err());
+    assert!(failed_checkpoint.exists());
+}
+
+#[tokio::test]
 async fn bilingual_sidecar_keeps_vtt_or_ass_source_format() {
     let fixture = fixture();
     let media = fixture.state.media.read().unwrap()[0].clone();
@@ -2548,6 +2585,42 @@ async fn plex_translated_stream_returns_the_staged_part_without_waiting_for_comp
     assert!(contents.contains("Hello\nXin chào"));
 }
 
+#[tokio::test]
+async fn plex_translated_subtitle_stream_returns_a_finite_checkpoint_snapshot() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let checkpoint = super::bilingual_subtitle_path(&media, "en", "vi", "vtt");
+    let checkpoint = std::path::PathBuf::from(format!("{}.part", checkpoint.to_string_lossy()));
+    std::fs::write(
+        &checkpoint,
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n",
+    )
+    .unwrap();
+    let final_path = super::bilingual_subtitle_path(&media, "en", "vi", "srt");
+    let job_key = final_path.to_string_lossy().into_owned();
+    let _active_job = super::start_translation_job(job_key.clone(), media.id.clone(), false).unwrap();
+
+    let response = super::translated_subtitle_stream_response(
+        &fixture.state,
+        &media,
+        "1\n00:00:01,000 --> 00:00:02,000\nHello\n",
+        "en",
+        "srt",
+        "en",
+        "vi",
+        "vtt",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "text/vtt; charset=utf-8");
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.starts_with("WEBVTT\n\n"));
+    assert!(body.contains("00:00:01.000 --> 00:00:02.000\nHello\nXin chào"));
+    super::cancel_streaming_translation_jobs(&media.id);
+    super::finish_translation_job(&job_key);
+}
+
 #[test]
 fn stopping_playback_cancels_stream_translation_but_preserves_explicit_preparation() {
     let media_id = format!("test-{}", NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed));
@@ -2577,10 +2650,11 @@ async fn plex_stopped_timeline_cancels_streaming_subtitle_generation() {
     let job_key = format!("{}.stream", media.path.display());
     let cancellation = super::start_translation_job(job_key.clone(), media.id.clone(), false)
         .unwrap();
+    let rating_key = super::plex_rating_key(&media);
     let response = send(
         &fixture.app,
         Method::GET,
-        "/:/timeline?ratingKey=1-1&time=2000&duration=10000&state=stopped",
+        &format!("/:/timeline?ratingKey={rating_key}&time=2000&duration=10000&state=stopped"),
         Body::empty(),
     )
     .await;
@@ -4203,6 +4277,17 @@ async fn plex_playback_endpoints_cover_success_and_failure_paths() {
         .await
         .status(),
         StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        send(
+            &fixture.app,
+            Method::GET,
+            &format!("/library/streams/{}", fixture.subtitle_id),
+            Body::empty()
+        )
+        .await
+        .status(),
+        StatusCode::OK
     );
     assert_eq!(
         send(

@@ -91,6 +91,7 @@ pub async fn translate_bilingual_resumable(
         second_language,
         output_part_path,
         None,
+        None,
     )
     .await
 }
@@ -103,6 +104,7 @@ pub async fn translate_bilingual_resumable_cancellable(
     second_language: &str,
     output_part_path: &Path,
     cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> Result<String, String> {
     translate_bilingual_resumable_at(
         client,
@@ -113,6 +115,7 @@ pub async fn translate_bilingual_resumable_cancellable(
         second_language,
         output_part_path,
         cancellation,
+        progress,
     )
     .await
 }
@@ -126,9 +129,28 @@ async fn translate_bilingual_resumable_at(
     second_language: &str,
     output_part_path: &Path,
     cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> Result<String, String> {
     let cues = parse_subtitles(contents)?;
     let staged_cues = read_staged_vtt(output_part_path, &cues).await?;
+    for cue in &staged_cues {
+        if let Some(progress) = progress.as_ref() {
+            if progress
+                .send(format!(
+                    "{} --> {}\n{}\n\n",
+                    cue.start.replace(',', "."),
+                    cue.end.replace(',', "."),
+                    cue.text
+                ))
+                .is_err()
+            {
+                if let Some(token) = cancellation.as_ref() {
+                    token.store(true, std::sync::atomic::Ordering::Release);
+                }
+                return Err("Bilingual subtitle stream closed".to_owned());
+            }
+        }
+    }
     for cue in cues.iter().skip(staged_cues.len()) {
         if cancellation.as_ref().is_some_and(|token| {
             token.load(std::sync::atomic::Ordering::Acquire)
@@ -164,6 +186,23 @@ async fn translate_bilingual_resumable_at(
             .remove(0)
         };
         append_staged_vtt_cue(output_part_path, cue, &first, &second).await?;
+        if let Some(progress) = progress.as_ref() {
+            if progress
+                .send(format!(
+                    "{} --> {}\n{}\n{}\n\n",
+                    cue.start.replace(',', "."),
+                    cue.end.replace(',', "."),
+                    escape_vtt(&first),
+                    escape_vtt(&second)
+                ))
+                .is_err()
+            {
+                if let Some(token) = cancellation.as_ref() {
+                    token.store(true, std::sync::atomic::Ordering::Release);
+                }
+                return Err("Bilingual subtitle stream closed".to_owned());
+            }
+        }
     }
     tokio::fs::read_to_string(output_part_path)
         .await
@@ -501,6 +540,7 @@ mod tests {
             "vi",
             &output_part,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -511,5 +551,32 @@ mod tests {
         let staged = tokio::fs::read_to_string(output_part).await.unwrap();
         assert!(staged.contains("Hello\nXin chào"));
         assert!(staged.contains("World\nvi:World"));
+    }
+
+    #[tokio::test]
+    async fn resumable_translation_emits_each_finished_cue_to_its_stream() {
+        let directory = tempfile::tempdir().unwrap();
+        let output_part = directory.path().join("Movie.en-en.vtt.part");
+        let (progress, mut cues) = tokio::sync::mpsc::unbounded_channel();
+        let output = translate_bilingual_resumable_at(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1/unused",
+            "00:00:01,000 --> 00:00:02,000\nHello\n",
+            "en",
+            "en",
+            "en",
+            &output_part,
+            None,
+            Some(progress),
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("Hello\nHello"));
+        assert_eq!(
+            cues.recv().await.as_deref(),
+            Some("00:00:01.000 --> 00:00:02.000\nHello\nHello\n\n")
+        );
+        assert!(cues.recv().await.is_none());
     }
 }

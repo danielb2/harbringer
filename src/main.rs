@@ -2280,13 +2280,43 @@ async fn translate_subtitle_cached_cancellable(
     second: &str,
     cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<String, String> {
+    translate_subtitle_cached_with_progress(
+        state,
+        media,
+        contents,
+        source,
+        extension,
+        first,
+        second,
+        cancellation,
+        None,
+    )
+    .await
+}
+
+async fn translate_subtitle_cached_with_progress(
+    state: &AppState,
+    media: &Media,
+    contents: &str,
+    source: &str,
+    extension: &str,
+    first: &str,
+    second: &str,
+    cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
+    progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+) -> Result<String, String> {
     let output_extension = match extension.to_ascii_lowercase().as_str() {
         "srt" | "vtt" | "ass" => extension.to_ascii_lowercase(),
         _ => return Err("This subtitle format cannot be translated".to_owned()),
     };
     let sidecar_path = bilingual_subtitle_path(media, first, second, &output_extension);
+    let sidecar_part_path = bilingual_subtitle_path(media, first, second, "vtt");
+    let sidecar_part_path = PathBuf::from(format!("{}.part", sidecar_part_path.to_string_lossy()));
     if let Ok(contents) = tokio::fs::read_to_string(&sidecar_path).await {
-        return Ok(subtitle_to_vtt(&contents, &output_extension));
+        cleanup_translation_checkpoint(&sidecar_part_path).await;
+        let vtt = subtitle_to_vtt(&contents, &output_extension);
+        send_vtt_progress(progress.as_ref(), &vtt)?;
+        return Ok(vtt);
     }
     let translation_input = match extension {
         "srt" | "vtt" => contents.to_owned(),
@@ -2313,13 +2343,22 @@ async fn translate_subtitle_cached_cancellable(
         .clone();
     let _cache_guard = cache_lock.lock().await;
     if let Ok(contents) = tokio::fs::read_to_string(&sidecar_path).await {
-        return Ok(subtitle_to_vtt(&contents, &output_extension));
+        let vtt = subtitle_to_vtt(&contents, &output_extension);
+        send_vtt_progress(progress.as_ref(), &vtt)?;
+        return Ok(vtt);
     }
     let legacy_cache_path = state
         .subtitle_checkpoints_dir
         .join(format!("{checkpoint_key}.vtt"));
     if let Ok(cached) = tokio::fs::read_to_string(&legacy_cache_path).await {
-        save_bilingual_sidecar(&sidecar_path, &cached, &output_extension).await?;
+        finalize_bilingual_translation(
+            &sidecar_path,
+            &sidecar_part_path,
+            &cached,
+            &output_extension,
+        )
+        .await?;
+        send_vtt_progress(progress.as_ref(), &cached)?;
         return Ok(cached);
     }
     let client = reqwest::Client::builder()
@@ -2329,8 +2368,6 @@ async fn translate_subtitle_cached_cancellable(
     tokio::fs::create_dir_all(state.subtitle_checkpoints_dir.as_path())
         .await
         .map_err(|_| "Could not create subtitle checkpoint directory".to_owned())?;
-    let sidecar_part_path = bilingual_subtitle_path(media, first, second, "vtt");
-    let sidecar_part_path = PathBuf::from(format!("{}.part", sidecar_part_path.to_string_lossy()));
     if tokio::fs::metadata(&sidecar_part_path).await.is_err() {
         for suffix in ["jsonl.part", "vtt.part"] {
             let legacy_checkpoint_path = state
@@ -2347,7 +2384,7 @@ async fn translate_subtitle_cached_cancellable(
             }
         }
     }
-    let translated = if let Some(token) = cancellation.clone() {
+    let translated = if cancellation.is_some() || progress.is_some() {
         subtitles::translate_bilingual_resumable_cancellable(
             &client,
             &translation_input,
@@ -2355,7 +2392,8 @@ async fn translate_subtitle_cached_cancellable(
             first,
             second,
             &sidecar_part_path,
-            Some(token),
+            cancellation.clone(),
+            progress,
         )
         .await
     } else {
@@ -2375,8 +2413,53 @@ async fn translate_subtitle_cached_cancellable(
     }) {
         return Err("Bilingual translation stopped with playback".to_owned());
     }
-    save_bilingual_sidecar(&sidecar_path, &vtt, &output_extension).await?;
+    finalize_bilingual_translation(
+        &sidecar_path,
+        &sidecar_part_path,
+        &vtt,
+        &output_extension,
+    )
+    .await?;
     Ok(vtt)
+}
+
+fn send_vtt_progress(
+    progress: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    vtt: &str,
+) -> Result<(), String> {
+    let Some(progress) = progress else {
+        return Ok(());
+    };
+    for cue in subtitles::parse_subtitles(vtt)? {
+        progress
+            .send(format!(
+                "{} --> {}\n{}\n\n",
+                cue.start.replace(',', "."),
+                cue.end.replace(',', "."),
+                cue.text
+            ))
+            .map_err(|_| "Bilingual subtitle stream closed".to_owned())?;
+    }
+    Ok(())
+}
+
+async fn finalize_bilingual_translation(
+    sidecar_path: &std::path::Path,
+    checkpoint_path: &std::path::Path,
+    vtt: &str,
+    extension: &str,
+) -> Result<(), String> {
+    save_bilingual_sidecar(sidecar_path, vtt, extension).await?;
+    cleanup_translation_checkpoint(checkpoint_path).await;
+    Ok(())
+}
+
+async fn cleanup_translation_checkpoint(path: &std::path::Path) {
+    if let Err(error) = tokio::fs::remove_file(path).await {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warn!(path = %path.display(), error = %error, "could not remove completed subtitle checkpoint");
+        }
+    }
 }
 
 async fn save_bilingual_sidecar(
@@ -2453,6 +2536,36 @@ async fn translated_subtitle_preview(
         },
     )
     .await
+}
+
+async fn translated_subtitle_stream_response(
+    state: &AppState,
+    media: &Media,
+    source_contents: &str,
+    source_language: &str,
+    source_format: &str,
+    first: &str,
+    second: &str,
+    requested_format: &str,
+) -> Response {
+    let output_srt = requested_format == "srt";
+    let content_type = if output_srt {
+        "text/srt; charset=utf-8"
+    } else {
+        "text/vtt; charset=utf-8"
+    };
+    let vtt = translated_subtitle_preview(
+        state,
+        media,
+        source_contents,
+        source_language,
+        source_format,
+        first,
+        second,
+    )
+    .await;
+    let body = if output_srt { vtt_to_srt(&vtt) } else { vtt };
+    ([(header::CONTENT_TYPE, content_type)], body).into_response()
 }
 
 async fn staged_subtitle_preview<F, Fut>(
@@ -6452,10 +6565,9 @@ fn apply_plex_technical_metadata(
             "extendedDisplayTitle": extended_display_title,
             "title": extended_display_title,
             "external": true,
-            "key": format!(
-                "/library/streams/{id}.{}",
-                subtitle_path.extension().and_then(|value| value.to_str()).unwrap_or("srt").to_ascii_lowercase()
-            ),
+            // Plex clients such as Plezy append the requested subtitle codec
+            // extension to Stream.key when fetching the sidecar.
+            "key": format!("/library/streams/{id}"),
             "default": false,
             "selected": selection
                 .and_then(|selection| selection.subtitle_stream_id)
@@ -6475,7 +6587,7 @@ fn apply_plex_technical_metadata(
             "language": plex_language(language_primary).1,
             "languageCode": plex_language_code_3(language_primary), "languageTag": language_primary,
             "displayTitle": label, "extendedDisplayTitle": "Bilingual VTT External", "title": "Bilingual VTT External",
-            "external": true, "key": format!("/library/streams/{id}.vtt"), "default": false,
+            "external": true, "key": format!("/library/streams/{id}"), "default": false,
             "selected": selection.and_then(|selection| selection.subtitle_stream_id).is_some_and(|selected| selected == id),
             "forced": false
         }));
@@ -12614,7 +12726,9 @@ fn plex_timeline(
             );
         }
         if playback_state.eq_ignore_ascii_case("stopped") {
-            cancel_streaming_translation_jobs(&media_id);
+            if let Some(media) = find_media(state, &media_id) {
+                cancel_streaming_translation_jobs(&media.id);
+            }
         }
     }
     if duration.is_some_and(|duration| plex_scrobble_threshold_reached(position, duration))
@@ -18950,7 +19064,11 @@ async fn plex_stream(
             else {
                 return StatusCode::NOT_FOUND.into_response();
             };
-            let contents = translated_subtitle_preview(
+            let requested = query
+                .get("format")
+                .map(|format| format.to_ascii_lowercase())
+                .unwrap_or_else(|| extension.unwrap_or("vtt").to_owned());
+            return translated_subtitle_stream_response(
                 &state,
                 media,
                 &source,
@@ -18958,18 +19076,9 @@ async fn plex_stream(
                 &format,
                 first,
                 second,
+                &requested,
             )
             .await;
-            let requested = query
-                .get("format")
-                .map(|format| format.to_ascii_lowercase())
-                .unwrap_or_else(|| extension.to_owned());
-            let (mime, body) = if requested == "srt" {
-                ("text/srt; charset=utf-8", vtt_to_srt(&contents))
-            } else {
-                ("text/vtt; charset=utf-8", contents)
-            };
-            return ([(header::CONTENT_TYPE, mime)], body).into_response();
         }
     }
     for media in media_index.iter() {
@@ -18993,7 +19102,7 @@ async fn plex_stream(
             let requested_format = query
                 .get("format")
                 .map(|format| format.to_ascii_lowercase())
-                .unwrap_or_else(|| extension.to_owned());
+                .unwrap_or_else(|| extension.unwrap_or(&subtitle_extension).to_owned());
             let Some((content_type, contents)) =
                 external_subtitle_content(&contents, &subtitle_extension, &requested_format)
             else {
@@ -19005,9 +19114,15 @@ async fn plex_stream(
     StatusCode::NOT_FOUND.into_response()
 }
 
-fn plex_stream_id_and_format(stream: &str) -> Option<(u64, &str)> {
-    let (id, extensions) = stream.split_once('.')?;
+fn plex_stream_id_and_format(stream: &str) -> Option<(u64, Option<&str>)> {
+    let (id, extensions) = stream
+        .split_once('.')
+        .map(|(id, extensions)| (id, Some(extensions)))
+        .unwrap_or((stream, None));
     let stream_id = id.parse::<u64>().ok()?;
+    let Some(extensions) = extensions else {
+        return Some((stream_id, None));
+    };
     let mut requested_format = None;
     for extension in extensions.split('.') {
         if !matches!(extension, "srt" | "ass" | "vtt") {
@@ -19015,7 +19130,7 @@ fn plex_stream_id_and_format(stream: &str) -> Option<(u64, &str)> {
         }
         requested_format = Some(extension);
     }
-    Some((stream_id, requested_format?))
+    Some((stream_id, Some(requested_format?)))
 }
 
 fn external_subtitle_content(

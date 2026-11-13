@@ -14,7 +14,7 @@ Harbringer is an alternative, independent implementation of Plex Media Server. I
 - Store matched metadata in the server database or beside your media files as portable sidecars.
 - Play supported files directly, with seeking and playback progress.
 - Use Plex Desktop for playback of supported H.264 Matroska media, including optional AAC audio.
-- Configure optional bilingual subtitles in the collapsible **Subtitle translation** section of Settings. Choose the two languages, translate while playing, or prepare the full episode; progress is staged beside the video as `<video>.en-vi.vtt.part`. Completed bilingual sidecars keep the source subtitle format and are available to Plex clients. Matching individual language sidecars can be merged automatically. Turning bilingual subtitles off hides bilingual tracks from clients without deleting their files.
+- Configure optional bilingual subtitles in the collapsible **Subtitle translation** section of Settings. Choose the two languages, translate while playing, or prepare the full episode; progress is staged beside the video as `<video>.en-vi.vtt.part`. During playback, clients receive the available subtitle snapshot while translation continues in the background; later cues appear when the subtitle is loaded again. Completed bilingual sidecars keep the source subtitle format and are available to Plex clients. Matching individual language sidecars can be merged automatically. Turning bilingual subtitles off hides bilingual tracks from clients without deleting their files.
 
 ## Run Harbringer
 
