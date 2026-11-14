@@ -27,7 +27,7 @@ image:
     docker buildx build --load --build-arg "IMAGE_BUILD_DATE=$build_date" -t harbringer:latest .
 
 # build and publish docker image
-publish:
+publish tag="latest":
     #!/usr/bin/env bash
     set -euo pipefail
     if ! docker buildx version >/dev/null 2>&1; then
@@ -36,10 +36,13 @@ publish:
     fi
     owner="$(gh repo view --json owner --jq .owner.login)"
     username="$(gh api user --jq .login)"
-    image="ghcr.io/${owner}/harbringer:latest"
+    image="ghcr.io/${owner}/harbringer:{{tag}}"
     gh auth token | docker login ghcr.io --username "$username" --password-stdin
     build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     docker buildx build --platform linux/amd64,linux/arm64 --push --build-arg "IMAGE_BUILD_DATE=$build_date" -t "$image" .
+
+# build and publish the non-stable nightly docker image
+nightly: (publish "nightly")
 
 # restart local server
 restart:
