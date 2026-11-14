@@ -2244,7 +2244,8 @@ async fn web_and_plex_clients_share_subtitle_selection() {
         fixture.subtitle_id
     )));
     assert!(web_player.contains("Translate while playing"));
-    assert!(web_player.contains("Translate full episode"));
+    assert!(web_player.contains("Generate bilingual subtitle"));
+    assert!(web_player.contains("class=\"translation-progress\""));
 
     let plex_selection = send(
         &fixture.app,
@@ -2494,6 +2495,50 @@ async fn successful_translation_removes_its_part_checkpoint_but_failures_keep_it
 }
 
 #[tokio::test]
+async fn changing_translation_source_resets_the_partial_without_mixing_cues() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let checkpoint = super::bilingual_subtitle_path(&media, "en", "vi", "vtt");
+    let checkpoint = std::path::PathBuf::from(format!("{}.part", checkpoint.to_string_lossy()));
+    let source_a = "1\n00:00:01,000 --> 00:00:02,000\nHello\n";
+    let source_b = "1\n00:00:01,000 --> 00:00:02,000\nGoodbye\n";
+    let fingerprint_a = super::subtitle_translation_fingerprint(
+        &media, source_a, "en", "srt", "en", "vi", Some("stream:1"),
+    )
+    .unwrap();
+    let fingerprint_b = super::subtitle_translation_fingerprint(
+        &media, source_b, "en", "srt", "en", "vi", Some("stream:2"),
+    )
+    .unwrap();
+    assert_ne!(fingerprint_a, fingerprint_b);
+    std::fs::write(
+        &checkpoint,
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n",
+    )
+    .unwrap();
+    super::write_subtitle_source_marker(&checkpoint, &fingerprint_a, Some("stream:1"))
+        .await
+        .unwrap();
+
+    super::prepare_translation_checkpoint(
+        &checkpoint,
+        source_b,
+        &fingerprint_b,
+        Some("stream:2"),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&checkpoint).unwrap(), "WEBVTT\n\n");
+    assert!(super::subtitle_source_marker_matches(
+        &checkpoint,
+        &fingerprint_b,
+        Some("stream:2")
+    )
+    .await);
+}
+
+#[tokio::test]
 async fn bilingual_sidecar_keeps_vtt_or_ass_source_format() {
     let fixture = fixture();
     let media = fixture.state.media.read().unwrap()[0].clone();
@@ -2566,6 +2611,9 @@ async fn plex_translated_stream_returns_the_staged_part_without_waiting_for_comp
         "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n",
     )
     .unwrap();
+    super::write_subtitle_source_marker(&checkpoint, "test-source", Some("stream:7"))
+        .await
+        .unwrap();
     let final_path = super::bilingual_subtitle_path(&media, "en", "vi", "vtt");
     let (resume_job, wait_for_resume) = tokio::sync::oneshot::channel::<()>();
     let contents = tokio::time::timeout(
@@ -2576,6 +2624,8 @@ async fn plex_translated_stream_returns_the_staged_part_without_waiting_for_comp
             &media.id,
             final_path.to_string_lossy().into_owned(),
             false,
+            true,
+            true,
             move |_cancelled| async move { let _ = wait_for_resume.await; },
         ),
     )
@@ -2701,6 +2751,61 @@ async fn embedded_text_subtitle_can_be_selected_as_translation_source() {
     )
     .unwrap();
     assert!(message.contains("Embedded subtitles could not be read"));
+}
+
+#[tokio::test]
+async fn web_translation_progress_reports_staged_cues_and_completed_srt() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let checkpoint = super::bilingual_subtitle_path(&media, "en", "vi", "vtt");
+    let checkpoint = std::path::PathBuf::from(format!("{}.part", checkpoint.to_string_lossy()));
+    std::fs::write(
+        &checkpoint,
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n",
+    )
+    .unwrap();
+    super::write_subtitle_source_marker(&checkpoint, "test-source", Some("stream:7"))
+        .await
+        .unwrap();
+    let request = || {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/web/translation-progress")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "path":"Demo.mkv", "library":0, "stream_id":0,
+                    "first_language":"en", "second_language":"vi",
+                    "source_key":"stream:7", "total_cues":1
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+    let response = fixture.app.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let progress: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(progress["completed"], 1);
+    assert_eq!(progress["total"], 1);
+    assert_eq!(progress["percent"], 100);
+    assert_eq!(progress["complete"], false);
+
+    let final_path = super::bilingual_subtitle_path(&media, "en", "vi", "srt");
+    std::fs::write(&final_path, "1\n00:00:01,000 --> 00:00:02,000\nHello\nXin chào\n")
+        .unwrap();
+    super::write_subtitle_source_marker(&final_path, "test-source", Some("stream:7"))
+        .await
+        .unwrap();
+    let response = fixture.app.clone().oneshot(request()).await.unwrap();
+    let progress: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(progress["percent"], 100);
+    assert_eq!(progress["complete"], true);
 }
 
 #[tokio::test]

@@ -1,6 +1,7 @@
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinSet;
+use tracing::{debug, info};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cue {
@@ -151,10 +152,11 @@ async fn translate_bilingual_resumable_at(
             }
         }
     }
-    for cue in cues.iter().skip(staged_cues.len()) {
+    for (cue_index, cue) in cues.iter().enumerate().skip(staged_cues.len()) {
         if cancellation.as_ref().is_some_and(|token| {
             token.load(std::sync::atomic::Ordering::Acquire)
         }) {
+            info!(cue_number = cue_index + 1, "playback stopped; no further subtitle requests will be sent");
             return Err("Bilingual translation stopped with playback".to_owned());
         }
         let first = if source_language == first_language {
@@ -166,6 +168,8 @@ async fn translate_bilingual_resumable_at(
                 std::slice::from_ref(&cue.text),
                 source_language,
                 first_language,
+                cue_index + 1,
+                cancellation.clone(),
             )
             .await?
             .remove(0)
@@ -181,6 +185,8 @@ async fn translate_bilingual_resumable_at(
                 std::slice::from_ref(&cue.text),
                 source_language,
                 second_language,
+                cue_index + 1,
+                cancellation.clone(),
             )
             .await?
             .remove(0)
@@ -231,6 +237,42 @@ async fn read_staged_vtt(output_path: &Path, source_cues: &[Cue]) -> Result<Vec<
     let completed = parsed.into_iter().take(completed).collect::<Vec<_>>();
     write_staged_vtt(output_path, &completed).await?;
     Ok(completed)
+}
+
+pub async fn staged_vtt_matches_source(output_path: &Path, source_contents: &str) -> bool {
+    let Ok(source_cues) = parse_subtitles(source_contents) else {
+        return false;
+    };
+    let Ok(staged_contents) = tokio::fs::read_to_string(output_path).await else {
+        return false;
+    };
+    let Ok(staged_cues) = parse_subtitles(&staged_contents) else {
+        return staged_contents.trim() == "WEBVTT";
+    };
+    if staged_cues.is_empty() {
+        return true;
+    }
+    if staged_cues.len() > source_cues.len() {
+        return false;
+    }
+    staged_cues
+        .iter()
+        .zip(&source_cues)
+        .all(|(staged, source)| {
+            if staged.start.replace(',', ".") != source.start.replace(',', ".")
+                || staged.end.replace(',', ".") != source.end.replace(',', ".")
+            {
+                return false;
+            }
+            let staged_lines = staged.text.lines().map(str::trim).collect::<Vec<_>>();
+            let source_lines = source.text.lines().map(str::trim).collect::<Vec<_>>();
+            !source_lines.is_empty()
+                && staged_lines.windows(source_lines.len()).any(|window| {
+                    window.iter().zip(&source_lines).all(|(saved, source)| {
+                        *saved == *source || *saved == escape_vtt(source)
+                    })
+                })
+        })
 }
 
 async fn write_staged_vtt(output_path: &Path, cues: &[Cue]) -> Result<(), String> {
@@ -335,11 +377,11 @@ async fn translate_bilingual_at(
 ) -> Result<String, String> {
     let cues = parse_subtitles(contents)?;
     let texts = cues.iter().map(|cue| cue.text.clone()).collect::<Vec<_>>();
-    let first = translate_batch(client, endpoint, &texts, source_language, first_language).await?;
+    let first = translate_batch(client, endpoint, &texts, source_language, first_language, 1, None).await?;
     let second = if first_language == second_language {
         first.clone()
     } else {
-        translate_batch(client, endpoint, &texts, source_language, second_language).await?
+        translate_batch(client, endpoint, &texts, source_language, second_language, 1, None).await?
     };
     bilingual_vtt(&cues, &first, &second)
 }
@@ -350,17 +392,24 @@ async fn translate_batch(
     texts: &[String],
     source: &str,
     target: &str,
+    first_cue_number: usize,
+    cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<Vec<String>, String> {
     if source == target {
         return Ok(texts.to_vec());
     }
     let mut output = Vec::with_capacity(texts.len());
-    for batch in texts.chunks(8) {
+    for (batch_index, batch) in texts.chunks(8).enumerate() {
+        let batch_first_cue = first_cue_number + batch_index * 8;
+        let batch_last_cue = batch_first_cue + batch.len() - 1;
+        info!(source_language = source, target_language = target, first_cue = batch_first_cue, last_cue = batch_last_cue, request_count = batch.len(), "sending Google Translate batch");
         let mut jobs = JoinSet::new();
         for (index, text) in batch.iter().enumerate() {
             let client = client.clone();
             let endpoint = endpoint.to_owned();
             let text = text.clone();
+            let cue_number = batch_first_cue + index;
+            let cancellation = cancellation.clone();
             let source = if source == "und" {
                 "auto".to_owned()
             } else {
@@ -370,31 +419,84 @@ async fn translate_batch(
             jobs.spawn(async move {
                 let mut retries = 0_u32;
                 loop {
-                    let response = client.get(&endpoint).query(&[
+                    if cancellation.as_ref().is_some_and(|token| {
+                        token.load(std::sync::atomic::Ordering::Acquire)
+                    }) {
+                        info!(source_language = source, target_language = target, cue_number, "playback stopped before Google Translate request");
+                        return Err("Bilingual translation stopped with playback".to_owned());
+                    }
+                    debug!(source_language = source, target_language = target, cue_number, attempt = retries + 1, "sending Google Translate API request");
+                    let request = client.get(&endpoint).query(&[
                         ("client", "gtx"), ("sl", source.as_str()), ("tl", target.as_str()),
                         ("dt", "t"), ("q", text.as_str()),
-                    ]).send().await;
+                    ]).send();
+                    let request_started = std::time::Instant::now();
+                    let response = if let Some(cancellation) = cancellation.clone() {
+                        tokio::select! {
+                            response = request => response,
+                            _ = wait_for_translation_cancellation(cancellation) => {
+                                info!(source_language = source, target_language = target, cue_number, attempt = retries + 1, elapsed_ms = request_started.elapsed().as_millis(), "Google Translate request cancelled after playback stopped");
+                                return Err("Bilingual translation stopped with playback".to_owned());
+                            }
+                        }
+                    } else {
+                        request.await
+                    };
                     match response {
                         Ok(response) if response.status().as_u16() == 429 => {
                             let retry_after = response.headers().get(reqwest::header::RETRY_AFTER)
                                 .and_then(|value| value.to_str().ok()).unwrap_or("not provided");
+                            tracing::warn!(source_language = source, target_language = target, cue_number, retry_after, "Google Translate API request returned HTTP 429");
                             return Err(format!("Google Translate rate limit (HTTP 429). Retry-After: {retry_after}. Completed subtitle cues are saved and will resume on the next request."));
                         }
                         Ok(response) if response.status().is_success() => {
-                            let value: serde_json::Value = response.json().await
-                                .map_err(|_| "Google Translate returned invalid JSON".to_owned())?;
+                            debug!(source_language = source, target_language = target, cue_number, status = response.status().as_u16(), elapsed_ms = request_started.elapsed().as_millis(), "Google Translate API response received");
+                            let value = if let Some(cancellation) = cancellation.clone() {
+                                tokio::select! {
+                                    value = response.json::<serde_json::Value>() => value,
+                                    _ = wait_for_translation_cancellation(cancellation) => {
+                                        info!(source_language = source, target_language = target, cue_number, "Google Translate response read cancelled after playback stopped");
+                                        return Err("Bilingual translation stopped with playback".to_owned());
+                                    }
+                                }
+                            } else {
+                                response.json::<serde_json::Value>().await
+                            }
+                            .map_err(|error| {
+                                tracing::error!(source_language = source, target_language = target, cue_number, error = %error, "Google Translate returned invalid JSON");
+                                "Google Translate returned invalid JSON".to_owned()
+                            })?;
                             let segments = value.get(0).and_then(serde_json::Value::as_array)
                                 .ok_or_else(|| "Google Translate returned an invalid response".to_owned())?;
                             let translated = segments.iter().filter_map(|segment| segment.get(0).and_then(serde_json::Value::as_str)).collect::<String>();
                             if translated.is_empty() { return Err("Google Translate returned an empty translation".to_owned()); }
                             return Ok((index, translated));
                         }
-                        Ok(response) => return Err(format!("Google Translate returned HTTP {}", response.status().as_u16())),
-                        Err(_) if retries < 4 => {
-                            retries += 1;
-                            tokio::time::sleep(std::time::Duration::from_secs(u64::from(retries * retries))).await;
+                        Ok(response) => {
+                            let status = response.status().as_u16();
+                            tracing::error!(source_language = source, target_language = target, cue_number, status, elapsed_ms = request_started.elapsed().as_millis(), "Google Translate API request failed");
+                            return Err(format!("Google Translate returned HTTP {status}"));
                         }
-                        Err(_) => return Err("Google Translate network request failed after four retries".to_owned()),
+                        Err(error) if retries < 4 => {
+                            retries += 1;
+                            tracing::warn!(source_language = source, target_language = target, cue_number, attempt = retries, error = %error, "Google Translate API network error; retrying");
+                            let backoff = tokio::time::sleep(std::time::Duration::from_secs(u64::from(retries * retries)));
+                            if let Some(cancellation) = cancellation.clone() {
+                                tokio::select! {
+                                    _ = backoff => {},
+                                    _ = wait_for_translation_cancellation(cancellation) => {
+                                        info!(source_language = source, target_language = target, cue_number, "Google Translate retry cancelled after playback stopped");
+                                        return Err("Bilingual translation stopped with playback".to_owned());
+                                    }
+                                }
+                            } else {
+                                backoff.await;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(source_language = source, target_language = target, cue_number, retries, error = %error, "Google Translate API request failed after retries");
+                            return Err("Google Translate network request failed after four retries".to_owned());
+                        }
                     }
                 }
             });
@@ -406,8 +508,17 @@ async fn translate_batch(
             batch_output[index] = translated;
         }
         output.extend(batch_output);
+        info!(source_language = source, target_language = target, first_cue = batch_first_cue, last_cue = batch_last_cue, "Google Translate batch completed");
     }
     Ok(output)
+}
+
+async fn wait_for_translation_cancellation(
+    cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    while !cancellation.load(std::sync::atomic::Ordering::Acquire) {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 #[cfg(test)]
@@ -551,6 +662,80 @@ mod tests {
         let staged = tokio::fs::read_to_string(output_part).await.unwrap();
         assert!(staged.contains("Hello\nXin chào"));
         assert!(staged.contains("World\nvi:World"));
+    }
+
+    #[tokio::test]
+    async fn legacy_checkpoint_is_reused_only_when_saved_cues_match_the_selected_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = directory.path().join("Demo.en-vi.vtt.part");
+        tokio::fs::write(
+            &checkpoint,
+            "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n",
+        )
+        .await
+        .unwrap();
+        assert!(staged_vtt_matches_source(
+            &checkpoint,
+            "00:00:01,000 --> 00:00:02,000\nHello\n"
+        )
+        .await);
+        assert!(!staged_vtt_matches_source(
+            &checkpoint,
+            "00:00:01,000 --> 00:00:02,000\nGoodbye\n"
+        )
+        .await);
+    }
+
+    async fn blocked_translation_stub(
+        State(request_started): State<Arc<tokio::sync::Notify>>,
+    ) -> impl axum::response::IntoResponse {
+        request_started.notify_one();
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        axum::Json(serde_json::json!([[["vi:Hello", "Hello"]], null, "en"]))
+    }
+
+    #[tokio::test]
+    async fn stopping_playback_cancels_an_in_flight_google_request() {
+        use axum::routing::get;
+
+        let request_started = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/",
+            get(blocked_translation_stub).with_state(request_started.clone()),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let directory = tempfile::tempdir().unwrap();
+        let output_part = directory.path().join("Movie.en-vi.vtt.part");
+        let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let job_cancellation = cancellation.clone();
+        let endpoint = format!("http://{address}/");
+        let job = tokio::spawn(async move {
+            translate_bilingual_resumable_at(
+                &reqwest::Client::new(),
+                &endpoint,
+                "00:00:01,000 --> 00:00:02,000\nHello\n",
+                "en",
+                "en",
+                "vi",
+                &output_part,
+                Some(job_cancellation),
+                None,
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), request_started.notified())
+            .await
+            .expect("translation request was not sent");
+        cancellation.store(true, std::sync::atomic::Ordering::Release);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), job)
+            .await
+            .expect("in-flight translation request was not cancelled")
+            .unwrap();
+        assert_eq!(result.unwrap_err(), "Bilingual translation stopped with playback");
     }
 
     #[tokio::test]

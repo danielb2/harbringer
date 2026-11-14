@@ -249,8 +249,14 @@ fn finish_translation_job(job_key: &str) {
 fn cancel_streaming_translation_jobs(media_id: &str) {
     if let Some(jobs) = ACTIVE_TRANSLATION_JOBS.get() {
         if let Ok(jobs) = jobs.lock() {
+            let mut cancelled = 0;
             for job in jobs.values().filter(|job| job.media_id == media_id && !job.explicit) {
-                job.cancelled.store(true, std::sync::atomic::Ordering::Release);
+                if !job.cancelled.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    cancelled += 1;
+                }
+            }
+            if cancelled > 0 {
+                info!(media_id, jobs = cancelled, "playback stopped; cancelling streaming subtitle translation");
             }
         }
     }
@@ -767,6 +773,7 @@ fn build_app(state: AppState) -> Router {
         )
         .route("/web/subtitle", get(web_subtitle))
         .route("/web/translated-subtitle", post(web_translated_subtitle))
+        .route("/web/translation-progress", post(web_translation_progress))
         .route("/web/artwork", get(web_artwork))
         .route("/web/info", get(web_info))
         .route("/web/tv-match/search", get(tv_match_search))
@@ -2119,10 +2126,123 @@ struct WebTranslatedSubtitleRequest {
     source_language: Option<String>,
     #[serde(default)]
     source_cues: Vec<BrowserSubtitleCue>,
+    #[serde(default)]
+    source_key: Option<String>,
     first_language: String,
     second_language: String,
     #[serde(default)]
     prepared: bool,
+}
+
+#[derive(Deserialize)]
+struct WebTranslationProgressRequest {
+    path: String,
+    library: Option<usize>,
+    #[serde(default)]
+    stream_id: u64,
+    first_language: String,
+    second_language: String,
+    #[serde(default)]
+    source_key: Option<String>,
+    #[serde(default)]
+    total_cues: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SubtitleSourceMarker {
+    fingerprint: String,
+    source_key: Option<String>,
+}
+
+async fn web_translation_progress(
+    State(state): State<AppState>,
+    Json(request): Json<WebTranslationProgressRequest>,
+) -> Response {
+    if !state
+        .config
+        .lock()
+        .is_ok_and(|config| config.bilingual_subtitles_enabled)
+    {
+        return (StatusCode::FORBIDDEN, "Bilingual subtitles are disabled in Settings")
+            .into_response();
+    }
+    if request.first_language == request.second_language
+        || isolang::Language::from_639_1(&request.first_language).is_none()
+        || isolang::Language::from_639_1(&request.second_language).is_none()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Choose two distinct supported languages",
+        )
+            .into_response();
+    }
+    let Some(relative) = clean_relative_path(&request.path) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if contains_hidden_component(&relative) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let root = selected_library_root(&state, request.library);
+    let Some(media) = web_media_for_relative(&state, &root, &relative).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let total = match request.total_cues {
+        Some(total) if total <= 20_000 => total,
+        Some(_) => return (StatusCode::BAD_REQUEST, "Subtitle track contains too many cues").into_response(),
+        None => {
+            let (contents, _, format) = match read_subtitle_source(&state, &media, request.stream_id).await {
+                Ok(source) => source,
+                Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+            };
+            match subtitles::parse_subtitles(&subtitle_to_vtt(&contents, &format)) {
+                Ok(cues) => cues.len(),
+                Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+            }
+        }
+    };
+    let final_path = bilingual_subtitle_path(
+        &media,
+        &request.first_language,
+        &request.second_language,
+        "srt",
+    );
+    let checkpoint_path = bilingual_subtitle_path(
+        &media,
+        &request.first_language,
+        &request.second_language,
+        "vtt",
+    );
+    let checkpoint_path = PathBuf::from(format!("{}.part", checkpoint_path.to_string_lossy()));
+    let finished = if subtitle_marker_source_matches(&final_path, request.source_key.as_deref()).await {
+        tokio::fs::read_to_string(&final_path).await.ok()
+    } else {
+        None
+    };
+    let staged = if let Some(contents) = finished.as_ref() {
+        contents.clone()
+    } else if subtitle_marker_source_matches(&checkpoint_path, request.source_key.as_deref()).await {
+        tokio::fs::read_to_string(&checkpoint_path)
+            .await
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let completed = subtitles::parse_subtitles(&staged)
+        .map(|cues| cues.len())
+        .unwrap_or(0)
+        .min(total);
+    let percent = if total == 0 {
+        0
+    } else {
+        (completed * 100 / total) as u8
+    };
+    Json(serde_json::json!({
+        "completed": completed,
+        "total": total,
+        "percent": if finished.is_some() { 100 } else { percent },
+        "complete": finished.is_some(),
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -2183,6 +2303,11 @@ async fn web_translated_subtitle(
             Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
         }
     };
+    let (contents, format) = if request.prepared {
+        (vtt_to_srt(&subtitle_to_vtt(&contents, &format)), "srt".to_owned())
+    } else {
+        (contents, format)
+    };
     let translated = if request.prepared {
         let job_key = format!(
             "prepared:{}:{}:{}",
@@ -2202,6 +2327,7 @@ async fn web_translated_subtitle(
             &request.first_language,
             &request.second_language,
             Some(cancellation),
+            request.source_key.as_deref(),
         )
         .await;
         finish_translation_job(&job_key);
@@ -2215,6 +2341,7 @@ async fn web_translated_subtitle(
             &format,
             &request.first_language,
             &request.second_language,
+            request.source_key.as_deref(),
         )
         .await)
     };
@@ -2255,6 +2382,121 @@ fn browser_cues_to_srt(cues: &[BrowserSubtitleCue]) -> Result<String, String> {
     Ok(output)
 }
 
+fn subtitle_source_marker_path(path: &std::path::Path) -> PathBuf {
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    path.with_file_name(format!(".{file_name}.source.json"))
+}
+
+fn subtitle_translation_fingerprint(
+    media: &Media,
+    contents: &str,
+    source_language: &str,
+    source_format: &str,
+    first: &str,
+    second: &str,
+    _source_key: Option<&str>,
+) -> Result<String, String> {
+    let translation_input = match source_format.to_ascii_lowercase().as_str() {
+        "srt" | "vtt" => contents.to_owned(),
+        "ass" => ass_to_vtt(contents),
+        _ => return Err("This subtitle format cannot be translated".to_owned()),
+    };
+    let cues = subtitles::parse_subtitles(&translation_input)?;
+    let mut normalized_source = String::new();
+    for cue in cues {
+        normalized_source.push_str(&cue.start.replace(',', "."));
+        normalized_source.push_str(" --> ");
+        normalized_source.push_str(&cue.end.replace(',', "."));
+        normalized_source.push('\n');
+        normalized_source.push_str(cue.text.trim());
+        normalized_source.push_str("\n\n");
+    }
+    let mut hash = Sha256::new();
+    hash.update(&media.id);
+    hash.update(normalized_source);
+    hash.update(source_language.as_bytes());
+    hash.update(first.as_bytes());
+    hash.update(second.as_bytes());
+    Ok(hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+async fn subtitle_source_marker_matches(
+    artifact_path: &std::path::Path,
+    fingerprint: &str,
+    _source_key: Option<&str>,
+) -> bool {
+    let marker_path = subtitle_source_marker_path(artifact_path);
+    let Ok(contents) = tokio::fs::read_to_string(marker_path).await else {
+        return false;
+    };
+    let Ok(marker) = serde_json::from_str::<SubtitleSourceMarker>(&contents) else {
+        return false;
+    };
+    marker.fingerprint == fingerprint
+}
+
+async fn subtitle_marker_source_matches(
+    artifact_path: &std::path::Path,
+    source_key: Option<&str>,
+) -> bool {
+    let marker_path = subtitle_source_marker_path(artifact_path);
+    let Ok(contents) = tokio::fs::read_to_string(marker_path).await else {
+        return false;
+    };
+    serde_json::from_str::<SubtitleSourceMarker>(&contents)
+        .is_ok_and(|marker| marker.source_key.as_deref() == source_key)
+}
+
+async fn write_subtitle_source_marker(
+    artifact_path: &std::path::Path,
+    fingerprint: &str,
+    source_key: Option<&str>,
+) -> Result<(), String> {
+    let marker_path = subtitle_source_marker_path(artifact_path);
+    let temporary_path = PathBuf::from(format!("{}.tmp", marker_path.to_string_lossy()));
+    let contents = serde_json::to_vec(&SubtitleSourceMarker {
+        fingerprint: fingerprint.to_owned(),
+        source_key: source_key.map(str::to_owned),
+    })
+    .map_err(|_| "Could not encode subtitle source metadata".to_owned())?;
+    tokio::fs::write(&temporary_path, contents)
+        .await
+        .map_err(|_| "Could not write subtitle source metadata".to_owned())?;
+    tokio::fs::rename(&temporary_path, &marker_path)
+        .await
+        .map_err(|_| "Could not save subtitle source metadata".to_owned())
+}
+
+async fn prepare_translation_checkpoint(
+    checkpoint_path: &std::path::Path,
+    translation_input: &str,
+    fingerprint: &str,
+    source_key: Option<&str>,
+) -> Result<(), String> {
+    if subtitle_source_marker_matches(checkpoint_path, fingerprint, source_key).await {
+        write_subtitle_source_marker(checkpoint_path, fingerprint, source_key).await?;
+        return Ok(());
+    }
+    let has_checkpoint = tokio::fs::metadata(checkpoint_path).await.is_ok();
+    let has_marker = tokio::fs::metadata(subtitle_source_marker_path(checkpoint_path))
+        .await
+        .is_ok();
+    let keep_legacy_checkpoint = has_checkpoint
+        && !has_marker
+        && subtitles::staged_vtt_matches_source(checkpoint_path, translation_input).await;
+    if has_checkpoint && !keep_legacy_checkpoint {
+        tokio::fs::write(checkpoint_path, "WEBVTT\n\n")
+            .await
+            .map_err(|_| "Could not reset the subtitle checkpoint for this source".to_owned())?;
+        info!("subtitle checkpoint belongs to a different source; restarting from the first cue");
+    }
+    write_subtitle_source_marker(checkpoint_path, fingerprint, source_key).await
+}
+
 async fn translate_subtitle_cached(
     state: &AppState,
     media: &Media,
@@ -2265,7 +2507,7 @@ async fn translate_subtitle_cached(
     second: &str,
 ) -> Result<String, String> {
     translate_subtitle_cached_cancellable(
-        state, media, contents, source, extension, first, second, None,
+        state, media, contents, source, extension, first, second, None, None,
     )
     .await
 }
@@ -2279,6 +2521,7 @@ async fn translate_subtitle_cached_cancellable(
     first: &str,
     second: &str,
     cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
+    source_key: Option<&str>,
 ) -> Result<String, String> {
     translate_subtitle_cached_with_progress(
         state,
@@ -2290,6 +2533,7 @@ async fn translate_subtitle_cached_cancellable(
         second,
         cancellation,
         None,
+        source_key,
     )
     .await
 }
@@ -2304,25 +2548,42 @@ async fn translate_subtitle_cached_with_progress(
     second: &str,
     cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
     progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    source_key: Option<&str>,
 ) -> Result<String, String> {
     let output_extension = match extension.to_ascii_lowercase().as_str() {
         "srt" | "vtt" | "ass" => extension.to_ascii_lowercase(),
         _ => return Err("This subtitle format cannot be translated".to_owned()),
     };
     let sidecar_path = bilingual_subtitle_path(media, first, second, &output_extension);
-    let sidecar_part_path = bilingual_subtitle_path(media, first, second, "vtt");
-    let sidecar_part_path = PathBuf::from(format!("{}.part", sidecar_part_path.to_string_lossy()));
-    if let Ok(contents) = tokio::fs::read_to_string(&sidecar_path).await {
-        cleanup_translation_checkpoint(&sidecar_part_path).await;
-        let vtt = subtitle_to_vtt(&contents, &output_extension);
-        send_vtt_progress(progress.as_ref(), &vtt)?;
-        return Ok(vtt);
+    if tokio::fs::metadata(&sidecar_path).await.is_ok()
+        && tokio::fs::metadata(subtitle_source_marker_path(&sidecar_path))
+            .await
+            .is_err()
+    {
+        if let Ok(contents) = tokio::fs::read_to_string(&sidecar_path).await {
+            if let Ok(vtt) = subtitles::parse_subtitles(&subtitle_to_vtt(&contents, &output_extension)) {
+                if !vtt.is_empty() {
+                    return Ok(subtitle_to_vtt(&contents, &output_extension));
+                }
+            }
+        }
     }
     let translation_input = match extension {
         "srt" | "vtt" => contents.to_owned(),
         "ass" => ass_to_vtt(contents),
         _ => return Err("This subtitle format cannot be translated".to_owned()),
     };
+    let sidecar_part_path = bilingual_subtitle_path(media, first, second, "vtt");
+    let sidecar_part_path = PathBuf::from(format!("{}.part", sidecar_part_path.to_string_lossy()));
+    let fingerprint = subtitle_translation_fingerprint(
+        media,
+        &translation_input,
+        source,
+        "vtt",
+        first,
+        second,
+        source_key,
+    )?;
     let mut hash = Sha256::new();
     hash.update(&media.id);
     hash.update(contents);
@@ -2342,10 +2603,14 @@ async fn translate_subtitle_cached_with_progress(
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone();
     let _cache_guard = cache_lock.lock().await;
-    if let Ok(contents) = tokio::fs::read_to_string(&sidecar_path).await {
-        let vtt = subtitle_to_vtt(&contents, &output_extension);
-        send_vtt_progress(progress.as_ref(), &vtt)?;
-        return Ok(vtt);
+    if subtitle_source_marker_matches(&sidecar_path, &fingerprint, source_key).await {
+        if let Ok(contents) = tokio::fs::read_to_string(&sidecar_path).await {
+            write_subtitle_source_marker(&sidecar_path, &fingerprint, source_key).await?;
+            cleanup_translation_checkpoint(&sidecar_part_path).await;
+            let vtt = subtitle_to_vtt(&contents, &output_extension);
+            send_vtt_progress(progress.as_ref(), &vtt)?;
+            return Ok(vtt);
+        }
     }
     let legacy_cache_path = state
         .subtitle_checkpoints_dir
@@ -2358,6 +2623,7 @@ async fn translate_subtitle_cached_with_progress(
             &output_extension,
         )
         .await?;
+        write_subtitle_source_marker(&sidecar_path, &fingerprint, source_key).await?;
         send_vtt_progress(progress.as_ref(), &cached)?;
         return Ok(cached);
     }
@@ -2384,6 +2650,13 @@ async fn translate_subtitle_cached_with_progress(
             }
         }
     }
+    prepare_translation_checkpoint(
+        &sidecar_part_path,
+        &translation_input,
+        &fingerprint,
+        source_key,
+    )
+    .await?;
     let translated = if cancellation.is_some() || progress.is_some() {
         subtitles::translate_bilingual_resumable_cancellable(
             &client,
@@ -2420,6 +2693,7 @@ async fn translate_subtitle_cached_with_progress(
         &output_extension,
     )
     .await?;
+    write_subtitle_source_marker(&sidecar_path, &fingerprint, source_key).await?;
     Ok(vtt)
 }
 
@@ -2455,9 +2729,11 @@ async fn finalize_bilingual_translation(
 }
 
 async fn cleanup_translation_checkpoint(path: &std::path::Path) {
-    if let Err(error) = tokio::fs::remove_file(path).await {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            warn!(path = %path.display(), error = %error, "could not remove completed subtitle checkpoint");
+    for artifact in [path.to_path_buf(), subtitle_source_marker_path(path)] {
+        if let Err(error) = tokio::fs::remove_file(&artifact).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!(path = %artifact.display(), error = %error, "could not remove completed subtitle checkpoint metadata");
+            }
         }
     }
 }
@@ -2490,16 +2766,41 @@ async fn translated_subtitle_preview(
     source_format: &str,
     first: &str,
     second: &str,
+    source_key: Option<&str>,
 ) -> String {
     let extension = source_format.to_ascii_lowercase();
     let final_path = bilingual_subtitle_path(media, first, second, &extension);
-    if let Ok(contents) = tokio::fs::read_to_string(&final_path).await {
-        return subtitle_to_vtt(&contents, &extension);
+    let Ok(fingerprint) = subtitle_translation_fingerprint(
+        media,
+        source_contents,
+        source_language,
+        &extension,
+        first,
+        second,
+        source_key,
+    ) else {
+        return "WEBVTT\n\n".to_owned();
+    };
+    let final_matches = subtitle_source_marker_matches(&final_path, &fingerprint, source_key).await;
+    if final_matches {
+        if let Ok(contents) = tokio::fs::read_to_string(&final_path).await {
+            let _ = write_subtitle_source_marker(&final_path, &fingerprint, source_key).await;
+            return subtitle_to_vtt(&contents, &extension);
+        }
     }
 
     let checkpoint_path = bilingual_subtitle_path(media, first, second, "vtt");
     let checkpoint_path = PathBuf::from(format!("{}.part", checkpoint_path.to_string_lossy()));
-    let job_key = final_path.to_string_lossy().into_owned();
+    let source_input = match extension.as_str() {
+        "ass" => ass_to_vtt(source_contents),
+        _ => subtitle_to_vtt(source_contents, &extension),
+    };
+    let marker_matches = subtitle_source_marker_matches(&checkpoint_path, &fingerprint, source_key).await;
+    let legacy_matches = !marker_matches
+        && tokio::fs::metadata(subtitle_source_marker_path(&checkpoint_path)).await.is_err()
+        && subtitles::staged_vtt_matches_source(&checkpoint_path, &source_input).await;
+    let allow_checkpoint = marker_matches || legacy_matches;
+    let job_key = format!("{}:{fingerprint}", final_path.to_string_lossy());
     let state = state.clone();
     let media = media.clone();
     let source_contents = source_contents.to_owned();
@@ -2507,6 +2808,7 @@ async fn translated_subtitle_preview(
     let source_format = source_format.to_owned();
     let first = first.to_owned();
     let second = second.to_owned();
+    let source_key = source_key.map(str::to_owned);
     let media_id = media.id.clone();
     staged_subtitle_preview(
         &final_path,
@@ -2514,6 +2816,8 @@ async fn translated_subtitle_preview(
         &media_id,
         job_key,
         false,
+        final_matches,
+        allow_checkpoint,
         move |cancellation| async move {
             if let Err(error) = translate_subtitle_cached_cancellable(
                 &state,
@@ -2524,6 +2828,7 @@ async fn translated_subtitle_preview(
                 &first,
                 &second,
                 Some(cancellation),
+                source_key.as_deref(),
             )
             .await
             {
@@ -2562,6 +2867,7 @@ async fn translated_subtitle_stream_response(
         source_format,
         first,
         second,
+        None,
     )
     .await;
     let body = if output_srt { vtt_to_srt(&vtt) } else { vtt };
@@ -2574,6 +2880,8 @@ async fn staged_subtitle_preview<F, Fut>(
     media_id: &str,
     job_key: String,
     explicit: bool,
+    allow_final: bool,
+    allow_checkpoint: bool,
     background_job: F,
 ) -> String
 where
@@ -2587,16 +2895,22 @@ where
         });
     }
 
-    if let Ok(contents) = tokio::fs::read_to_string(final_path).await {
+    if allow_final {
+        if let Ok(contents) = tokio::fs::read_to_string(final_path).await {
         let extension = final_path
             .extension()
             .and_then(|extension| extension.to_str())
             .unwrap_or("srt");
         return subtitle_to_vtt(&contents, extension);
+        }
     }
-    let mut preview = tokio::fs::read_to_string(checkpoint_path)
-        .await
-        .unwrap_or_else(|_| "WEBVTT\n\n".to_owned());
+    let mut preview = if allow_checkpoint {
+        tokio::fs::read_to_string(checkpoint_path)
+            .await
+            .unwrap_or_else(|_| "WEBVTT\n\n".to_owned())
+    } else {
+        "WEBVTT\n\n".to_owned()
+    };
     for _ in 0..30 {
         if subtitles::parse_subtitles(&preview).is_ok() {
             break;
@@ -2930,10 +3244,11 @@ async fn start_plex_auth(State(state): State<AppState>, headers: HeaderMap) -> R
         .unwrap_or("http");
     let callback = format!("{proto}://{host}/settings/plex/callback");
     let link = format!(
-        "https://app.plex.tv/auth#?clientID={}&code={}&context%5Bdevice%5D%5Bproduct%5D={}&context%5Bdevice%5D%5Bversion%5D=0.1.0&context%5Bdevice%5D%5Bplatform%5D=macOS&context%5Bdevice%5D%5BdeviceName%5D={}&forwardUrl={}",
+        "https://app.plex.tv/auth#?clientID={}&code={}&context%5Bdevice%5D%5Bproduct%5D={}&context%5Bdevice%5D%5Bversion%5D={}&context%5Bdevice%5D%5Bplatform%5D=macOS&context%5Bdevice%5D%5BdeviceName%5D={}&forwardUrl={}",
         url_encode(&auth_client_identifier),
         url_encode(&pin.code),
         url_encode(&configured_server_name),
+        env!("CARGO_PKG_VERSION"),
         url_encode(&configured_server_name),
         url_encode(&callback)
     );
@@ -8659,6 +8974,9 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     .subtitle-translation label {{ display: grid; gap: .2rem; color: #cbd5e1; font-size: .75rem; }}
     .subtitle-translation select, .subtitle-translation button {{ padding: .4rem .55rem; border: 1px solid #4b5563; border-radius: .35rem; color: #fff; background: #111827; }}
     .translation-status {{ flex-basis: 100%; min-height: 1.2rem; color: #9ca3af; font-size: .8rem; }}
+    .translation-source-label {{ flex-basis: 100%; color: #9ca3af; font-size: .75rem; }}
+    .translation-progress {{ flex-basis: 100%; width: 100%; height: .65rem; accent-color: #22c55e; }}
+    .translation-progress-label {{ flex-basis: 100%; color: #9ca3af; font-size: .75rem; }}
     .breadcrumb {{ display: flex; flex-wrap: wrap; align-items: center; gap: .35rem; box-sizing: border-box; color: #9ca3af; }}
     .breadcrumb a {{ padding: .35rem .55rem; border-radius: .35rem; text-decoration: none; }}
     .breadcrumb a:hover {{ background: #24344d; }}
@@ -8783,6 +9101,9 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
       }}
       const path = video.dataset.progressPath;
       const subtitleSelect = video.closest("article")?.querySelector(".subtitle-select");
+      let activeStreamingSourceKey = null;
+      let activeStreamingSourceName = null;
+      let updateTranslationSourceLabel = () => {{}};
       const applySubtitle = selected => {{
         [...video.textTracks].forEach((track, index) => {{
           track.mode = index === selected ? "showing" : "disabled";
@@ -8846,7 +9167,26 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
         let translatedOption = null;
         let translatedCueKeys = new Set();
         let translationPollTimer = null;
+        let generationProgressTimer = null;
+        let generationProgressPending = false;
         let latestTranslationRequest = null;
+        const sourceLabel = translationControls.querySelector(".translation-source-label");
+        updateTranslationSourceLabel = () => {{
+          const option = subtitleSelect?.selectedOptions[0];
+          const selectedName = option?.textContent.trim() || "No subtitle selected";
+          const selectedKey = option?.dataset.browserTrack !== undefined
+            ? `embedded:${{option.dataset.browserTrack}}`
+            : `stream:${{Number(option?.dataset.streamId || 0)}}`;
+          if (activeStreamingSourceKey && activeStreamingSourceKey !== selectedKey) {{
+            sourceLabel.textContent = `Selected: ${{selectedName}} · current translation still uses ${{activeStreamingSourceName}}`;
+          }} else if (activeStreamingSourceKey) {{
+            sourceLabel.textContent = `Live translation source: ${{activeStreamingSourceName}}`;
+          }} else {{
+            sourceLabel.textContent = `Selected translation source: ${{selectedName}}`;
+          }}
+        }};
+        subtitleSelect?.addEventListener("change", updateTranslationSourceLabel);
+        updateTranslationSourceLabel();
         const addTranslatedCues = (contents, track) => {{
           if (!track?.track) return;
           for (const block of contents.split(/\n\s*\n/)) {{
@@ -8872,6 +9212,8 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
         }};
         const translate = async prepared => {{
           const status = translationControls.querySelector(".translation-status");
+          const generationProgress = translationControls.querySelector(".translation-progress");
+          const generationProgressLabel = translationControls.querySelector(".translation-progress-label");
           const selectedOption = subtitleSelect?.selectedOptions[0];
           if (selectedOption?.dataset.bilingual === "true") {{
             status.textContent = "This subtitle is already bilingual.";
@@ -8879,6 +9221,8 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
           }}
           const sourceId = Number(selectedOption?.dataset.streamId || 0);
           const browserTrackIndex = selectedOption?.dataset.browserTrack;
+          const sourceKey = browserTrackIndex !== undefined ? `embedded:${{browserTrackIndex}}` : `stream:${{sourceId}}`;
+          const selectedSourceName = selectedOption?.textContent.trim() || "selected subtitle";
           let browserCues = [];
           let sourceLanguage = "und";
           if (browserTrackIndex !== undefined) {{
@@ -8887,13 +9231,48 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             sourceLanguage = embeddedTrack.language || "und";
             browserCues = [...embeddedTrack.cues].map(cue => ({{ start_ms: cue.startTime * 1000, end_ms: cue.endTime * 1000, text: cue.text }}));
           }} else if (!sourceId) {{ status.textContent = "Select a text subtitle track first."; return; }}
-          status.textContent = prepared ? "Preparing bilingual subtitles…" : "Translating subtitles…";
+          if (activeStreamingSourceKey && (prepared || activeStreamingSourceKey !== sourceKey)) {{
+            await fetch("/web/translation-stop", {{ method: "POST", headers: {{ "content-type": "application/json" }},
+              body: JSON.stringify({{ path, library: subtitleSelect.dataset.library ? Number(subtitleSelect.dataset.library) : null }}) }}).catch(() => {{}});
+            activeStreamingSourceKey = null;
+            activeStreamingSourceName = null;
+          }}
+          if (!prepared) {{
+            activeStreamingSourceKey = sourceKey;
+            activeStreamingSourceName = selectedSourceName;
+          }} else if (subtitleSelect) {{
+            subtitleSelect.disabled = true;
+          }}
+          updateTranslationSourceLabel();
+          status.textContent = prepared ? `Generating from ${{selectedSourceName}}…` : `Translating from ${{selectedSourceName}}…`;
           translationControls.querySelectorAll("button").forEach(button => button.disabled = true);
           try {{
             latestTranslationRequest = {{ path, library: subtitleSelect.dataset.library ? Number(subtitleSelect.dataset.library) : null,
                 stream_id: sourceId, first_language: translationControls.querySelector(".translation-first").value,
                 second_language: translationControls.querySelector(".translation-second").value,
-                source_language: sourceLanguage, source_cues: browserCues, prepared }};
+                source_language: sourceLanguage, source_cues: browserCues, source_key: sourceKey, prepared }};
+            if (prepared) {{
+              generationProgress.hidden = false;
+              generationProgress.value = 0;
+              generationProgressLabel.textContent = "Starting bilingual subtitle generation…";
+              const progressRequest = {{ path, library: latestTranslationRequest.library, stream_id: sourceId,
+                first_language: latestTranslationRequest.first_language, second_language: latestTranslationRequest.second_language,
+                source_key: sourceKey, total_cues: browserCues.length || null }};
+              const refreshProgress = async () => {{
+                if (generationProgressPending) return;
+                generationProgressPending = true;
+                try {{
+                  const progressResponse = await fetch("/web/translation-progress", {{ method: "POST", headers: {{ "content-type": "application/json" }},
+                    body: JSON.stringify(progressRequest), cache: "no-store" }});
+                  if (!progressResponse.ok) return;
+                  const progress = await progressResponse.json();
+                  generationProgress.value = progress.percent;
+                  generationProgressLabel.textContent = `${{progress.completed}} / ${{progress.total}} cues (${{progress.percent}}%)`;
+                }} catch (_) {{}} finally {{ generationProgressPending = false; }}
+              }};
+              refreshProgress();
+              generationProgressTimer = setInterval(refreshProgress, 750);
+            }}
             const response = await fetch("/web/translated-subtitle", {{ method: "POST", headers: {{ "content-type": "application/json" }},
               body: JSON.stringify(latestTranslationRequest) }});
             if (!response.ok) throw new Error(await response.text());
@@ -8931,9 +9310,18 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                 }}, 2500);
               }}
             }}, {{ once: true }});
-            status.textContent = prepared ? "Bilingual subtitle prepared and cached." : "Bilingual subtitles ready.";
-          }} catch (error) {{ status.textContent = `Translation unavailable: ${{error.message || "request failed"}}`; }}
-          finally {{ translationControls.querySelectorAll("button").forEach(button => button.disabled = false); }}
+            status.textContent = prepared ? "Bilingual subtitle generated and saved as SRT." : "Bilingual subtitles ready.";
+            if (prepared) {{ generationProgress.value = 100; generationProgressLabel.textContent = "Complete · saved as .srt"; }}
+          }} catch (error) {{
+            status.textContent = `Translation unavailable: ${{error.message || "request failed"}}`;
+            if (prepared) generationProgressLabel.textContent = "Generation stopped; completed cues remain staged for resume.";
+          }} finally {{
+            if (generationProgressTimer) clearInterval(generationProgressTimer);
+            generationProgressTimer = null;
+            generationProgressPending = false;
+            if (prepared && subtitleSelect) subtitleSelect.disabled = false;
+            translationControls.querySelectorAll("button").forEach(button => button.disabled = false);
+          }}
         }};
         translationControls.querySelector(".translate-live").addEventListener("click", () => translate(false));
         translationControls.querySelector(".translate-prepare").addEventListener("click", () => translate(true));
@@ -9005,9 +9393,11 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
       const cancelStreamingTranslation = () => fetch("/web/translation-stop", {{
         method: "POST", headers: {{ "content-type": "application/json" }}, body: translationStopRequest
       }}).catch(() => {{}});
-      video.addEventListener("ended", () => {{ save(true); if (translationPollTimer) clearInterval(translationPollTimer); cancelStreamingTranslation(); }});
+      video.addEventListener("ended", () => {{ save(true); if (translationPollTimer) clearInterval(translationPollTimer); activeStreamingSourceKey = null; activeStreamingSourceName = null; updateTranslationSourceLabel(); cancelStreamingTranslation(); }});
       window.addEventListener("pagehide", () => {{
         if (translationPollTimer) clearInterval(translationPollTimer);
+        activeStreamingSourceKey = null;
+        activeStreamingSourceName = null;
         if (video.currentTime > 0 && navigator.sendBeacon) {{
           navigator.sendBeacon("/web/translation-stop", new Blob([
             translationStopRequest
@@ -10550,7 +10940,7 @@ fn web_client_item(
     };
     let translation_controls = if bilingual_enabled {
         format!(
-            r#"<div class="subtitle-translation"><label>First language <select class="translation-first">{}</select></label><label>Second language <select class="translation-second">{}</select></label><button type="button" class="translate-live">Translate while playing</button><button type="button" class="translate-prepare">Translate full episode</button><span class="translation-status" role="status" aria-live="polite"></span></div>"#,
+            r#"<div class="subtitle-translation"><label>First language <select class="translation-first">{}</select></label><label>Second language <select class="translation-second">{}</select></label><button type="button" class="translate-live">Translate while playing</button><button type="button" class="translate-prepare">Generate bilingual subtitle</button><span class="translation-source-label" role="status" aria-live="polite"></span><progress class="translation-progress" max="100" value="0" hidden aria-label="Bilingual subtitle generation progress"></progress><span class="translation-progress-label" role="status" aria-live="polite"></span><span class="translation-status" role="status" aria-live="polite"></span></div>"#,
             translation_language_options(language_primary),
             translation_language_options(language_secondary)
         )
