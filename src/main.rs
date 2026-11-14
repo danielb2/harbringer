@@ -16,6 +16,10 @@ use axum::{
     routing::{any, delete, get, post, put},
     Json, Router,
 };
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::Parser;
 use ed25519_dalek::{Signer, SigningKey};
@@ -763,6 +767,10 @@ fn restart_process() -> Result<(), Box<dyn std::error::Error>> {
 fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/", get(root_handler))
+        .route("/auth", get(auth_page))
+        .route("/auth/setup", post(auth_setup))
+        .route("/auth/login", post(auth_login))
+        .route("/auth/logout", post(auth_logout))
         .route("/web/stream", any(web_stream))
         .route("/web/progress", get(web_progress).post(update_web_progress))
         .route("/web/translation-stop", post(stop_web_translation))
@@ -926,6 +934,7 @@ fn build_app(state: AppState) -> Router {
         .route("/media/:id", any(stream_media))
         .fallback(log_not_found)
         .layer(middleware::from_fn(plex_cors))
+        .layer(middleware::from_fn_with_state(state.clone(), web_auth_gate))
         .layer(
             TraceLayer::new_for_http()
                 .on_request(|request: &Request<Body>, _span: &Span| {
@@ -1720,6 +1729,14 @@ fn open_database(
              id TEXT PRIMARY KEY,
              plex_user_id TEXT UNIQUE,
              name TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS web_admin (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             password_hash TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS web_sessions (
+             token_hash TEXT PRIMARY KEY,
+             expires_at INTEGER NOT NULL
          );
          CREATE TABLE IF NOT EXISTS media (
              media_key TEXT PRIMARY KEY,
@@ -8064,8 +8081,8 @@ async fn home_client(State(state): State<AppState>) -> Response {
         recent = "<p class=\"note empty-state\">No recently added media yet.</p>".to_owned();
     }
     Html(format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>harbringer</title><style>body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }} .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }} .sidebar-top {{ display: flex; justify-content: space-between; align-items: center; }} .sidebar-toggle {{ background: none; border: 0; color: #cbd5e1; font-size: 1.3rem; cursor: pointer; }} .sidebar-label {{ padding: 1rem .7rem .4rem; color: #6b7280; font-size: .7rem; text-transform: uppercase; }} .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }} .sidebar-link.active, .sidebar-link:hover {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; }} main {{ max-width: 1100px; width: 100%; box-sizing: border-box; margin: auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; text-decoration: none; }} h1 {{ margin-top: 0; }} .section {{ margin: 2rem 0; }} .library-grid, .recent-grid, .continue-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax({}px, 1fr)); gap: 1rem; }} .library-card {{ display: flex; flex-direction: column; gap: .4rem; padding: 1rem; border: 1px solid #374151; border-radius: .7rem; background: #1f2937; }} .media-card {{ position: relative; min-width: 0; padding: .7rem; border: 1px solid transparent; border-radius: .6rem; background: #1f2937; transition: border-color .15s, transform .15s; }} .media-card:hover {{ border-color: #374151; transform: translateY(-2px); }} .media-card-artwork {{ position: relative; }} .media-card-poster, .media-card-poster img {{ display: block; width: 100%; aspect-ratio: 2 / 3; }} .media-card-poster img {{ object-fit: cover; border-radius: .35rem; background: #111827; }} .media-card-info {{ display: grid; gap: .12rem; padding: .55rem 0 1.6rem; color: inherit; text-align: center; text-decoration: none; }} .media-card-title {{ display: block; height: 2.4em; overflow: hidden; margin: .25rem 0 .15rem; font-size: .8rem; font-weight: 500; line-height: 1.2; }} .media-card-tv .media-card-title {{ height: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }} .media-card-subtitle, .media-card-details {{ overflow: hidden; color: #9ca3af; font-size: .75rem; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }} .media-card-progress-row {{ display: flex; align-items: center; gap: .45rem; margin: .3rem 0 .4rem; }} .media-card-progress {{ flex: 1 1 auto; min-width: 0; height: .3rem; border-radius: 999px; background: #374151; overflow: hidden; }} .media-card-progress span {{ display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #2563eb, #22c55e); }} .media-card-percent {{ flex: 0 0 auto; color: #93c5fd; font-size: .68rem; line-height: 1; }} .media-card-menu {{ position: absolute; right: .45rem; bottom: .45rem; z-index: 4; }} .media-card-menu summary {{ display: grid; width: 1.65rem; height: 1.65rem; place-items: center; border: 1px solid rgba(255,255,255,.25); border-radius: 50%; color: #f9fafb; background: rgba(17,24,39,.58); backdrop-filter: blur(3px); font-size: 1rem; font-weight: 800; line-height: 1; list-style: none; cursor: pointer; }} .media-card-menu summary::-webkit-details-marker {{ display: none; }} .media-card-menu-items {{ position: absolute; right: 0; bottom: calc(100% + .35rem); display: grid; min-width: 12.5rem; gap: .2rem; padding: .35rem; border: 1px solid #374151; border-radius: .5rem; background: #111827; box-shadow: 0 8px 24px #0008; }} .media-card-menu-items button {{ padding: .55rem .65rem; border: 0; border-radius: .3rem; color: #e5e7eb; background: transparent; font: inherit; font-size: .78rem; text-align: left; cursor: pointer; }} .media-card-menu-items button:hover {{ background: #263244; }} .library-icon {{ font-size: 2rem; }} .note {{ color: #9ca3af; }} .empty-state {{ padding: 1.5rem; border: 1px dashed #4b5563; border-radius: .7rem; }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; width: 100%; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} .sidebar-label {{ display: none; }} .sidebar-toggle {{ display: none; }} }}</style></head><body><div class="app-shell">{}<main><h1>Home</h1><section class="section"><h2>Continue watching</h2><div class="continue-grid">{}</div></section><section class="section"><h2>Recently added</h2><div class="recent-grid">{}</div></section><section class="section"><h2>Your libraries</h2><div class="library-grid">{}</div></section></main></div>{}{}<script>const shell=document.querySelector('.app-shell'), toggle=document.querySelector('.sidebar-toggle'); if(localStorage.getItem('mplex-sidebar-collapsed')==='true') shell.classList.add('sidebar-collapsed'); toggle?.addEventListener('click',()=>{{shell.classList.toggle('sidebar-collapsed');localStorage.setItem('mplex-sidebar-collapsed',shell.classList.contains('sidebar-collapsed')?'true':'false')}});</script></body></html>"#,
-        POSTER_CARD_MIN_WIDTH, sidebar_nav_for(&state, std::path::Path::new(""), None), continue_watching, recent, libraries, media_card_action_script(), spa_navigation_script()
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>harbringer</title><style>body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }} .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }} .sidebar-top {{ display: flex; justify-content: space-between; align-items: center; }} .sidebar-toggle {{ background: none; border: 0; color: #cbd5e1; font-size: 1.3rem; cursor: pointer; }} .sidebar-label {{ padding: 1rem .7rem .4rem; color: #6b7280; font-size: .7rem; text-transform: uppercase; }} .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }} .sidebar-link.active, .sidebar-link:hover {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; }} main {{ max-width: 1100px; width: 100%; box-sizing: border-box; margin: auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; text-decoration: none; }} h1 {{ margin-top: 0; }} .section {{ margin: 2rem 0; }} .library-grid, .recent-grid, .continue-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax({}px, 1fr)); gap: 1rem; }} .library-card {{ display: flex; flex-direction: column; gap: .4rem; padding: 1rem; border: 1px solid #374151; border-radius: .7rem; background: #1f2937; }} .media-card {{ position: relative; min-width: 0; padding: .7rem; border: 1px solid transparent; border-radius: .6rem; background: #1f2937; transition: border-color .15s, transform .15s; }} .media-card:hover {{ border-color: #374151; transform: translateY(-2px); }} .media-card-artwork {{ position: relative; }} .media-card-poster, .media-card-poster img {{ display: block; width: 100%; aspect-ratio: 2 / 3; }} .media-card-poster img {{ object-fit: cover; border-radius: .35rem; background: #111827; }} .media-card-info {{ display: grid; gap: .12rem; padding: .55rem 0 1.6rem; color: inherit; text-align: center; text-decoration: none; }} .media-card-title {{ display: block; height: 2.4em; overflow: hidden; margin: .25rem 0 .15rem; font-size: .8rem; font-weight: 500; line-height: 1.2; }} .media-card-tv .media-card-title {{ height: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }} .media-card-subtitle, .media-card-details {{ overflow: hidden; color: #9ca3af; font-size: .75rem; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }} .media-card-progress-row {{ display: flex; align-items: center; gap: .45rem; margin: .3rem 0 .4rem; }} .media-card-progress {{ flex: 1 1 auto; min-width: 0; height: .3rem; border-radius: 999px; background: #374151; overflow: hidden; }} .media-card-progress span {{ display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #2563eb, #22c55e); }} .media-card-percent {{ flex: 0 0 auto; color: #93c5fd; font-size: .68rem; line-height: 1; }} .media-card-menu {{ position: absolute; right: .45rem; bottom: .45rem; z-index: 4; }} .media-card-menu summary {{ display: grid; width: 1.65rem; height: 1.65rem; place-items: center; border: 1px solid rgba(255,255,255,.25); border-radius: 50%; color: #f9fafb; background: rgba(17,24,39,.58); backdrop-filter: blur(3px); font-size: 1rem; font-weight: 800; line-height: 1; list-style: none; cursor: pointer; }} .media-card-menu summary::-webkit-details-marker {{ display: none; }} .media-card-menu-items {{ position: absolute; right: 0; bottom: calc(100% + .35rem); display: grid; min-width: 12.5rem; gap: .2rem; padding: .35rem; border: 1px solid #374151; border-radius: .5rem; background: #111827; box-shadow: 0 8px 24px #0008; }} .media-card-menu-items button {{ padding: .55rem .65rem; border: 0; border-radius: .3rem; color: #e5e7eb; background: transparent; font: inherit; font-size: .78rem; text-align: left; cursor: pointer; }} .media-card-menu-items button:hover {{ background: #263244; }} .library-icon {{ font-size: 2rem; }} .note {{ color: #9ca3af; }} .empty-state {{ padding: 1.5rem; border: 1px dashed #4b5563; border-radius: .7rem; }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; width: 100%; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} .sidebar-label {{ display: none; }} .sidebar-toggle {{ display: none; }} }}</style></head><body><div class="app-shell">{}<main><h1>Home</h1><section class="section"><h2>Continue watching</h2><div class="continue-grid">{}</div></section><section class="section"><h2>Recently added</h2><div class="recent-grid">{}</div></section><section class="section"><h2>Your libraries</h2><div class="library-grid">{}</div></section></main></div>{}{}{}<script>const shell=document.querySelector('.app-shell'), toggle=document.querySelector('.sidebar-toggle'); if(localStorage.getItem('mplex-sidebar-collapsed')==='true') shell.classList.add('sidebar-collapsed'); toggle?.addEventListener('click',()=>{{shell.classList.toggle('sidebar-collapsed');localStorage.setItem('mplex-sidebar-collapsed',shell.classList.contains('sidebar-collapsed')?'true':'false')}});</script></body></html>"#,
+        POSTER_CARD_MIN_WIDTH, sidebar_nav_for(&state, std::path::Path::new(""), None), continue_watching, recent, libraries, fix_match_dialog_markup(), media_card_action_script(), spa_navigation_script()
     )).into_response()
 }
 
@@ -8949,20 +8966,6 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     .info-button {{ background: #374151; }}
     dialog {{ position: relative; max-width: min(760px, calc(100vw - 2rem)); width: 100%; color: #f9fafb; border: 1px solid #4b5563; border-radius: .75rem; background: #111827; }} dialog::backdrop {{ background: rgba(0,0,0,.7); }} dialog form {{ position: absolute; top: .75rem; right: .75rem; margin: 0; }} dialog form button {{ padding: .35rem .6rem; }} .info-grid {{ display: grid; gap: .45rem; max-height: 65vh; overflow: auto; }} .info-row {{ display: grid; grid-template-columns: minmax(140px, .4fr) 1fr; gap: .8rem; padding: .45rem 0; border-bottom: 1px solid #263244; }} .info-key {{ color: #9ca3af; }} .info-value {{ overflow-wrap: anywhere; }}
     .theatre-button {{ background: #4b5563; }}
-    #tv-fix-match-dialog {{ max-height: calc(100vh - 2rem); padding: 1.25rem; overflow: auto; }}
-    #tv-fix-match-dialog h2 {{ padding-right: 2.5rem; }}
-    .fix-match-close {{ position: absolute; top: .65rem; right: .65rem; min-width: 2.4rem; padding: .3rem .55rem; }}
-    .fix-match-search-row {{ display: flex; flex-wrap: wrap; gap: .5rem; margin: .9rem 0; }}
-    .fix-match-search-row input {{ flex: 1 1 16rem; min-width: 0; padding: .6rem .7rem; border: 1px solid #4b5563; border-radius: .4rem; color: #fff; background: #0b1220; font: inherit; }}
-    .fix-match-results {{ display: grid; gap: .65rem; }}
-    .fix-match-result {{ display: flex; align-items: flex-start; gap: .9rem; padding: .75rem; border: 1px solid #374151; border-radius: .5rem; background: #1f2937; }}
-    .fix-match-poster {{ flex: 0 0 76px; width: 76px; height: 114px; object-fit: cover; border-radius: .3rem; background: #111827; }}
-    .fix-match-result-content {{ min-width: 0; }}
-    .fix-match-result h3 {{ margin: 0; }}
-    @media (max-width: 420px) {{ .fix-match-poster {{ flex-basis: 60px; width: 60px; height: 90px; }} .fix-match-result {{ gap: .6rem; }} }}
-    .fix-match-result p {{ margin: .35rem 0 .65rem; color: #cbd5e1; font-size: .85rem; line-height: 1.45; }}
-    .fix-match-status {{ min-height: 1.5rem; color: #cbd5e1; }}
-
     body.theatre-mode main {{ max-width: none; padding: 0; }}
     body.theatre-mode .library {{ display: block; }}
     body.theatre-mode article:not(.theatre-card), body.theatre-mode .breadcrumb, body.theatre-mode .folder-card {{ display: none; }}
@@ -9020,7 +9023,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     {}
     <section class="library">{}</section>
     <dialog id="info-modal"><form method="dialog"><button type="submit" aria-label="Close dialog" title="Close">×</button></form><h2>Technical media information</h2><div id="info-content" class="info-grid">Loading…</div></dialog>
-    <dialog id="tv-fix-match-dialog" aria-labelledby="tv-fix-match-heading"><button class="fix-match-close" type="button" aria-label="Close Fix Match dialog" title="Close">×</button><h2 id="tv-fix-match-heading">Fix TV Show Match</h2><p id="tv-fix-match-show" class="note"></p><div class="fix-match-search-row"><input id="tv-fix-match-query" type="search" aria-label="Search TV shows" autocomplete="off"><button id="tv-fix-match-search" type="button">Search</button></div><p id="tv-fix-match-status" class="fix-match-status" role="status" aria-live="polite"></p><div id="tv-fix-match-results" class="fix-match-results"></div></dialog>
+    {}
     </main>
   </div>
   <script>
@@ -9447,7 +9450,10 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
       refreshing = true;
       try {{
         const response = await fetch(window.location.href, {{ cache: "no-store" }});
-        if (!response.ok) return;
+        if (!response.ok) {{
+          window.__mplexShowConnectionLost?.(`Connection to Harbringer failed (HTTP ${{response.status}}). Reload the page to reconnect.`);
+          return;
+        }}
         const document = new DOMParser().parseFromString(await response.text(), "text/html");
         const current = window.document.querySelector(".library");
         const next = document.querySelector(".library");
@@ -9457,6 +9463,8 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
           current.replaceWith(next);
           window.__mplexSelectedVideo = null;
         }}
+      }} catch (_) {{
+        window.__mplexShowConnectionLost?.("Lost connection to Harbringer. Check that the server is running, then reload the page.");
       }} finally {{
         refreshing = false;
       }}
@@ -9473,6 +9481,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
         page_heading,
         info_panel,
         items,
+        fix_match_dialog_markup(),
         media_card_action_script(),
         spa_navigation_script()
         )),
@@ -11107,6 +11116,7 @@ fn sidebar_nav_with_library_links(
     {}
     <a class="sidebar-link {}" href="/settings"><span class="sidebar-icon">⚙</span>Settings</a>
   </nav>
+  <form method="post" action="/auth/logout" style="margin-top:1rem"><button type="submit" class="sidebar-link" style="width:100%;border:0;background:transparent;text-align:left;cursor:pointer"><span class="sidebar-icon">↪</span>Sign out</button></form>
 </aside>"#,
         if home_active && !settings_active {
             "active"
@@ -11419,11 +11429,35 @@ fn media_card_progress(metadata: &serde_json::Value) -> f64 {
     }
 }
 
+fn fix_match_dialog_markup() -> &'static str {
+    r#"<style>
+#tv-fix-match-dialog { position: fixed; inset: 0; width: min(760px, calc(100vw - 2rem)); max-height: calc(100vh - 2rem); margin: auto; padding: 1.25rem; overflow: auto; color: #f9fafb; border: 1px solid #4b5563; border-radius: .75rem; background: #111827; }
+#tv-fix-match-dialog::backdrop { background: rgba(0,0,0,.7); }
+#tv-fix-match-dialog h2 { padding-right: 2.5rem; }
+.fix-match-close { position: absolute; top: .65rem; right: .65rem; min-width: 2.4rem; padding: .3rem .55rem; }
+.fix-match-search-row { display: flex; flex-wrap: wrap; gap: .5rem; margin: .9rem 0; }
+.fix-match-search-row input { flex: 1 1 16rem; min-width: 0; padding: .6rem .7rem; border: 1px solid #4b5563; border-radius: .4rem; color: #fff; background: #0b1220; font: inherit; }
+.fix-match-results { display: grid; gap: .65rem; }
+.fix-match-result { display: flex; align-items: flex-start; gap: .9rem; padding: .75rem; border: 1px solid #374151; border-radius: .5rem; background: #1f2937; }
+.fix-match-poster { flex: 0 0 76px; width: 76px; height: 114px; object-fit: cover; border-radius: .3rem; background: #111827; }
+.fix-match-result-content { min-width: 0; }
+.fix-match-result h3 { margin: 0; }
+.fix-match-result p { margin: .35rem 0 .65rem; color: #cbd5e1; font-size: .85rem; line-height: 1.45; }
+.fix-match-status { min-height: 1.5rem; color: #cbd5e1; }
+@media (max-width: 420px) { .fix-match-poster { flex-basis: 60px; width: 60px; height: 90px; } .fix-match-result { gap: .6rem; } }
+</style><dialog id="tv-fix-match-dialog" aria-labelledby="tv-fix-match-heading"><button class="fix-match-close" type="button" aria-label="Close Fix Match dialog" title="Close">×</button><h2 id="tv-fix-match-heading">Fix TV Show Match</h2><p id="tv-fix-match-show" class="note"></p><div class="fix-match-search-row"><input id="tv-fix-match-query" type="search" aria-label="Search TV shows" autocomplete="off"><button id="tv-fix-match-search" type="button">Search</button></div><p id="tv-fix-match-status" class="fix-match-status" role="status" aria-live="polite"></p><div id="tv-fix-match-results" class="fix-match-results"></div></dialog>"#
+}
+
 fn media_card_action_script() -> &'static str {
     r##"<script>
-if (!window.__mplexCardActionsBound) {
-window.__mplexCardActionsBound = true;
-document.addEventListener("error", event => {
+window.__mplexCardActionsCleanup?.();
+const cardActionListeners = [];
+const bindCardAction = (element, type, handler, options) => {
+  if (!element) return;
+  element.addEventListener(type, handler, options);
+  cardActionListeners.push(() => element.removeEventListener(type, handler, options));
+};
+bindCardAction(document, "error", event => {
   const image = event.target;
   if (!(image instanceof HTMLImageElement) || !image.matches(".media-card-poster img")) return;
   const placeholder = document.createElement("div");
@@ -11439,13 +11473,42 @@ const fixMatchQuery = document.querySelector("#tv-fix-match-query");
 const fixMatchSearchButton = document.querySelector("#tv-fix-match-search");
 const fixMatchStatus = document.querySelector("#tv-fix-match-status");
 const fixMatchResults = document.querySelector("#tv-fix-match-results");
+let matchSearchPending = false;
+const stopLibraryRefresh = () => {
+  if (window.__mplexLibraryRefreshTimer) {
+    clearInterval(window.__mplexLibraryRefreshTimer);
+    window.__mplexLibraryRefreshTimer = null;
+  }
+};
+window.__mplexShowConnectionLost = message => {
+  stopLibraryRefresh();
+  let notice = document.querySelector("#mplex-connection-lost");
+  if (!notice) {
+    notice = document.createElement("div");
+    notice.id = "mplex-connection-lost";
+    notice.setAttribute("role", "alert");
+    notice.style.cssText = "position:fixed;top:1rem;left:50%;transform:translateX(-50%);z-index:9999;display:flex;align-items:center;gap:1rem;max-width:calc(100vw - 2rem);padding:.8rem 1rem;border:1px solid #ef4444;border-radius:.65rem;color:#fff;background:#7f1d1d;box-shadow:0 8px 24px #0008";
+    const text = document.createElement("span");
+    text.className = "connection-lost-message";
+    const reload = document.createElement("button");
+    reload.type = "button";
+    reload.textContent = "Reload page";
+    reload.style.cssText = "flex:0 0 auto;padding:.5rem .7rem;border:0;border-radius:.4rem;color:#111827;background:#fff;font:inherit;cursor:pointer";
+    reload.addEventListener("click", () => window.location.reload());
+    notice.append(text, reload);
+    document.body.append(notice);
+  }
+  notice.querySelector(".connection-lost-message").textContent = message;
+};
 const searchTvMatches = async () => {
+  if (matchSearchPending) return;
   fixMatchResults.replaceChildren();
   const query = fixMatchQuery.value.trim();
   if (!query) {
     fixMatchStatus.textContent = "Enter a show title to search.";
     return;
   }
+  matchSearchPending = true;
   fixMatchStatus.textContent = "Searching TMDB…";
   fixMatchSearchButton.disabled = true;
   try {
@@ -11455,8 +11518,12 @@ const searchTvMatches = async () => {
       query
     });
     const response = await fetch(`/web/tv-match/search?${params}`, { cache: "no-store" });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "TMDB search failed.");
+    const payload = await response.json().catch(() => ({}));
+    if (response.status === 404) {
+      window.__mplexShowConnectionLost("Harbringer could not find the match search endpoint (404). Reload the page to reconnect.");
+      throw new Error("Harbringer could not find the match search endpoint (404). Reload the page to reconnect.");
+    }
+    if (!response.ok) throw new Error(payload.error || `TMDB search failed (HTTP ${response.status}).`);
     if (!payload.results.length) {
       fixMatchStatus.textContent = "No matches found. Try another search.";
       return;
@@ -11486,19 +11553,26 @@ const searchTvMatches = async () => {
       fixMatchResults.append(item);
     });
   } catch (error) {
-    fixMatchStatus.textContent = error.message || "TMDB search failed.";
+    if (error instanceof TypeError) {
+      const message = "Lost connection to Harbringer. Check that the server is running, then click Search to retry.";
+      window.__mplexShowConnectionLost(message);
+      fixMatchStatus.textContent = message;
+    } else {
+      fixMatchStatus.textContent = error.message || "TMDB search failed.";
+    }
   } finally {
+    matchSearchPending = false;
     fixMatchSearchButton.disabled = false;
   }
 };
-fixMatchSearchButton.addEventListener("click", searchTvMatches);
-fixMatchQuery.addEventListener("keydown", event => {
+bindCardAction(fixMatchSearchButton, "click", searchTvMatches);
+bindCardAction(fixMatchQuery, "keydown", event => {
   if (event.key === "Enter") {
     event.preventDefault();
     searchTvMatches();
   }
 });
-fixMatchResults.addEventListener("click", async event => {
+bindCardAction(fixMatchResults, "click", async event => {
   const select = event.target.closest("[data-match-id]");
   if (!select || select.disabled) return;
   select.disabled = true;
@@ -11513,20 +11587,30 @@ fixMatchResults.addEventListener("click", async event => {
         tmdb_id: Number(select.dataset.matchId)
       })
     });
-    const payload = await response.json();
+    const payload = await response.json().catch(() => ({}));
+    if (response.status === 404) {
+      window.__mplexShowConnectionLost("Harbringer could not find the match save endpoint (404). Reload the page to reconnect.");
+      throw new Error("Harbringer could not find the match save endpoint (404). Reload the page to reconnect.");
+    }
     if (!response.ok) throw new Error(payload.error || "Could not save this match.");
     fixMatchDialog.close();
     window.location.reload();
   } catch (error) {
     select.disabled = false;
-    fixMatchStatus.textContent = error.message || "Could not save this match.";
+    if (error instanceof TypeError) {
+      const message = "Lost connection to Harbringer. Your match was not saved. Check that the server is running, then reload the page.";
+      window.__mplexShowConnectionLost(message);
+      fixMatchStatus.textContent = message;
+    } else {
+      fixMatchStatus.textContent = error.message || "Could not save this match.";
+    }
   }
 });
-document.querySelector(".fix-match-close")?.addEventListener("click", () => fixMatchDialog.close());
-fixMatchDialog.addEventListener("click", event => {
+bindCardAction(document.querySelector(".fix-match-close"), "click", () => fixMatchDialog.close());
+bindCardAction(fixMatchDialog, "click", event => {
   if (event.target === fixMatchDialog) fixMatchDialog.close();
 });
-document.addEventListener("click", async event => {
+bindCardAction(document, "click", async event => {
   const menu = event.target.closest(".media-card-menu");
   if (menu && event.target.closest("summary")) {
     document.querySelectorAll(".media-card-menu[open]").forEach(openMenu => {
@@ -11570,19 +11654,25 @@ document.addEventListener("click", async event => {
 
   if (fixMatchButton) {
     event.preventDefault();
+    const fixMatchHeading = document.querySelector("#tv-fix-match-heading");
+    const fixMatchDescription = document.querySelector("#tv-fix-match-show");
+    if (!fixMatchDialog || !fixMatchQuery || !fixMatchSearchButton || !fixMatchStatus || !fixMatchResults || !fixMatchHeading || !fixMatchDescription) {
+      window.__mplexShowConnectionLost("The Fix Match dialog is unavailable on this page. Reload to reconnect.");
+      return;
+    }
     document.querySelectorAll(".media-card-menu[open]").forEach(openMenu => openMenu.removeAttribute("open"));
     const card = fixMatchButton.closest(".media-card");
     const title = card?.querySelector(".media-card-title")?.textContent.trim() || "Media item";
-    document.querySelector("#tv-fix-match-heading").textContent = "Fix Match";
+    fixMatchHeading.textContent = "Fix Match";
     fixMatchQuery.setAttribute("aria-label", "Search movies and TV shows");
     fixMatchDialog.dataset.library = fixMatchButton.dataset.library;
     fixMatchDialog.dataset.path = fixMatchButton.dataset.path;
-    document.querySelector("#tv-fix-match-show").textContent = `Search for the correct match for ${title}.`;
+    fixMatchDescription.textContent = `Search for the correct match for ${title}.`;
     fixMatchQuery.value = title;
     fixMatchStatus.textContent = "";
     fixMatchResults.replaceChildren();
     fixMatchDialog.showModal();
-    searchTvMatches();
+    fixMatchStatus.textContent = "Review the title, then click Search to look for a match.";
     return;
   }
   if (!button || button.disabled) return;
@@ -11650,7 +11740,7 @@ document.addEventListener("click", async event => {
     showFailure();
   }
 });
-}
+window.__mplexCardActionsCleanup = () => cardActionListeners.splice(0).forEach(remove => remove());
 </script>"##
 }
 
@@ -13415,6 +13505,109 @@ async fn root_handler(
     } else {
         home_client(State(s)).await
     }
+}
+
+#[derive(Deserialize)]
+struct AdminLoginForm {
+    password: String,
+    #[serde(default)]
+    confirm_password: String,
+}
+
+fn web_admin_exists(state: &AppState) -> bool {
+    state.db.lock().ok().and_then(|db| {
+        db.query_row("SELECT EXISTS(SELECT 1 FROM web_admin WHERE id = 1)", [], |row| row.get::<_, bool>(0)).ok()
+    }).unwrap_or(false)
+}
+
+fn web_session_valid(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(token) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok())
+        .and_then(|cookie| cookie.split(';').find_map(|part| part.trim().strip_prefix("harbringer_session="))) else { return false; };
+    let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or_default();
+    state.db.lock().ok().and_then(|db| db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM web_sessions WHERE token_hash = ?1 AND expires_at > ?2)",
+        (&token_hash, now), |row| row.get::<_, bool>(0)
+    ).ok()).unwrap_or(false)
+}
+
+async fn web_auth_gate(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
+    let path = request.uri().path();
+    let plex_client = request.headers().contains_key("X-Plex-Product")
+        || request.headers().contains_key("X-Plex-Client-Identifier")
+        || request.headers().contains_key("X-Plex-Token")
+        || plex_query_value(request.uri(), "X-Plex-Product").is_some()
+        || plex_query_value(request.uri(), "X-Plex-Client-Identifier").is_some()
+        || plex_query_value(request.uri(), "X-Plex-Token").is_some();
+    let web_page = path == "/" || path == "/web" || path.starts_with("/web/")
+        || path == "/settings" || path.starts_with("/settings/");
+    if !web_page || (path == "/" && plex_client) || path.starts_with("/auth") {
+        return next.run(request).await;
+    }
+    if !web_admin_exists(&state) || !web_session_valid(&state, request.headers()) {
+        return Redirect::to("/auth").into_response();
+    }
+    next.run(request).await
+}
+
+async fn auth_page(State(state): State<AppState>) -> Response {
+    let setup = !web_admin_exists(&state);
+    let (title, description, button) = if setup {
+        ("Create administrator login", "Set a password for the Harbringer web interface.", "Create login")
+    } else {
+        ("Sign in", "Sign in to manage your Harbringer server.", "Sign in")
+    };
+    let action = if setup { "/auth/setup" } else { "/auth/login" };
+    let confirm = if setup { r#"<label>Confirm password<input name="confirm_password" type="password" autocomplete="new-password" required></label>"# } else { "" };
+    let body = format!(r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · harbringer</title><style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b1020;color:#f9fafb;font:16px system-ui}}main{{box-sizing:border-box;width:min(92vw,410px);padding:2rem;border:1px solid #374151;border-radius:1rem;background:#111827}}h1{{margin-top:0}}p{{color:#9ca3af}}form,label{{display:grid;gap:.7rem}}form{{gap:1rem}}input,button{{box-sizing:border-box;width:100%;padding:.8rem;border-radius:.5rem;font:inherit}}input{{border:1px solid #4b5563;background:#0b1020;color:white}}button{{border:0;background:#2563eb;color:white;font-weight:700;cursor:pointer}}</style><main><h1>{title}</h1><p>{description}</p><form method="post" action="{action}"><label>Administrator password<input name="password" type="password" minlength="8" autocomplete="{autocomplete}" required></label>{confirm}<button>{button}</button></form></main></html>"#,
+        autocomplete = if setup { "new-password" } else { "current-password" });
+    Html(body).into_response()
+}
+
+async fn auth_setup(State(state): State<AppState>, Form(form): Form<AdminLoginForm>) -> Response {
+    if form.password.len() < 8 || form.password != form.confirm_password || web_admin_exists(&state) {
+        return (StatusCode::BAD_REQUEST, "Setup is unavailable, passwords do not match, or the password is too short").into_response();
+    }
+    let salt = SaltString::generate(&mut OsRng);
+    let Ok(hash) = Argon2::default().hash_password(form.password.as_bytes(), &salt) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    let Ok(db) = state.db.lock() else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
+    match db.execute("INSERT OR IGNORE INTO web_admin (id, password_hash) VALUES (1, ?1)", [hash.to_string()]) {
+        Ok(1) => {}
+        Ok(_) => return (StatusCode::CONFLICT, "Administrator setup has already completed").into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    drop(db);
+    issue_web_session(&state)
+}
+
+async fn auth_login(State(state): State<AppState>, Form(form): Form<AdminLoginForm>) -> Response {
+    let hash = state.db.lock().ok().and_then(|db| db.query_row("SELECT password_hash FROM web_admin WHERE id = 1", [], |row| row.get::<_, String>(0)).ok());
+    let valid = hash.and_then(|hash| PasswordHash::new(&hash).ok().map(|parsed| Argon2::default().verify_password(form.password.as_bytes(), &parsed).is_ok())).unwrap_or(false);
+    if !valid { return (StatusCode::UNAUTHORIZED, Html("<p>Incorrect password. <a href=\"/auth\">Try again</a></p>")).into_response(); }
+    issue_web_session(&state)
+}
+
+fn issue_web_session(state: &AppState) -> Response {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let token = URL_SAFE_NO_PAD.encode(bytes);
+    let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or_default();
+    if state.db.lock().ok().is_none_or(|db| db.execute("INSERT INTO web_sessions (token_hash, expires_at) VALUES (?1, ?2)", (&token_hash, now + 60 * 60 * 24 * 14)).is_err()) { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
+    let mut response = Redirect::to("/").into_response();
+    if let Ok(value) = HeaderValue::from_str(&format!("harbringer_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=1209600")) { response.headers_mut().insert(header::SET_COOKIE, value); }
+    response
+}
+
+async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(token) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok())
+        .and_then(|cookie| cookie.split(';').find_map(|part| part.trim().strip_prefix("harbringer_session="))) {
+        let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        if let Ok(db) = state.db.lock() { let _ = db.execute("DELETE FROM web_sessions WHERE token_hash = ?1", [&token_hash]); }
+    }
+    let mut response = Redirect::to("/auth").into_response();
+    response.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_static("harbringer_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"));
+    response
 }
 
 async fn plex_root(state: &AppState) -> Response {

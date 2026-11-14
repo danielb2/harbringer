@@ -8,6 +8,7 @@ use axum::{
     Router,
 };
 use base64::Engine as _;
+use sha2::Digest as _;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
@@ -111,6 +112,7 @@ fn fixture() -> Fixture {
 
     let config_path = config_dir.join("config.toml");
     let (db, machine_identifier) = open_database(&config_path).unwrap();
+    authorize_test_fixture(&db);
     migrate_library_model(&db).unwrap();
     let library = ConfigLibrary {
         name: "Movies".to_owned(),
@@ -177,7 +179,7 @@ fn fixture() -> Fixture {
         plex_tls: PlexTls::load(root.join("config/certs")).unwrap(),
     };
     Fixture {
-        app: build_app(state.clone()),
+        app: build_app(state.clone()).layer(axum::middleware::from_fn(inject_test_cookie)),
         state,
         config: shared_config,
         db: shared_db,
@@ -221,6 +223,7 @@ fn tv_fixture() -> Fixture {
         .collect::<Vec<_>>();
     let config_path = config_dir.join("config.toml");
     let (db, machine_identifier) = open_database(&config_path).unwrap();
+    authorize_test_fixture(&db);
     migrate_library_model(&db).unwrap();
     let config = Config {
         bind: "127.0.0.1:0".to_owned(),
@@ -275,7 +278,7 @@ fn tv_fixture() -> Fixture {
         plex_tls: PlexTls::load(root.join("config/certs")).unwrap(),
     };
     Fixture {
-        app: build_app(state.clone()),
+        app: build_app(state.clone()).layer(axum::middleware::from_fn(inject_test_cookie)),
         state,
         config: shared_config,
         db: shared_db,
@@ -284,6 +287,18 @@ fn tv_fixture() -> Fixture {
         subtitle_id: 0,
         change_stamp,
     }
+}
+
+fn authorize_test_fixture(db: &rusqlite::Connection) {
+    let token = "unit-test-session";
+    let token_hash = format!("{:x}", super::Sha256::digest(token.as_bytes()));
+    db.execute("INSERT INTO web_admin (id, password_hash) VALUES (1, 'test-hash')", []).unwrap();
+    db.execute("INSERT INTO web_sessions (token_hash, expires_at) VALUES (?1, 4102444800)", [&token_hash]).unwrap();
+}
+
+async fn inject_test_cookie(mut request: Request<Body>, next: axum::middleware::Next) -> axum::response::Response {
+    request.headers_mut().insert(header::COOKIE, "harbringer_session=unit-test-session".parse().unwrap());
+    next.run(request).await
 }
 
 async fn send(app: &Router, method: Method, uri: &str, body: Body) -> axum::response::Response {
@@ -310,6 +325,7 @@ async fn send_form(
             Request::builder()
                 .method(method)
                 .uri(uri)
+                .header(header::COOKIE, "harbringer_session=unit-test-session")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(Body::from(body.to_owned()))
                 .unwrap(),
@@ -336,6 +352,35 @@ async fn send_async_form(
         )
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn web_ui_requires_admin_session_while_plex_api_remains_available() {
+    let fixture = fixture();
+    let app = build_app(fixture.state.clone());
+    for path in ["/", "/settings", "/web/watch-action"] {
+        let response = app.clone().oneshot(Request::builder().uri(path).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
+        assert_eq!(response.headers()[header::LOCATION], "/auth");
+    }
+    let spoofed = app.clone().oneshot(Request::builder().uri("/settings").header("X-Plex-Product", "Plex Web").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(spoofed.status(), StatusCode::SEE_OTHER);
+    let plex = app.oneshot(Request::builder().uri("/library/sections").header("X-Plex-Product", "Plex Web").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(plex.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn first_run_creates_admin_and_starts_an_authenticated_session() {
+    let fixture = fixture();
+    let app = build_app(fixture.state.clone());
+    fixture.db.lock().unwrap().execute("DELETE FROM web_admin", []).unwrap();
+    let setup = send(&app, Method::GET, "/auth", Body::empty()).await;
+    assert_eq!(setup.status(), StatusCode::OK);
+    let created = send_form(&app, Method::POST, "/auth/setup", "password=correct-horse-battery&confirm_password=correct-horse-battery").await;
+    assert_eq!(created.status(), StatusCode::SEE_OTHER);
+    let cookie = created.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap();
+    let settings = app.oneshot(Request::builder().uri("/settings").header(header::COOKIE, cookie).body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(settings.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -3066,6 +3111,26 @@ async fn tv_show_cards_display_the_season_count() {
     assert!(body.contains("aria-label=\"Search TV shows\""));
     assert!(body.contains("aria-label=\"Close Fix Match dialog\" title=\"Close\""));
     assert!(body.contains("/web/tv-match/search"));
+    assert!(body.contains("Lost connection to Harbringer. Check that the server is running"));
+    assert!(body.contains("window.__mplexLibraryRefreshTimer = null"));
+    assert!(body.contains("Review the title, then click Search to look for a match."));
+    assert!(body.contains("window.__mplexCardActionsCleanup?.()"));
+    assert!(body.contains("window.__mplexCardActionsCleanup ="));
+}
+
+#[tokio::test]
+async fn home_page_renders_the_fix_match_dialog_for_home_card_actions() {
+    let fixture = tv_fixture();
+    let response = send(&fixture.app, Method::GET, "/", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("data-fix-match data-library=\"0\""));
+    assert!(body.contains("id=\"tv-fix-match-dialog\""));
+    assert!(body.contains("id=\"tv-fix-match-search\""));
+    assert!(body.contains("if (!fixMatchDialog || !fixMatchQuery"));
 }
 
 #[tokio::test]

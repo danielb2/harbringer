@@ -28,6 +28,16 @@ Harbringer reads its settings from `./config/config.toml` and creates its state 
 
 Open `http://<server>:32400/` in a browser on your network. Use **Settings** to create a library and add a folder on the server. Run **Scan all libraries** to index the files, or leave automatic scanning enabled.
 
+### Reset the web admin password
+
+Stop Harbringer, then remove the admin account and its login sessions from the SQLite state database:
+
+```sh
+sqlite3 config/state.sqlite 'DELETE FROM web_sessions; DELETE FROM web_admin;'
+```
+
+Start Harbringer and open its web client to create a new admin password. If you use a custom config directory, run the command against `state.sqlite` beside that directory's `config.toml`. For Docker, run it against the `state.sqlite` file in the host directory mounted at `/config`.
+
 ### Docker Compose
 
 The published image supports `linux/amd64` and `linux/arm64`. It runs on Linux hosts and in Docker Desktop's Linux-container mode on macOS and Windows.
