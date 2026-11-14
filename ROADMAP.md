@@ -96,6 +96,7 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 ### 2026-11-14
 
 - Make subtitle source selection explicit during translation and prevent a partial or completed output from being reused for different subtitle text. Source-aware fingerprints validate checkpoints, legacy partials are resumed only when their cues match the selected source, and hidden metadata records provenance. Switching source during playback cancels the old translation; selecting identical content can safely reuse progress. Bump the package version to 0.1.1 and use it in Plex auth device metadata. Full `cargo test` passed all 183 tests and `git diff --check` passed.
+- Publish Docker images for `linux/amd64` and `linux/arm64`, cross-compiling on the native builder to avoid an AWS-LC assembly compiler crash under QEMU. Mark the subtitle cache helper test-only to remove its release dead-code warning. Verified local Docker builds for both architectures, `just --dry-run publish`, `cargo build --release`, full `cargo test` (183 passed), and `git diff --check`.
 
 ### 2026-11-12
 

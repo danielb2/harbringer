@@ -30,6 +30,8 @@ Open `http://<server>:32400/` in a browser on your network. Use **Settings** to 
 
 ### Docker Compose
 
+The published image supports `linux/amd64` and `linux/arm64`. It runs on Linux hosts and in Docker Desktop's Linux-container mode on macOS and Windows.
+
 Save this as `compose.yaml` and start Harbringer with `docker compose up -d`:
 
 ```yaml

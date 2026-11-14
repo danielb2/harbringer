@@ -39,7 +39,7 @@ publish:
     image="ghcr.io/${owner}/harbringer:latest"
     gh auth token | docker login ghcr.io --username "$username" --password-stdin
     build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    docker buildx build --push --build-arg "IMAGE_BUILD_DATE=$build_date" -t "$image" .
+    docker buildx build --platform linux/amd64,linux/arm64 --push --build-arg "IMAGE_BUILD_DATE=$build_date" -t "$image" .
 
 # restart local server
 restart:

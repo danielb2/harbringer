@@ -2497,6 +2497,7 @@ async fn prepare_translation_checkpoint(
     write_subtitle_source_marker(checkpoint_path, fingerprint, source_key).await
 }
 
+#[cfg(test)]
 async fn translate_subtitle_cached(
     state: &AppState,
     media: &Media,
